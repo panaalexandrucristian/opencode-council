@@ -1,5 +1,5 @@
 .DS_Store
 *.log
-council-run*/
-run*/
-answers*.json
+/council-run*/
+/run*/
+/answers*.json

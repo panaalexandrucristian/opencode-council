@@ -58,6 +58,14 @@ How it works:
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
+## Example
+
+[`examples/`](examples/) is a real run: a 2-member council (Claude Sonnet read-only + OpenCode Kimi K3
+as executor) gets "create `hello.sh` that prints a greeting", **asks** for the exact text, language,
+shell and permissions instead of assuming them, then agrees a plan, implements it and ratifies the
+result. It contains the `council.json`, the `answers.json`, the console output of `show` / `start` /
+`resume`, and the full [`transcript.md`](examples/transcript.md).
+
 ## `oc.sh` on its own
 
 ```bash

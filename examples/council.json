@@ -1,0 +1,15 @@
+{
+  "dir": "/path/to/project",
+  "max_rounds": 4,
+  "timeout_s": 600,
+  "handover_at": 0.5,
+  "max_turns": 30,
+  "executor": "B",
+  "tasks": [
+    {"id": "hello", "text": "Creează în directorul de lucru un script shell `hello.sh` care afișează un salut.", "execute": true}
+  ],
+  "members": [
+    {"id": "A", "kind": "claude",   "model": "sonnet",                   "effort": "medium", "mode": "read"},
+    {"id": "B", "kind": "opencode", "model": "kimi-code-plan-global/k3", "effort": "high",   "mode": "edit"}
+  ]
+}

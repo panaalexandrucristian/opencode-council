@@ -1,0 +1,8 @@
+{
+  "hello/r1/A/q1": "Textul exact: Salut, consiliu!",
+  "hello/r1/A/q2": "Română.",
+  "hello/r1/A/q3": "#!/bin/sh (POSIX).",
+  "hello/r1/A/q4": "Da, executabil (chmod +x).",
+  "hello/r1/B/q5": "Textul exact: Salut, consiliu! — în română.",
+  "hello/r1/B/q6": "Da, chmod +x."
+}
