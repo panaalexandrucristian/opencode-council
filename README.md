@@ -13,11 +13,58 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 
 ## Install
 
+### 1. Prerequisites
+
+| tool | why | check |
+|---|---|---|
+| [OpenCode](https://opencode.ai) **v2** (`opencode`) | runs the OpenCode sessions / background service | `opencode --version` → `v2.x` |
+| [Claude Code](https://claude.com/claude-code) (`claude`) | loads the skill; also runs Claude council members via `claude -p` | `claude --version` |
+| `bash` (3.2+ is fine, macOS default works), `curl`, `jq` | the scripts | `jq --version` |
+
+Authenticate at least one OpenCode provider (each council member's model must belong to an enabled provider):
+
+```bash
+opencode auth login        # e.g. OpenAI (ChatGPT/Codex), Google, Kimi, Moonshot …
+```
+
+### 2. Install the skill
+
+As a **user skill** (available in every project):
+
 ```bash
 git clone https://github.com/panaalexandrucristian/opencode-council.git ~/.claude/skills/opencode
 ```
 
-Requirements: `opencode` (v2, with at least one provider authenticated), `claude` (Claude Code CLI, for Claude council members), `bash`, `curl`, `jq`. The scripts start the OpenCode background service themselves when it is not running.
+or as a **project skill** (committed with one repository):
+
+```bash
+git clone https://github.com/panaalexandrucristian/opencode-council.git .claude/skills/opencode
+```
+
+The skill is named by the `name: opencode` line in `SKILL.md`, so it appears in Claude Code as `/opencode` regardless of the folder name. Nothing else to configure — the scripts read the OpenCode service URL/password from `~/.local/state/opencode/service.json` and start the service (`opencode service start`) when it is not running.
+
+### 3. Verify
+
+```bash
+~/.claude/skills/opencode/scripts/oc.sh ensure          # {"url":"http://127.0.0.1:49374","version":"2.0.11",...}
+~/.claude/skills/opencode/scripts/oc.sh models          # enabled models as provider/id — pick council members from here
+claude -p "reply OK" --model sonnet --output-format json | jq .result   # only needed for Claude council members
+```
+
+Then, in Claude Code:
+
+```
+/opencode list the models available in OpenCode
+/opencode vreau un consiliu: 2 OpenCode (Astra high, Gemini 3.1 Pro high) + 1 Claude (Sonnet medium, executor) pe acest proiect …
+```
+
+`SKILL.md` lists `scripts/oc.sh` and `scripts/council.sh` under `allowed-tools`, so Claude Code should not prompt for them while the skill is active; if your setup still prompts, allow the two commands once (or add them to `permissions.allow` in `~/.claude/settings.json`).
+
+### 4. Update
+
+```bash
+git -C ~/.claude/skills/opencode pull
+```
 
 ## The council
 
