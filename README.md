@@ -74,3 +74,7 @@ scripts/oc.sh models [filter]                          # enabled models (provide
 scripts/oc.sh run "task" --dir /abs/project --model openai/gpt-6-astra --variant high
 scripts/oc.sh prompt ses_… "follow-up" ; scripts/oc.sh diff ses_… --patch ; scripts/oc.sh messages ses_…
 ```
+
+## License
+
+[MIT](LICENSE)
