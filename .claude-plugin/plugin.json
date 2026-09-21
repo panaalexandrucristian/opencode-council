@@ -1,0 +1,13 @@
+{
+  "name": "opencode-council",
+  "displayName": "OpenCode Council",
+  "version": "0.1.0",
+  "description": "Drive OpenCode through its HTTP API and run a cross-CLI council: OpenCode and Claude Code sessions on chosen models/efforts that discuss tasks, ask instead of assuming, and reach unanimous consensus.",
+  "author": {
+    "name": "Alexandru-Cristian Pana",
+    "url": "https://github.com/panaalexandrucristian"
+  },
+  "repository": "https://github.com/panaalexandrucristian/opencode-council",
+  "license": "MIT",
+  "keywords": ["opencode", "council", "multi-agent", "consensus", "claude-code", "skill"]
+}
