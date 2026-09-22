@@ -7,6 +7,8 @@
 #   council.sh start  --config F --run-dir D          create the sessions and run all tasks (D must not exist)
 #   council.sh status --run-dir D                     where the run is: task, round, member context/tokens, pending questions
 #   council.sh resume --run-dir D [--answers F|--answer TEXT]   continue after exit 4 (questions) or exit 2 (member failure)
+#                     [--replace ID=kind:model:effort]         swap a member's model/session (e.g. its provider ran out of quota):
+#                                                              C=claude:sonnet:xhigh or C=opencode:google/gemini-3.8-flash:high
 #
 # Exit codes: 0 every task reached consensus · 1 usage/config error · 2 a member failed twice (checkpointed; resume
 #             re-runs the round) · 4 questions for the user are pending (see D/questions.json) · 5 finished, but at
@@ -38,12 +40,13 @@ command -v jq >/dev/null || { echo "council: jq is required" >&2; exit 1; }
 die() { echo "council: $*" >&2; exit 1; }
 log() { echo "council: $*" >&2; }
 now() { date +%H:%M:%S; }
-CMD=""; CONFIG=""; RUN=""; ANSWERS_FILE=""; ANSWER_TEXT=""
+CMD=""; CONFIG=""; RUN=""; ANSWERS_FILE=""; ANSWER_TEXT=""; REPLACE=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --config|--run-dir|--answers|--answer) [ $# -ge 2 ] || die "missing value for $1" ;;
+    --config|--run-dir|--answers|--answer|--replace) [ $# -ge 2 ] || die "missing value for $1" ;;
   esac
   case "$1" in
+    --replace) REPLACE+=("$2"); shift 2 ;;
     --config)  CONFIG=$2; shift 2 ;;
     --run-dir) RUN=$2; shift 2 ;;
     --answers) ANSWERS_FILE=$2; shift 2 ;;
@@ -363,6 +366,10 @@ answers_block() {  # user answers relevant to the current task (all of them, ver
   local a; a=$(jq -r --arg t "$(st '.task_id')" '[.answers[]? | select(.task==$t)] | if length==0 then "" else "Answers from the user to the council'"'"'s questions (verbatim, authoritative):\n" + (map("- Q (member \(.member)): \(.question)\n  A: \(.answer)")|join("\n")) + "\n" end' "$ST")
   [ -n "$a" ] && printf '%s\n' "$a"
 }
+notices_block() {  # one-off notes from the orchestrator (e.g. a member was replaced), cleared after the step
+  local n; n=$(jq -r '(.notices // []) | if length==0 then "" else "Notes from the orchestrator:\n" + (map("- " + .)|join("\n")) + "\n" end' "$ST")
+  [ -n "$n" ] && printf '%s\n' "$n"
+}
 prompt_retry() { echo "Your previous reply could not be used: it did not end with a valid fenced \`\`\`json tail matching the required schema (or the call failed). Re-send your COMPLETE post for the current round now, ending with the JSON tail. Do not refer to your previous reply."; }
 prompt_handover() {
   cat <<TXT
@@ -397,14 +404,18 @@ run_step() {
   for i in $idxs; do
     needs_handover $i && do_handover $i
     pf="$RUN/prompts/$tid-$tag-$(mid $i).md"
+    if [ "$(st '.reuse_posts // false')" = true ] && post_valid "$RUN/posts/$tid-$tag-$(mid $i).json" && [ -s "$RUN/posts/$tid-$tag-$(mid $i).md" ]; then
+      log "member $(mid $i): reusing its $tag post from the checkpoint (not re-run)"; sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'; continue
+    fi
     { if [ "$(mget $i fresh)" = true ]; then rules_text $i; echo
         local hn; hn=$(mget $i handover_note); [ "$hn" != null ] && [ -n "$hn" ] && { echo "Handover note from your predecessor session (same member id):"; echo "<<<HANDOVER"; cat "$hn"; echo ">>>"; echo; }; fi
-      $gen $i "$t" "$r"; } >"$pf"
+      notices_block; $gen $i "$t" "$r"; } >"$pf"
     launch $i "$pf" "$tid-$tag" || { log "member $(mid $i): launch failed"; return 1; }
   done
   local fail=0
   for i in $idxs; do
     local id; id=$(mid $i); local ok=0 attempt
+    if [ "$(st ".members[$i].inflight.tag")" = reuse ]; then sts --argjson i $i '.members[$i].inflight=null'; continue; fi
     for attempt in 1 2; do
       if collect $i && tail_json "$RUN/raw/$tid-$tag-$id.md" >"$RUN/posts/$tid-$tag-$id.json" && jq -e '(.vote|IN("propose","agree","disagree","question","done")) and
                  (if .vote=="propose" or .vote=="disagree" then ((.proposal|type)=="string" and (.proposal|length)>0)
@@ -427,9 +438,42 @@ run_step() {
   done
   # collect votes from the post tails
   local votes="[]"; for i in $idxs; do local id; id=$(mid $i); [ -f "$RUN/posts/$tid-$tag-$id.json" ] && votes=$(jq -c --arg m "$id" --slurpfile p "$RUN/posts/$tid-$tag-$id.json" '. + [ $p[0] + {member:$m} ]' <<<"$votes"); done
-  sts --argjson v "$votes" '.last_votes=$v'
+  sts --argjson v "$votes" '.last_votes=$v | .notices=[] | .reuse_posts=false'
   render_transcript
   return $fail
+}
+
+post_valid() {  # json tail file -> 0 if it parses and has a usable vote
+  [ -s "$1" ] && jq -e '(.vote|IN("propose","agree","disagree","question","done"))' "$1" >/dev/null 2>&1
+}
+
+replace_member() {  # "ID=kind:model:effort" -> new session for that member, handover note built from its own posts
+  local spec=$1 id kind model effort i
+  id=${spec%%=*}; local rest=${spec#*=}; kind=${rest%%:*}; rest=${rest#*:}; effort=${rest##*:}; model=${rest%:*}
+  [ -n "$id" ] && [ -n "$kind" ] && [ -n "$model" ] && [ -n "$effort" ] && [ "$model" != "$effort" ] || die "--replace expects ID=kind:model:effort (got: $spec)"
+  i=""; local j; for j in $(seq 0 $((N-1))); do [ "$(mid $j)" = "$id" ] && i=$j; done; [ -n "$i" ] || die "--replace: no member $id"
+  local mode; mode=$(mget $i mode); local ctx=null extra
+  case "$kind" in
+    claude)   echo "$effort" | grep -qxE 'low|medium|high|xhigh|max' || die "--replace: claude effort must be low|medium|high|xhigh|max"
+              extra=$(jq -cn --arg pm "$( [ "$mode" = edit ] && echo acceptEdits || echo plan )" '{permission_mode:$pm, agent:null}') ;;
+    opencode) local mj; mj=$("$OC" api GET "/api/model?location%5Bdirectory%5D=$(jq -rn --arg d "$DIR" '$d|@uri')" | jq -c --arg m "$model" '.data[] | select(.enabled and (.providerID+"/"+.id)==$m)')
+              [ -n "$mj" ] || die "--replace: OpenCode model not enabled: $model"
+              jq -e --arg e "$effort" '([.variants[]?.id] | index($e)) != null or ($e=="default" and ([.variants[]?]|length)==0)' <<<"$mj" >/dev/null || die "--replace: effort '$effort' is not a variant of $model (valid: $(jq -r '[.variants[]?.id]|join("|")' <<<"$mj"))"
+              ctx=$(jq '.limit.context' <<<"$mj"); extra=$(jq -cn --arg a "$( [ "$mode" = edit ] && echo build || echo plan )" '{agent:$a, permission_mode:null}') ;;
+    *) die "--replace: kind must be opencode|claude" ;;
+  esac
+  local note="$RUN/raw/replace-$id-g$(mget $i gen).md"
+  { echo "Your predecessor session as member $id ($(mget $i kind) $(mget $i model), effort $(mget $i effort)) could not continue (provider failure or replacement by the user) and could not write a handover note. Below are ALL the posts it made in this run, oldest first — they are your positions so far; continue from them."
+    local f; for f in $(ls -tr "$RUN/posts" 2>/dev/null | grep -- "-$id\.md$"); do echo; echo "--- post ${f%.md} ---"; cat "$RUN/posts/$f"; done; } >"$note"
+  local old; old=$(mget $i session)
+  sts --argjson i $i --arg kind "$kind" --arg model "$model" --arg effort "$effort" --argjson ctx "$ctx" --argjson extra "$extra" --arg note "$note" --arg old "$old" --arg now "$(now)" '
+    .members[$i] |= (.retired += [{session:.session, gen:.gen, tokens:.session_tokens, cost:.session_cost, model:(.kind+" "+.model), reason:"replaced"}]
+                     | .gen+=1 | .session=null | .fresh=true | .handover_note=$note | .ctx_used=0 | .ctx_limit=$ctx | .session_tokens=0 | .session_cost=0 | .session_calls=0
+                     | .kind=$kind | .model=$model | .effort=$effort | . + $extra | del(.[] | nulls))
+    | .config.members[$i] |= (. + {kind:$kind, model:$model, effort:$effort} + $extra | del(.[] | nulls))
+    | .notices += ["member \(.members[$i].id) is now \($kind) \($model) (effort \($effort)); its previous session could not continue. It has its earlier posts."]
+    | .log += ["\($now) member \(.members[$i].id) g\(.members[$i].gen): replaced \($old) with \($kind) \($model) [\($effort)]"]'
+  log "member $id: replaced with $kind $model [$effort] (previous session $old retired; note built from $(grep -c '^--- post' "$note") earlier posts)"
 }
 
 pause_for_questions() {  # -> writes questions.json, exit 4
@@ -466,12 +510,13 @@ deliberate() {  # task json -> sets .results[-1] {task, outcome, text, rounds}; 
         log "task $tid: CONSENSUS in round $r on candidate $(st .candidate.id)"; return 0
       fi
       local p=$(( (r-1) % N ))   # rotating proposer for the next candidate
+      sts '.voted_candidate=.candidate'   # keep the candidate this round actually voted on (for an unresolved outcome)
       sts --arg tid "$tid" --argjson r $r --arg m "$(mid $p)" --arg txt "$(position_of $p)" '.candidate={id:($tid+"-c"+($r|tostring)), member:$m, text:$txt}'
     fi
     r=$((r+1))
   done
-  # round 1 only (max_rounds=1) or exhausted: record unresolved with everyone's last position
-  sts --arg tid "$tid" --argjson r "$MAXR" '.results += [{task:$tid, outcome:"unresolved", text:.candidate.text, rounds:$r, dissent:[.last_votes[] | select(.vote!="agree") | {member, reason, proposal}]}] | .round=1'
+  # exhausted: record unresolved with the candidate of the LAST VOTE (not the next rotating proposal) and every dissent
+  sts --arg tid "$tid" --argjson r "$MAXR" '(.voted_candidate // .candidate) as $c | .results += [{task:$tid, outcome:"unresolved", text:$c.text, candidate:$c.id, rounds:$r, dissent:[.last_votes[] | select(.vote!="agree") | {member, reason, proposal}]}] | .round=1 | .voted_candidate=null'
   log "task $tid: UNRESOLVED after $MAXR rounds"; return 1
 }
 
@@ -575,7 +620,7 @@ case "$CMD" in
     jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" '
       ($lim | split("\n") | map(select(length>0) | split("\t") | {key:.[0], value:(.[1]|tonumber)}) | from_entries) as $L |
       {config:$cfg, run_dir:$run, started:$ts, status:"created", cl_cumulative:$cum, task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
-       answers:[], pending_questions:null, results:[], log:[],
+       answers:[], pending_questions:null, notices:[], reuse_posts:false, results:[], log:[],
        members:[ $cfg.members[] | . + {session:null, gen:1, fresh:true, handover_note:null, ctx_used:0, ctx_limit:($L[.id] // null), session_tokens:0, session_cost:0, calls:0, session_calls:0, retired:[], inflight:null} ]}' >"$RUN/state.json"
     load_state
     print_roster "$cfg" "$lim" >&2; log "run dir: $RUN"
@@ -606,14 +651,19 @@ case "$CMD" in
         elif [ -n "$ANSWER_TEXT" ]; then
           sts --arg a "$ANSWER_TEXT" '.answers += [ .pending_questions[] | . + {answer:$a} ]'
         else die "pending questions — pass --answers answers.json ({qid: answer}) or --answer TEXT (same answer to all). See $RUN/questions.json"; fi
-        sts '.pending_questions=null | .status="running" | .last_votes=[]'; rm -f "$RUN/questions.json"
+        sts '.pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; rm -f "$RUN/questions.json"
+        # the round is redone with the answers: discard the posts of that step so nobody's earlier post is reused
+        case "$(st .phase)" in exec) stag="exec$(st .round)" ;; ratify) stag="x$(st .round)" ;; *) stag="r$(st .round)" ;; esac
+        rm -f "$RUN"/posts/"$(st .task_id)-$stag-"*
         log "answers recorded — re-running task $(st .task_id) phase $(st .phase) round $(st .round) with the answers (round budget not consumed)" ;;
       failed|running|created)
-        log "resuming task $(st '.task_id // "-"') phase $(st .phase) round $(st .round) (the interrupted round is re-run)"
-        sts '.status="running" | .last_votes=[] | .members |= map(.inflight=null)' ;;
+        log "resuming task $(st '.task_id // "-"') phase $(st .phase) round $(st .round) — members with a valid post in that round are not re-run"
+        sts '.status="running" | .last_votes=[] | .reuse_posts=true | .members |= map(.inflight=null)' ;;
       done) die "this run is finished (see $RUN/transcript.md)" ;;
       *) die "unknown status: $status" ;;
     esac
+    for spec in "${REPLACE[@]:-}"; do [ -n "$spec" ] && replace_member "$spec"; done
+    render_transcript
     run_tasks ;;
 
   *) die "unknown command: $CMD (show|start|status|resume)" ;;
