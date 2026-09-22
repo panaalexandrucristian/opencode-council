@@ -112,6 +112,7 @@ is advisory; the measurements are not dollar predictions.
 ```
 council.sh start  --config council.json --run-dir <scratchpad>/council-<name>     # new run dir, must not exist
 council.sh status --run-dir D                                                     # task/round, per-member context %, tokens, cost, pending questions
+council.sh report --run-dir D                                                     # token report: prompt bytes by section, de-duplication replay, duplication left
 council.sh resume --run-dir D --answers answers.json | --answer "text"            # after exit 4 (questions) or exit 2 (failure)
 council.sh resume --run-dir D --replace C=claude:sonnet:xhigh                     # swap a member's model/session (repeatable)
 ```
@@ -154,6 +155,12 @@ Votes still target the authoritative candidate in state. Capped diffs end with a
 `DIFF TRUNCATED` line naming the 20000-byte cap and the directory to inspect.
 
 ### 3. Tests
+
+`scripts/ptools/` is part of the skill, not an extra: `python3` is required and `council.sh` refuses to
+start without it. Every finished run's transcript ends with a **Token report** — prompt bytes by section,
+the de-duplication replay and the verbatim duplication still present — and `council.sh report --run-dir D`
+prints the same report for any run at any time (offline, no model calls). `scripts/ptools/test_ptools.py`
+is their unittest suite (28 cases), run automatically by `scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
 loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and

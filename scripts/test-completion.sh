@@ -267,5 +267,21 @@ handover_tests() (
   mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
   mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests handover_tests; do "$suite" || exit 1; done
+ptools_tests() (
+  # the analysis tools are part of the skill: their own unittest suite must pass,
+  # and both must run on a run directory produced by council.sh itself.
+  check 0 'python3 is available' Python python3 --version
+  out=$(python3 "$HERE/ptools/test_ptools.py" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then echo "FAIL ptools unittest:"; echo "$out" | tail -20; exit 1; fi
+  echo "PASS ptools unittest ($(printf '%s' "$out" | grep -o 'Ran [0-9]* tests' | head -1))"
+  echo x >>"$scratch/passed"
+  local run="$scratch/dedup"   # built by dedup_tests: state.json + prompts/ + posts/
+  [ -d "$run/prompts" ] || { echo "FAIL ptools: no generated run dir"; exit 1; }
+  check 0 'prompt_report runs on a council-generated run' 'Prompts:' python3 "$HERE/ptools/prompt_report.py" "$run"
+  check 0 'prompt_report reports the de-duplication replay' 'Combined:' python3 "$HERE/ptools/prompt_report.py" "$run"
+  check 0 'dedup_check runs on a council-generated run' 'repeated blocks' python3 "$HERE/ptools/dedup_check.py" "$run"
+  check 2 'prompt_report rejects a directory with no run' '' python3 "$HERE/ptools/prompt_report.py" "$scratch/nope"
+  check 2 'dedup_check rejects a directory with no run' '' python3 "$HERE/ptools/dedup_check.py" "$scratch/nope"
+)
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests handover_tests ptools_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

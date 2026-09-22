@@ -6,6 +6,8 @@
 #   council.sh show   --config F                      validate the config and print the roster (no sessions created)
 #   council.sh start  --config F --run-dir D          create the sessions and run all tasks (D must not exist)
 #   council.sh status --run-dir D                     where the run is: task, round, member context/tokens, pending questions
+#   council.sh report --run-dir D                     token report for the run: prompt bytes by section, de-duplication
+#                                                     replay and the remaining verbatim duplication (scripts/ptools, offline)
 #   council.sh resume --run-dir D [--answers F|--answer TEXT]   continue after exit 4 (questions) or exit 2 (member failure)
 #                     [--replace ID=kind:model:effort]         swap a member's model/session (e.g. its provider ran out of quota):
 #                                                              C=claude:sonnet:xhigh or C=opencode:google/gemini-3.8-flash:high
@@ -37,6 +39,11 @@ set -o pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); OC="$HERE/oc.sh"
 [ -x "$OC" ] || { echo "council: oc.sh not found next to this script" >&2; exit 1; }
 command -v jq >/dev/null || { echo "council: jq is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "council: python3 is required (scripts/ptools: token report and duplicate audit)" >&2; exit 1; }
+PTOOLS="$HERE/ptools"
+for t in prompt_report.py dedup_check.py; do
+  [ -f "$PTOOLS/$t" ] || { echo "council: missing $PTOOLS/$t" >&2; exit 1; }
+done
 
 die() { echo "council: $*" >&2; exit 1; }
 log() { echo "council: $*" >&2; }
@@ -760,6 +767,21 @@ run_tasks() {  # from state.task_idx onward
   [ $unresolved -eq 0 ] && exit 0 || exit 5
 }
 
+# --------------------------------------------------------------- report ----
+# Offline token accounting for a finished (or in-progress) run. No model calls, no network.
+token_report() {  # prints the report; returns non-zero only if both tools fail
+  local rc=0
+  echo "### Prompt bytes by section and de-duplication replay"; echo
+  echo '```'
+  python3 "$PTOOLS/prompt_report.py" "$RUN" 2>&1 || rc=1
+  echo '```'; echo
+  echo "### Verbatim duplication still present inside single prompts (>= 128 bytes)"; echo
+  echo '```'
+  python3 "$PTOOLS/dedup_check.py" "$RUN" 2>&1 | tail -40 || rc=1
+  echo '```'
+  return $rc
+}
+
 # ------------------------------------------------------------ transcript ----
 usage_totals() {  # latest generation plus ALL retired generations; no API calls
   st '
@@ -799,6 +821,9 @@ render_transcript() {
     done
     local qa; qa=$(jq -r '.answers[]? | "- [\(.id)] member \(.member): \(.question)\n  → \(.answer)"' "$ST"); [ -n "$qa" ] && { echo "## Questions and answers"; echo; echo "$qa"; echo; }
     local pq; pq=$(jq -r '.pending_questions[]? | "- [\(.id)] member \(.member): \(.question)"' "$ST"); [ -n "$pq" ] && { echo "## PENDING questions for the user"; echo; echo "$pq"; echo; }
+    if [ "$(st .status)" = done ] && [ -d "$RUN/prompts" ]; then
+      echo "## Token report"; echo; token_report || echo "(the report tools reported an error; see above)"; echo
+    fi
     echo "## Log"; echo; st '.log[]? | "- " + .'
   } >"$RUN/transcript.md.tmp" 2>/dev/null && mv "$RUN/transcript.md.tmp" "$RUN/transcript.md"
 }
@@ -837,6 +862,10 @@ case "$CMD" in
     jq -r '.pending_questions[]? | "  PENDING [\(.id)] member \(.member): \(.question)"' "$ST"
     echo "  transcript: $RUN/transcript.md" ;;
 
+  report)
+    [ -n "$RUN" ] || die "report needs --run-dir D"; RUN=$(abs "$RUN"); load_state
+    echo "run: $RUN"; token_report; exit $? ;;
+
   resume)
     [ -n "$RUN" ] || die "resume needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     "$OC" ensure >/dev/null || exit 1
@@ -869,5 +898,5 @@ case "$CMD" in
     render_transcript
     run_tasks ;;
 
-  *) die "unknown command: $CMD (show|start|status|resume)" ;;
+  *) die "unknown command: $CMD (show|start|status|report|resume)" ;;
 esac

@@ -23,6 +23,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | [OpenCode](https://opencode.ai) **v2** (`opencode`) | runs the OpenCode sessions / background service | `opencode --version` → `v2.x` |
 | [Claude Code](https://claude.com/claude-code) (`claude`) | loads the skill; also runs Claude council members via `claude -p` | `claude --version` |
 | `bash` (3.2+ is fine, macOS default works), `curl`, `jq` | the scripts | `jq --version` |
+| `python3` (macOS ships one; standard library only) | `scripts/ptools/` — the token report and duplicate audit the council runs on every finished run | `python3 --version` |
 
 Authenticate at least one OpenCode provider (each council member's model must belong to an enabled provider):
 
@@ -85,6 +86,7 @@ Plugin: `claude plugin marketplace update opencode-council && claude plugin upda
 scripts/council.sh show   --config council.json              # validate + print the roster (no sessions created)
 scripts/council.sh start  --config council.json --run-dir D  # run all tasks
 scripts/council.sh status --run-dir D                        # task/round, per-member context %, tokens, cost
+council.sh report --run-dir D                        # token report (prompt bytes by section, de-duplication, duplication left)
 scripts/council.sh resume --run-dir D --answers answers.json # continue after the council asked questions
 council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member a fresh session on another model
 ```
@@ -128,8 +130,13 @@ How it works:
   The JSON tail's `proposal`/`report` — the text that is voted on and implemented — plus quoted code, paths,
   commands, errors and numbers are never compressed. Expect single-digit % of output tokens in this council,
   not the headline figures: the JSON tail is 74–99% of a post.
-- **Tests.** `scripts/test-completion.sh` — offline contract suite (no network, no model calls),
-  run it together with `bash -n` on both scripts after any change.
+- **Token report.** Every finished run's transcript ends with a Token report (prompt bytes by section,
+  the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
+  prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
+  offline with no model calls.
+- **Tests.** `scripts/test-completion.sh` — 130 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (28 unittest cases for the analysis tools). Run it together with
+  `bash -n` on both scripts after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
