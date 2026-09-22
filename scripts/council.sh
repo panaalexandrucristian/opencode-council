@@ -194,7 +194,8 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
     if [ $rc -eq 2 ]; then "$OC" interrupt "$sid" >/dev/null 2>&1; log "member $id: timeout after ${TIMEOUT}s (interrupted)"; fi
     "$OC" result "$sid" >"$out" 2>&1; local result_rc=$?
     if [ $result_rc -ne 0 ]; then
-      log "member $id: result failed (exit $result_rc)"
+      local why; why=$(grep -m1 -E '^\[(error|outcome)\]' "$out" | cut -c1-300)
+      log "member $id: result failed (exit $result_rc)${why:+ — $why}"
       [ $rc -ne 0 ] || rc=1
     fi
     # tokens: last assistant message of this turn = context in use; session totals = consumed
