@@ -38,7 +38,7 @@ opencode auth login        # e.g. OpenAI (ChatGPT/Codex), Google, Kimi, Moonshot
 /plugin install opencode-council@opencode-council
 ```
 
-(or from a terminal: `claude plugin marketplace add panaalexandrucristian/opencode-council` and `claude plugin install opencode-council@opencode-council`; add `--scope project` to install for one repository only). Plugin skills are namespaced, so the skill is invoked as **`/opencode-council:opencode …`**. To update later: `claude plugin marketplace update opencode-council`, then update the plugin from the `/plugin` menu.
+(or from a terminal: `claude plugin marketplace add panaalexandrucristian/opencode-council` and `claude plugin install opencode-council@opencode-council`; add `--scope project` to install for one repository only). Plugin skills are namespaced, so the skill is invoked as **`/opencode-council:opencode …`**. To update later: `claude plugin marketplace update opencode-council && claude plugin update opencode-council@opencode-council`, then restart Claude Code.
 
 **Option B — with the `skills` CLI** ([vercel-labs/skills](https://github.com/vercel-labs/skills), works for Claude Code and other agents; discovers the `SKILL.md` at the repo root):
 
@@ -76,7 +76,7 @@ Then, in Claude Code:
 
 ### 4. Update
 
-Plugin: `claude plugin marketplace update opencode-council` + update in `/plugin`. `skills` CLI: re-run `npx skills add …`. Git clone: `git -C ~/.claude/skills/opencode pull`.
+Plugin: `claude plugin marketplace update opencode-council && claude plugin update opencode-council@opencode-council` (restart Claude Code to apply). `skills` CLI: re-run `npx skills add …`. Git clone: `git -C ~/.claude/skills/opencode pull`.
 
 ## The council
 
