@@ -125,6 +125,15 @@ shell and permissions instead of assuming them, then agrees a plan, implements i
 result. It contains the `council.json`, the `answers.json`, the console output of `show` / `start` /
 `resume`, and the full [`transcript.md`](examples/transcript.md).
 
+## Cost and billing
+
+Council members are billed exactly like any other Claude Code / OpenCode session — headless mode is not priced differently:
+
+- **Claude members** (`claude -p … --resume`) use whatever `claude` is logged in with. On a claude.ai subscription (Pro/Max/Team/Enterprise) they are included in the plan and draw from the same 5-hour/weekly windows as your interactive session; the `cost` figures in `status` and the transcript are then only local list-price estimates. With an API key they are billed per token at list price. `council.sh` never uses `--bare` (which would ignore the subscription login and require `ANTHROPIC_API_KEY`).
+- **OpenCode members** are billed by the provider behind the model (OpenAI, Google, Kimi plan, …); `cost` comes from OpenCode's own accounting (0 on flat-rate plans).
+- N members = N full agent contexts per round, so a council uses a multiple of what one session would. Effort (`variant` / `--effort`) is the main lever.
+- Token/cost accounting follows the Claude Code version: from v2.1.277 a resumed session reports its cumulative spend, so `council.sh` reads the latest result instead of summing (detected at `start`, stored as `cl_cumulative` in `state.json`).
+
 ## `oc.sh` on its own
 
 ```bash

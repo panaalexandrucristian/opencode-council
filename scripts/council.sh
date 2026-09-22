@@ -56,6 +56,13 @@ done
 [ -n "$CMD" ] || { sed -n '2,12p' "$0"; exit 1; }
 abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$PWD/${1#./}" ;; esac; }
 
+# Claude Code >= 2.1.277 reports a resumed session's CUMULATIVE spend on every result (total_cost_usd, modelUsage);
+# earlier versions report per-call figures. Detect once so session totals are neither double-counted nor under-counted.
+claude_cumulative() {
+  local v; v=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); [ -n "$v" ] || { echo false; return; }
+  printf '%s\n%s\n' "2.1.277" "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -1 | grep -qx "2.1.277" && echo true || echo false
+}
+
 # ------------------------------------------------------------------ state ----
 # Everything lives in $RUN: config.json, state.json, prompts/, posts/, raw/, questions.json, transcript.md
 ST=""
@@ -205,10 +212,13 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
     sts --argjson i $i '.members[$i].cl_started=true'
     local u; u=$(jq -c '{ctx:((.usage.iterations // [.usage] | last) | (.input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens + .output_tokens)),
                         tot:(.usage | .input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens + .output_tokens),
+                        cum:([(.modelUsage // {})[] | .inputTokens + .cacheReadInputTokens + .cacheCreationInputTokens + .outputTokens] | add // 0),
                         lim:((.modelUsage // {}) | to_entries | max_by(.value.inputTokens + .value.cacheReadInputTokens + .value.cacheCreationInputTokens) | .value.contextWindow),
                         cost:(.total_cost_usd // 0)}' "$j" 2>/dev/null)
-    [ -n "$u" ] && sts --argjson i $i --argjson u "$u" \
-      '.members[$i] |= (.ctx_used=$u.ctx | .session_tokens+=$u.tot | .session_cost+=$u.cost | .calls+=1 | .session_calls+=1 | (if $u.lim then .ctx_limit=$u.lim else . end))'
+    [ -n "$u" ] && sts --argjson i $i --argjson u "$u" --argjson cum "$(st '.cl_cumulative // false')" \
+      '.members[$i] |= (.ctx_used=$u.ctx | .calls+=1 | .session_calls+=1 | (if $u.lim then .ctx_limit=$u.lim else . end)
+        | (if $cum then .session_tokens=$u.cum | .session_cost=$u.cost          # >= 2.1.277: result already carries the whole session
+           else .session_tokens+=$u.tot | .session_cost+=$u.cost end))'
   fi
   sts --argjson i $i '.members[$i].inflight=null'
   return $rc
@@ -562,9 +572,9 @@ case "$CMD" in
     "$OC" ensure >/dev/null || exit 1
     lim=$(check_opencode_models "$cfg") || exit 1
     mkdir -p "$RUN/prompts" "$RUN/posts" "$RUN/raw"; cp "$CONFIG" "$RUN/config.json"
-    jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" '
+    jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" '
       ($lim | split("\n") | map(select(length>0) | split("\t") | {key:.[0], value:(.[1]|tonumber)}) | from_entries) as $L |
-      {config:$cfg, run_dir:$run, started:$ts, status:"created", task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
+      {config:$cfg, run_dir:$run, started:$ts, status:"created", cl_cumulative:$cum, task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
        answers:[], pending_questions:null, results:[], log:[],
        members:[ $cfg.members[] | . + {session:null, gen:1, fresh:true, handover_note:null, ctx_used:0, ctx_limit:($L[.id] // null), session_tokens:0, session_cost:0, calls:0, session_calls:0, retired:[], inflight:null} ]}' >"$RUN/state.json"
     load_state
