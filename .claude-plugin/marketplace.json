@@ -9,7 +9,7 @@
       "name": "opencode-council",
       "source": "./",
       "description": "OpenCode via HTTP API + a cross-CLI council (OpenCode & Claude Code sessions) with explicit roster, no-assumptions questions and unanimous consensus.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "category": "productivity",
       "keywords": ["opencode", "council", "multi-agent", "consensus"]
     }

@@ -41,6 +41,10 @@ The service is global; each request targets a *location* (project directory):
 | `GET /api/session/{sid}/diff[?from=msg_&to=msg_&context=N]` | – | `{data:[{file, status, additions, deletions, patch}]}` (needs turn snapshots) |
 | `GET /api/vcs/status?location[directory]=D` | – | `{data:[{file, status, additions, deletions}]}` (git working tree) |
 
+`oc.sh` requires successful curl transport as well as a successful HTTP status. Result commands
+inspect structured assistant errors and idle outcomes; a failed or unavailable result remains
+printable for inspection but returns exit 1.
+
 Model ref = `Model.Info.id` + `providerID` (e.g. `{"providerID":"opencode","id":"muse-spark-1.3-contributor-free"}`);
 `oc.sh` accepts it as `provider/id`.
 

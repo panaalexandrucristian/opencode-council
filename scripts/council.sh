@@ -192,8 +192,11 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
   if [ "$kind" = opencode ]; then
     "$OC" wait "$sid" --timeout "$TIMEOUT" >/dev/null 2>"$RUN/raw/$tag-$id.err"; rc=$?
     if [ $rc -eq 2 ]; then "$OC" interrupt "$sid" >/dev/null 2>&1; log "member $id: timeout after ${TIMEOUT}s (interrupted)"; fi
-    "$OC" result "$sid" >"$out" 2>&1
-    grep -q '^\[error\]' "$out" && { log "member $id: $(grep '^\[error\]' "$out" | head -1)"; rc=1; }
+    "$OC" result "$sid" >"$out" 2>&1; local result_rc=$?
+    if [ $result_rc -ne 0 ]; then
+      log "member $id: result failed (exit $result_rc)"
+      [ $rc -ne 0 ] || rc=1
+    fi
     # tokens: last assistant message of this turn = context in use; session totals = consumed
     local msg; msg=$("$OC" api GET "/api/session/$sid/message?order=desc&limit=40" 2>/dev/null)
     local ctx; ctx=$(jq '[.data[] | select(.type=="assistant")][0].tokens | (.input + .output + (.reasoning//0) + .cache.read + .cache.write)' <<<"$msg" 2>/dev/null)

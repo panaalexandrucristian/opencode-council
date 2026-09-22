@@ -102,17 +102,20 @@ resolve() {
   die "OpenCode service did not become healthy within 30s (try: opencode service status / opencode service restart)"
 }
 
-# api METHOD PATH [JSON_BODY] -> prints response body; non-zero on HTTP >= 300
+# api METHOD PATH [JSON_BODY] -> prints response body; 1 on transport/HTTP/read failure
 api() {
-  local method=$1 path=$2 body=$3 out code
-  out=$(mktemp)
+  local method=$1 path=$2 body=$3 out code rc cat_rc
+  out=$(mktemp) || return 1
   if [ -n "$body" ]; then
     code=$(curl -s -o "$out" -w '%{http_code}' --max-time "$API_TIMEOUT" "${AUTH[@]}" -X "$method" "$BASE$path" \
            -H 'Content-Type: application/json' --data-binary "$body")
   else
     code=$(curl -s -o "$out" -w '%{http_code}' --max-time "$API_TIMEOUT" "${AUTH[@]}" -X "$method" "$BASE$path")
   fi
-  cat "$out"; rm -f "$out"
+  rc=$?
+  cat "$out"; cat_rc=$?; rm -f "$out"
+  [ $rc -eq 0 ] || { echo "oc: curl exited $rc for $method $path (HTTP $code)" >&2; return 1; }
+  [ $cat_rc -eq 0 ] || return 1
   case "$code" in
     2*) return 0 ;;
     *)  echo "" >&2; echo "oc: HTTP $code for $method $path" >&2; return 1 ;;
@@ -199,8 +202,8 @@ handle_permissions() {  # sid -> 0 none pending / 0 auto-approved / 3 pending an
   if [ "$AUTO" = true ]; then
     echo "$pend" | jq -r '.[] | "\(.id)\t\(.action) \(.resources|join(", "))"' | while IFS=$'\t' read -r pid what; do
       echo "oc: auto-approving permission $pid ($what)" >&2
-      api POST "/api/session/$sid/permission/$pid/reply" '{"decision":"once"}' >/dev/null
-    done
+      api POST "/api/session/$sid/permission/$pid/reply" '{"decision":"once"}' >/dev/null || return 1
+    done || return 1
     return 0
   fi
   echo "oc: session $sid is BLOCKED on permission request(s):" >&2
@@ -210,19 +213,22 @@ handle_permissions() {  # sid -> 0 none pending / 0 auto-approved / 3 pending an
 }
 
 wait_idle() {  # sid ; returns 0 idle, 2 timeout, 3 blocked on permission, 1 error
-  local sid=$1 deadline code rc chunk settle=0
+  local sid=$1 deadline code rc chunk ltype
   deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     handle_permissions "$sid"; rc=$?
     [ $rc -ne 0 ] && return $rc
     chunk=$(( deadline - $(date +%s) )); [ $chunk -gt 10 ] && chunk=10; [ $chunk -lt 1 ] && chunk=1
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$chunk" "${AUTH[@]}" -X POST "$BASE/api/experimental/session/$sid/wait")
+    rc=$?
+    [ $rc -eq 28 ] && continue   # polling slice expired; the overall deadline still applies
+    [ $rc -eq 0 ] || { echo "oc: wait curl exited $rc (HTTP $code)" >&2; return 1; }
     case "$code" in
       204|200)
         # idle according to the server; make sure the turn actually got recorded (idle marker is last)
-        if [ "$(last_type "$sid")" = "idle" ] || [ $settle -ge 5 ]; then return 0; fi
-        settle=$((settle+1)); sleep 1 ;;
-      000) ;;   # curl timed out: loop, re-check permissions
+        ltype=$(last_type "$sid") || return 1
+        [ "$ltype" = "idle" ] && return 0
+        sleep 1 ;;
       *) echo "oc: wait returned HTTP $code" >&2; return 1 ;;
     esac
   done
@@ -230,17 +236,19 @@ wait_idle() {  # sid ; returns 0 idle, 2 timeout, 3 blocked on permission, 1 err
   return 2
 }
 
-show_result() {  # sid -> text of the last turn
-  api GET "/api/session/$1/message?order=desc&limit=40" | jq -r '
-    .data as $m
+show_result() {  # sid -> available text; 0 only for a succeeded turn without assistant errors
+  api GET "/api/session/$1/message?order=desc&limit=40" | jq -rs '
+    (if length==1 and (.[0]|type)=="object" and (.[0].data|type)=="array"
+     then .[0].data else error("invalid message response") end) as $m
     | ($m | map(.type=="user") | index(true)) as $u
     | ($m | if $u == null then . else .[:$u] end | reverse) as $turn
     | ($turn | map(select(.type=="assistant") | .content[]? | select(.type=="text") | .text) | join("\n")) as $text
-    | ($turn | map(select(.type=="assistant" and .error != null) | .error.message)) as $errs
+    | ($turn | map(select(.type=="assistant" and .error != null) | (.error.message // "(unspecified error)"))) as $errs
     | ($turn | map(select(.type=="idle") | .outcome) | last) as $outcome
     | (if $text == "" then "(no text output in this turn)" else $text end),
       (if ($errs|length) > 0 then "\n[error] " + ($errs|join("; ")) else empty end),
-      (if $outcome != null and $outcome != "succeeded" then "\n[outcome] " + $outcome else empty end)'
+      (if $outcome != "succeeded" then "\n[outcome] " + ($outcome // "unavailable") else empty end),
+      (if ($errs|length)>0 or $outcome != "succeeded" then null | halt_error(1) else empty end)' || return 1
 }
 
 # -------------------------------------------------------------- commands ----
@@ -292,7 +300,7 @@ case "$cmd" in
     send_prompt "$sid" "$text" >/dev/null || die "prompt was not accepted by session $sid"
     [ "$NOWAIT" = true ] && { echo "$sid"; exit 0; }
     wait_idle "$sid"; rc=$?
-    [ $rc -eq 0 ] && show_result "$sid"
+    if [ $rc -eq 0 ]; then show_result "$sid"; rc=$?; fi
     exit $rc ;;
 
   run)
@@ -303,7 +311,7 @@ case "$cmd" in
     send_prompt "$sid" "$text" >/dev/null || die "prompt was not accepted by session $sid"
     [ "$NOWAIT" = true ] && { echo "$sid"; exit 0; }
     wait_idle "$sid"; rc=$?
-    [ $rc -eq 0 ] && show_result "$sid"
+    if [ $rc -eq 0 ]; then show_result "$sid"; rc=$?; fi
     exit $rc ;;
 
   wait)

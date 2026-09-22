@@ -56,6 +56,11 @@ list bash task external_directory webfetch websearch skill lsp` (`*` = any).
 `oc.sh wait <ses_id>` again (default timeout 600 s, `--timeout S` to change) or `oc.sh interrupt <ses_id>`
 · `3` blocked on a permission request (only with `--ask`, see above).
 
+`prompt`, `run` (when waiting), and `result` preserve available output but return **1** for
+transport/JSON errors, assistant errors, or a turn without a succeeded idle outcome. `wait`
+returns **0** only after observing an idle marker; deadline expiry remains **2**, and permission
+blocking remains **3**.
+
 ## Other commands
 
 | command | purpose |
@@ -104,7 +109,15 @@ Then: `council.sh show --config council.json` → paste the roster to the user a
 council.sh start  --config council.json --run-dir <scratchpad>/council-<name>     # new run dir, must not exist
 council.sh status --run-dir D                                                     # task/round, per-member context %, tokens, cost, pending questions
 council.sh resume --run-dir D --answers answers.json | --answer "text"            # after exit 4 (questions) or exit 2 (failure)
+council.sh resume --run-dir D --replace C=claude:sonnet:xhigh                     # swap a member's model/session (repeatable)
 ```
+
+`resume` re-runs only what is missing: a member that already has a valid post for the current
+round is reused, not called again. `--replace ID=kind:model:effort` (`kind` = `opencode` \| `claude`)
+gives a member a fresh session on another model — use it when its provider fails or runs out of
+quota. The new session keeps the member's id and mode, and its first prompt carries a handover note
+built from that member's own earlier posts, so it continues from its positions. The replaced
+session is retired (visible in `status`/transcript as an earlier generation).
 
 Runs take minutes (rounds × slowest member): start it in the background and read the log; keep
 `--run-dir` in the scratchpad. Exit codes: **0** all tasks reached consensus · **1** config error ·
@@ -128,7 +141,15 @@ writes a handover note, a fresh session is created for the same member id (gener
 note + council rules are prepended to its first prompt. `status` and the transcript show per member:
 generation, context %, session tokens, cost, calls, retired sessions.
 
-### 3. Report
+### 3. Tests
+
+`scripts/test-completion.sh` is an offline contract suite (no network, no model calls, ~1 s): it
+loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and
+HTTP failures, permission-reply propagation, `wait_idle` completion, `show_result` validation,
+`prompt`/`run` status propagation, and the council's rejection of votes from failed turns. Run it
+(plus `bash -n` on both scripts) after any change to `oc.sh` or `council.sh`.
+
+### 4. Report
 
 The transcript is `D/transcript.md`: roster, per-member context/tokens/cost/generations, per task
 the outcome (`consensus` / `ratified` / `unresolved` / `unratified`), the agreed text, every post

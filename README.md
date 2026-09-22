@@ -85,6 +85,7 @@ scripts/council.sh show   --config council.json              # validate + print 
 scripts/council.sh start  --config council.json --run-dir D  # run all tasks
 scripts/council.sh status --run-dir D                        # task/round, per-member context %, tokens, cost
 scripts/council.sh resume --run-dir D --answers answers.json # continue after the council asked questions
+council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member a fresh session on another model
 ```
 
 `council.json` — every field is explicit, nothing is defaulted silently:
@@ -114,6 +115,13 @@ How it works:
 - **No assumptions.** Each member must list every choice the task leaves open and what settles it (`task` / `dir` / `user` / `ask`). Anything not settled by the task, the working directory or an earlier answer becomes a question for the user: the run pauses (exit 4, `questions.json`), you answer, `resume` re-runs the round.
 - **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` the session writes a handover note and is replaced by a fresh session (same member, next generation) that starts from the note.
 - **Transcript.** `D/transcript.md`: roster, per-member tokens/context/cost/generations, every post by task and round, outcomes, Q&A, log.
+
+- **Resume is cheap and swappable.** `resume` re-runs only what is missing — a member that already
+  has a valid post for the current round is reused. `--replace ID=kind:model:effort` moves a member
+  to a fresh session on another model (its provider failed or ran out of quota); the new session
+  keeps the member's id and gets a handover note built from that member's own earlier posts.
+- **Tests.** `scripts/test-completion.sh` — offline contract suite (no network, no model calls),
+  run it together with `bash -n` on both scripts after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
