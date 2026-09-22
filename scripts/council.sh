@@ -117,7 +117,7 @@ validate_config() {  # $1 = config file -> prints normalised config json
     + (if ([.members[]?.id]|unique|length) == ([.members[]?.id]|length) then [] else ["member ids must be unique"] end)
     + (if (.max_rounds|type)=="number" and .max_rounds>=2 and .max_rounds<=10 then [] else ["max_rounds must be 2..10 (round 1 = proposals, consensus needs at least one voting round)"] end)
     + (if (.timeout_s|type)=="number" and .timeout_s>=30 then [] else ["timeout_s must be >= 30"] end)
-    + (if (.handover_at|type)=="number" and .handover_at>0 and .handover_at<=1 then [] else ["handover_at must be in (0,1]"] end)
+    + (if (.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))) then [] else ["handover_at must be a fraction in (0,1] of the model context window, or an absolute token count >= 1000 (e.g. 150000)"] end)
     + [ .tasks[]? | select((type=="string" and length>0) or (type=="object" and (.text|type)=="string") | not) | "each task must be a string or {id,text,execute}" ]
     | .[]' "$1" | sed 's/^/  /')
   [ -z "$err" ] || { echo "council: invalid config $1:" >&2; echo "$err" >&2; exit 1; }
@@ -126,7 +126,7 @@ validate_config() {  # $1 = config file -> prints normalised config json
   err=$(jq -r '.members[] | select(.kind=="claude") | select(.effort|IN("low","medium","high","xhigh","max")|not) | "  member \(.id): claude effort must be low|medium|high|xhigh|max"' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
   # optional per-member handover threshold (overrides the council-wide handover_at)
-  err=$(jq -r '.members[] | select(has("handover_at")) | select(((.handover_at|type)=="number" and .handover_at>0 and .handover_at<=1)|not) | "  member \(.id): handover_at must be a number in (0,1]"' "$1")
+  err=$(jq -r '.members[] | select(has("handover_at")) | select(((.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))))|not) | "  member \(.id): handover_at must be a fraction in (0,1] or an absolute token count >= 1000"' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
   # optional prose-compression style (see style_rules): normal (default) | lite | caveman | ultra
   err=$(jq -r '(if (.style // "normal")|IN("normal","lite","caveman","ultra")|not then "  style must be normal|lite|caveman|ultra" else empty end),
@@ -162,14 +162,14 @@ print_roster() {  # $1 = normalised config json, $2 = ctx-limit tsv (id<TAB>limi
   echo "COUNCIL ROSTER"
   echo "  sessions: $(jq -r '.members|length' <<<"$cfg") total = $(jq -r '[.members[]|select(.kind=="opencode")]|length' <<<"$cfg") OpenCode + $(jq -r '[.members[]|select(.kind=="claude")]|length' <<<"$cfg") Claude Code"
   printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %-9s %s\n' id kind model effort mode agent/perm style handover ctx-window
-  jq -r --argjson d "$(jq -r '.handover_at' <<<"$cfg")" '.members[] | "\(.id)\t\(.kind)\t\(.model)\t\(.effort)\t\(.mode)\t\(.agent // .permission_mode)\t\(.style // "normal")\t\(((.handover_at // $d)*100|floor|tostring)+"%")"' <<<"$cfg" | while IFS=$'\t' read -r id kind model effort mode ag sty ho; do
+  jq -r --argjson d "$(jq -r '.handover_at' <<<"$cfg")" '.members[] | "\(.id)\t\(.kind)\t\(.model)\t\(.effort)\t\(.mode)\t\(.agent // .permission_mode)\t\(.style // "normal")\t\((.handover_at // $d) as $h | if $h > 1 then (($h/1000|floor)|tostring)+"k tok" else (($h*100|floor)|tostring)+"%" end)"' <<<"$cfg" | while IFS=$'\t' read -r id kind model effort mode ag sty ho; do
     local l; l=$(printf '%s\n' "$lim" | awk -F'\t' -v i="$id" '$1==i{print $2}')
     [ -n "$l" ] && l="$((l/1000))k" || l="(from first reply)"
     printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %-9s %s\n' "$id" "$kind" "$model" "$effort" "$mode" "$ag" "$sty" "$ho" "$l"
   done
   echo "  executor (only member allowed to edit files): $(jq -r '.executor // "none — read-only council"' <<<"$cfg")"
   echo "  dir: $(jq -r .dir <<<"$cfg")"
-  echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at*100|floor' <<<"$cfg")% context (council default; per-member values in the table) · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
+  echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at as $h | if $h > 1 then ($h|tostring)+" tokens" else (($h*100|floor)|tostring)+"% of context" end' <<<"$cfg") (council default; per-member values in the table) · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
   echo "  tasks:"; jq -r '.tasks[] | "    \(.id)\(if .execute then " [build]" else "" end): \(.text|gsub("\n";" ")|.[0:110])"' <<<"$cfg"
 }
 
@@ -569,11 +569,14 @@ TXT
 # ------------------------------------------------------------- engine ----
 ctx_pct() { st ".members[$1] | if (.ctx_limit // 0) > 0 and (.ctx_used // 0) > 0 then ((.ctx_used / .ctx_limit) * 100 | floor) else 0 end"; }
 member_handover_at() { st ".members[$1].handover_at // $HANDOVER"; }
-needs_handover() { st ".members[$1] | ((.session_calls // 0) >= 2 and (.ctx_limit // 0) > 0 and (.ctx_used // 0) > 0 and (.ctx_used / .ctx_limit) >= (.handover_at // $HANDOVER))" | grep -q true; }
+# handover_at <= 1 is a fraction of the model's context window; > 1 is an absolute token count.
+needs_handover() { st ".members[$1] | (.handover_at // $HANDOVER) as \$h
+  | ((.session_calls // 0) >= 2 and (.ctx_used // 0) > 0
+     and (if \$h > 1 then (.ctx_used >= \$h) else ((.ctx_limit // 0) > 0 and (.ctx_used / .ctx_limit) >= \$h) end))" | grep -q true; }
 
 do_handover() {  # idx -> old session writes a note; new session created; note stored for the next prompt
   local i=$1 id; id=$(mid $i)
-  log "member $id: context $(ctx_pct $i)% >= $(st ".members[$1] | ((.handover_at // $HANDOVER)*100|floor)")% — handover to a new session"
+  log "member $id: context $(st ".members[$i].ctx_used // 0") tokens ($(ctx_pct $i)%) reached its $(st ".members[$i] | (.handover_at // $HANDOVER) as \$h | if \$h > 1 then (\$h|tostring)+\" tokens\" else ((\$h*100|floor)|tostring)+\"%\" end") handover threshold — new session"
   local pf="$RUN/prompts/handover-$id-g$(mget $i gen).md"; prompt_handover $i >"$pf"
   launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
@@ -856,7 +859,7 @@ case "$CMD" in
   status)
     [ -n "$RUN" ] || die "status needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     echo "run: $RUN · status: $(st .status) · task $(st '.task_id // "-"') ($(st .task_idx)/$(st '.config.tasks|length') done) · phase $(st .phase) · round $(st .round)/$MAXR"
-    st '.members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)% of \(((.handover_at // 0.5)*100|floor))% handover) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
+    st '.members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)%; handover at \((.handover_at // 0.5) as $h | if $h > 1 then ($h|tostring)+" tok" else (($h*100|floor)|tostring)+"%" end))) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
     usage_totals
     st '.results[] | "  task \(.task): \(.outcome) (\(.rounds) rounds)"'
     jq -r '.pending_questions[]? | "  PENDING [\(.id)] member \(.member): \(.question)"' "$ST"

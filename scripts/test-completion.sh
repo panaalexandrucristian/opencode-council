@@ -264,6 +264,10 @@ handover_tests() (
   mk 0.85 900 2; check 0 'member threshold 0.85 fires at 90%' '' needs_handover 0
   mk 0.3 900 1;  check 1 'no handover before the session made two calls' '' needs_handover 0
   mk 0.3 0 5;    check 1 'no handover without a context reading' '' needs_handover 0
+  mk 150000 149999 2; check 1 'absolute threshold not reached below 150k tokens' '' needs_handover 0
+  mk 150000 150000 2; check 0 'absolute threshold reached at exactly 150k tokens' '' needs_handover 0
+  mk 150000 900000 1; check 1 'absolute threshold still needs two calls' '' needs_handover 0
+  mk 1000 2000 2;  check 0 'absolute threshold ignores the context window' '' needs_handover 0
   mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
   mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
 )
