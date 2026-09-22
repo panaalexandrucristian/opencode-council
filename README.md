@@ -115,7 +115,7 @@ How it works:
 - **Unanimous consensus.** Round 1 = proposals; then a rotating proposer's position is the frozen candidate and everyone votes `agree` / `disagree` (with a complete revised proposal). All `agree` = consensus. `max_rounds` reached = `unresolved` (exit 5), dissent preserved — never a forced verdict.
 - **Build tasks.** Consensus on a plan → the single `executor` implements it → the council ratifies the report + diff (fix rounds if needed).
 - **No assumptions.** Each member must list every choice the task leaves open and what settles it (`task` / `dir` / `user` / `ask`). Anything not settled by the task, the working directory or an earlier answer becomes a question for the user: the run pauses (exit 4, `questions.json`), you answer, `resume` re-runs the round.
-- **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` the session writes a handover note and is replaced by a fresh session (same member, next generation) that starts from the note.
+- **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` the session writes a handover note and is replaced by a fresh session (same member, next generation) that starts from the note. `handover_at` is a council-wide default that any member can override with its own value, so a member on a small context window (or an expensive one) hands over earlier.
 - **Transcript.** `D/transcript.md`: roster, per-member tokens/context/cost/generations, every post by task and round, outcomes, Q&A, log.
 - **Visible truncation.** Diffs retain their 20000-byte cap; truncated output ends with the cap and the working directory to inspect.
 

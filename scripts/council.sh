@@ -19,7 +19,7 @@
 #   "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "handover_at": 0.5, "max_turns": 30,
 #   "executor": "A" | null,
 #   "tasks": ["question", {"id":"t2","text":"...","execute":true}],
-#   "members": [ {"id":"A","kind":"opencode","model":"openai/gpt-6-astra","effort":"high","mode":"read"},
+#   "members": [ {"id":"A","kind":"opencode","model":"openai/gpt-6-astra","effort":"high","mode":"read","handover_at":0.35},
 #                {"id":"B","kind":"claude","model":"sonnet","effort":"high","mode":"read"} ]
 # }
 # mode read -> opencode agent "plan" / claude --permission-mode plan; mode edit -> "build" / acceptEdits.
@@ -31,6 +31,7 @@
 # plan -> executor implements -> ratification rounds on the report + diff. Any question pauses the run (exit 4).
 # Context: after every call the member's context usage is measured; at >= handover_at of the model's window the
 # session writes a handover note and is replaced by a fresh session (same member id, next generation).
+# handover_at is the council-wide default; a member may set its own handover_at to hand over earlier or later.
 set -o pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd); OC="$HERE/oc.sh"
@@ -117,6 +118,9 @@ validate_config() {  # $1 = config file -> prints normalised config json
   # claude effort values; opencode efforts are checked against the model's variants below
   err=$(jq -r '.members[] | select(.kind=="claude") | select(.effort|IN("low","medium","high","xhigh","max")|not) | "  member \(.id): claude effort must be low|medium|high|xhigh|max"' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
+  # optional per-member handover threshold (overrides the council-wide handover_at)
+  err=$(jq -r '.members[] | select(has("handover_at")) | select(((.handover_at|type)=="number" and .handover_at>0 and .handover_at<=1)|not) | "  member \(.id): handover_at must be a number in (0,1]"' "$1")
+  [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
   # optional prose-compression style (see style_rules): normal (default) | lite | caveman | ultra
   err=$(jq -r '(if (.style // "normal")|IN("normal","lite","caveman","ultra")|not then "  style must be normal|lite|caveman|ultra" else empty end),
                (.members[] | select((.style // "normal")|IN("normal","lite","caveman","ultra")|not) | "  member \(.id): style must be normal|lite|caveman|ultra")' "$1")
@@ -126,8 +130,8 @@ validate_config() {  # $1 = config file -> prints normalised config json
                                   else {id:(.value.id // ("t"+((.key+1)|tostring))), text:.value.text, execute:(.value.execute==true)} end)]
       | .max_turns = (.max_turns // 30)
       | .style = (.style // "normal")
-      | .members |= [ .[] | {style: $s} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
-                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "normal"' "$1")" "$1"
+      | .members |= [ .[] | {style: $s, handover_at: $h} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
+                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "normal"' "$1")" --argjson h "$(jq -r '.handover_at' "$1")" "$1"
 }
 
 check_opencode_models() {  # $1 = normalised config json -> validates model + variant against the live server; prints ctx limits json
@@ -150,15 +154,15 @@ print_roster() {  # $1 = normalised config json, $2 = ctx-limit tsv (id<TAB>limi
   local cfg=$1 lim=$2
   echo "COUNCIL ROSTER"
   echo "  sessions: $(jq -r '.members|length' <<<"$cfg") total = $(jq -r '[.members[]|select(.kind=="opencode")]|length' <<<"$cfg") OpenCode + $(jq -r '[.members[]|select(.kind=="claude")]|length' <<<"$cfg") Claude Code"
-  printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %s\n' id kind model effort mode agent/perm style ctx-window
-  jq -r '.members[] | "\(.id)\t\(.kind)\t\(.model)\t\(.effort)\t\(.mode)\t\(.agent // .permission_mode)\t\(.style // "normal")"' <<<"$cfg" | while IFS=$'\t' read -r id kind model effort mode ag sty; do
+  printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %-9s %s\n' id kind model effort mode agent/perm style handover ctx-window
+  jq -r --argjson d "$(jq -r '.handover_at' <<<"$cfg")" '.members[] | "\(.id)\t\(.kind)\t\(.model)\t\(.effort)\t\(.mode)\t\(.agent // .permission_mode)\t\(.style // "normal")\t\(((.handover_at // $d)*100|floor|tostring)+"%")"' <<<"$cfg" | while IFS=$'\t' read -r id kind model effort mode ag sty ho; do
     local l; l=$(printf '%s\n' "$lim" | awk -F'\t' -v i="$id" '$1==i{print $2}')
     [ -n "$l" ] && l="$((l/1000))k" || l="(from first reply)"
-    printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %s\n' "$id" "$kind" "$model" "$effort" "$mode" "$ag" "$sty" "$l"
+    printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %-9s %s\n' "$id" "$kind" "$model" "$effort" "$mode" "$ag" "$sty" "$ho" "$l"
   done
   echo "  executor (only member allowed to edit files): $(jq -r '.executor // "none — read-only council"' <<<"$cfg")"
   echo "  dir: $(jq -r .dir <<<"$cfg")"
-  echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at*100|floor' <<<"$cfg")% context · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
+  echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at*100|floor' <<<"$cfg")% context (council default; per-member values in the table) · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
   echo "  tasks:"; jq -r '.tasks[] | "    \(.id)\(if .execute then " [build]" else "" end): \(.text|gsub("\n";" ")|.[0:110])"' <<<"$cfg"
 }
 
@@ -557,11 +561,12 @@ TXT
 
 # ------------------------------------------------------------- engine ----
 ctx_pct() { st ".members[$1] | if (.ctx_limit // 0) > 0 and (.ctx_used // 0) > 0 then ((.ctx_used / .ctx_limit) * 100 | floor) else 0 end"; }
-needs_handover() { st ".members[$1] | ((.session_calls // 0) >= 2 and (.ctx_limit // 0) > 0 and (.ctx_used // 0) > 0 and (.ctx_used / .ctx_limit) >= $HANDOVER)" | grep -q true; }
+member_handover_at() { st ".members[$1].handover_at // $HANDOVER"; }
+needs_handover() { st ".members[$1] | ((.session_calls // 0) >= 2 and (.ctx_limit // 0) > 0 and (.ctx_used // 0) > 0 and (.ctx_used / .ctx_limit) >= (.handover_at // $HANDOVER))" | grep -q true; }
 
 do_handover() {  # idx -> old session writes a note; new session created; note stored for the next prompt
   local i=$1 id; id=$(mid $i)
-  log "member $id: context $(ctx_pct $i)% >= $(st ".config.handover_at*100|floor")% — handover to a new session"
+  log "member $id: context $(ctx_pct $i)% >= $(st ".members[$1] | ((.handover_at // $HANDOVER)*100|floor)")% — handover to a new session"
   local pf="$RUN/prompts/handover-$id-g$(mget $i gen).md"; prompt_handover $i >"$pf"
   launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
@@ -826,7 +831,7 @@ case "$CMD" in
   status)
     [ -n "$RUN" ] || die "status needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     echo "run: $RUN · status: $(st .status) · task $(st '.task_id // "-"') ($(st .task_idx)/$(st '.config.tasks|length') done) · phase $(st .phase) · round $(st .round)/$MAXR"
-    st '.members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)%) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
+    st '.members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)% of \(((.handover_at // 0.5)*100|floor))% handover) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
     usage_totals
     st '.results[] | "  task \(.task): \(.outcome) (\(.rounds) rounds)"'
     jq -r '.pending_questions[]? | "  PENDING [\(.id)] member \(.member): \(.question)"' "$ST"

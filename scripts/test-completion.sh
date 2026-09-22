@@ -253,5 +253,19 @@ style_tests() (
   check 0 'rules_text omits the rule for a normal member' '' test -z "$(rules_text 1 | grep '6. Style')"
   check 0 'rules_text still states the tail rule for a styled member' 'MUST end with a JSON tail' rules_text 0
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests; do "$suite" || exit 1; done
+handover_tests() (
+  load council.sh; ST="$scratch/ho-state.json"; N=3; HANDOVER=0.5
+  mk() { jq -n --argjson ho "$1" --argjson used "$2" --argjson calls "$3" \
+    '{members:[({id:"A",ctx_limit:1000,ctx_used:$used,session_calls:$calls} + (if $ho==null then {} else {handover_at:$ho} end))]}' >"$ST"; }
+  mk null 400 2; check 1 'default threshold not reached at 40%' '' needs_handover 0
+  mk null 600 2; check 0 'default threshold reached at 60%' '' needs_handover 0
+  mk 0.3 400 2;  check 0 'member threshold 0.3 fires at 40%' '' needs_handover 0
+  mk 0.85 600 2; check 1 'member threshold 0.85 does not fire at 60%' '' needs_handover 0
+  mk 0.85 900 2; check 0 'member threshold 0.85 fires at 90%' '' needs_handover 0
+  mk 0.3 900 1;  check 1 'no handover before the session made two calls' '' needs_handover 0
+  mk 0.3 0 5;    check 1 'no handover without a context reading' '' needs_handover 0
+  mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
+  mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
+)
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests handover_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"
