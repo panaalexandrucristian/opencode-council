@@ -4,6 +4,7 @@ set -o pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d /tmp/opencode-completion.XXXXXX) || exit 1
 export TMPDIR="$scratch"
+: >"$scratch/passed"
 trap '[ "$BASH_SUBSHELL" -ne 0 ] || rm -rf "$scratch"' EXIT
 curl() { echo "unexpected network call" >&2; return 99; }
 load() { eval "$(sed '/^# .* commands /,$d' "$HERE/$1")"; }
@@ -14,6 +15,7 @@ check() {
     echo "FAIL $name: exit $got, wanted $want; expected text: $text"; cat "$scratch/out" "$scratch/err"; exit 1
   fi
   echo "PASS $name"
+  echo x >>"$scratch/passed"
 }
 api_tests() (
   load oc.sh
@@ -88,4 +90,168 @@ council_tests() (
   check 0 'council accepted the successful vote' '' jq -e '.last_votes[0].vote=="agree"' "$ST"
   result_rc=1; for wait_rc in 2 3; do sts '.members[0].inflight={tag:"wait"}'; check "$wait_rc" "council preserves wait=$wait_rc" '' collect 0; done
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests; do "$suite" || exit 1; done
+
+dedup_tests() (
+  load council.sh; RUN="$scratch/dedup"; ST="$RUN/state.json"; N=3; MAXR=4; DIR=$scratch; EXEC=""
+  mkdir -p "$RUN/posts" "$RUN/raw" "$RUN/prompts"
+  local task='{"id":"fixture","text":"Test exact proposals","execute":false}'
+  local proposal; proposal=$(jq -nr '"Unicode café 雪; quotes \"x\", literal \\n, actual\nnewline and \\path. " * 8')
+  write_post() {
+    jq -cn --arg p "$2" '{vote:"propose",proposal:$p,questions:[]}' >"$RUN/posts/fixture-r1-$1.json"
+    { echo "Prose from $1."; echo '```json'; cat "$RUN/posts/fixture-r1-$1.json"; echo '```'; } >"$RUN/posts/fixture-r1-$1.md"
+  }
+  fixture() {
+    jq -n --arg p "$proposal" --arg d "$DIR" --argjson t "$task" '{candidate:{id:"fixture-c1",member:"A",text:$p},task_id:"fixture",answers:[],notices:[],log:[],results:[],
+      config:{dir:$d,tasks:[$t],members:[],max_rounds:4},
+      members:(["A","B","C"]|map({id:.,kind:"opencode",model:"fixture",effort:"high",mode:"read",fresh:false,session_calls:0,retired:[]}))}' >"$ST"
+    write_post A "$proposal"; write_post B "Different B"; write_post C "Different C"
+  }
+  pair() {
+    local r=2
+    prompt_roundN_full "$1" "$task" 2 >"$scratch/full"
+    prompt_roundN "$1" "$task" 2 >"$scratch/dedup-prompt" 2>"$scratch/dedup-log"
+  }
+  fallback() { pair "${1:-1}"; cmp -s "$scratch/full" "$scratch/dedup-prompt" && [ ! -s "$scratch/dedup-log" ]; }
+  exact() {
+    fixture
+    [ "$1" != trailing ] || { proposal="$proposal"$'\n\n'; fixture; }
+    [ "$1" != fresh ] || sts '.members[1].fresh=true'
+    cp "$ST" "$scratch/before-state"; cp "$RUN/posts/fixture-r1-A.md" "$scratch/before-post"
+    pair 1
+    grep -q '^Exact candidate:' "$scratch/dedup-prompt" &&
+      grep -q '^<<<COUNCIL_POST fixture-r1-A>>>$' "$scratch/dedup-prompt" &&
+      grep -q '1a.*saved' "$scratch/dedup-log" || return 1
+    # Decode the source actually carried in the generated prompt, not just its sidecar.
+    awk '/^<<<COUNCIL_POST fixture-r1-A>>>$/{p=1;next} /^--- member C ---$/{p=0} p' "$scratch/dedup-prompt" >"$scratch/source"
+    tail_json "$scratch/source" >"$scratch/source.json"
+    jq -e --slurpfile p "$scratch/source.json" '.candidate.text==$p[0].proposal' "$ST" >/dev/null &&
+      cmp -s "$ST" "$scratch/before-state" && cmp -s "$RUN/posts/fixture-r1-A.md" "$scratch/before-post"
+  }
+  check 0 'dedup exact decoded equality, Unicode, escaped quotes/newlines, posts/state unchanged' '' exact resumed
+  check 0 'dedup fresh session' '' exact fresh
+  check 0 'dedup preserves trailing proposal newlines' '' exact trailing
+  difference() { fixture; sts --arg suffix "$1" '.candidate.text += $suffix'; fallback; }
+  check 0 'dedup one-character difference falls back' '' difference x
+  check 0 'dedup whitespace difference falls back' '' difference ' '
+  check 0 'dedup newline difference falls back' '' difference $'\n'
+  missing() { fixture; case "$1" in md|json) : >"$RUN/posts/fixture-r1-A.$1";; parse) echo '{' >"$RUN/posts/fixture-r1-A.json";; tail) echo '```json' >"$RUN/posts/fixture-r1-A.md";; mismatch) echo '{"proposal":"other"}' >"$RUN/posts/fixture-r1-A.json";; esac; fallback; }
+  for kind in md json parse tail mismatch; do check 0 "dedup missing/invalid/mismatched $kind falls back" '' missing "$kind"; done
+  excluded() { fixture; fallback 0; }
+  check 0 'dedup excluded proposer never becomes source' '' excluded
+  unsafe_id() { fixture; write_post 'A>>>' "$proposal"; sts '.members[0].id="A>>>" | .candidate.member="A>>>"'; fallback; }
+  check 0 'dedup ambiguous anchor spelling falls back' '' unsafe_id
+  no_temp() { fixture; mktemp() { return 1; }; fallback; }
+  check 0 'dedup unavailable scratch space falls back' '' no_temp
+  short() { fixture; write_post A tiny; sts '.candidate.text="tiny"'; fallback; }
+  check 0 'dedup non-positive saving falls back' '' short
+  collision() {
+    fixture
+    case "$1" in
+      post) echo '<<<COUNCIL_POST fixture-r1-A>>>' >>"$RUN/posts/fixture-r1-C.md";;
+      answer) sts '.answers=[{task:"fixture",question:"marker",answer:"COUNCIL_POST",member:"A"}]';;
+      note) sts '.notices=["COUNCIL_POST"]';;
+      handover) echo 'COUNCIL_POST' >"$scratch/handover"; sts --arg f "$scratch/handover" '.members[1] += {fresh:true,handover_note:$f}';;
+    esac
+    fallback
+  }
+  for kind in post answer note handover; do check 0 "dedup marker collision in $kind falls back" '' collision "$kind"; done
+  twins() {
+    fixture; write_post C "$proposal"; sts '.candidate.text="An unrelated candidate"'
+    case "$1" in
+      near) write_post C "$proposal "; fallback; return;;
+      escaping) sed 's/Unicode/\\u0055nicode/' "$RUN/posts/fixture-r1-C.md" >"$scratch/escaped"; cp "$scratch/escaped" "$RUN/posts/fixture-r1-C.md"; fallback; return;;
+      mismatch) echo '{}' >"$RUN/posts/fixture-r1-C.json"; fallback; return;;
+      combined) sts --arg p "$proposal" '.candidate.text=$p';;
+    esac
+    pair 1
+    grep -q '"(identical to the proposal string in COUNCIL_POST fixture-r1-A above)"' "$scratch/dedup-prompt" &&
+      [ "$(grep -c '^<<<COUNCIL_POST ' "$scratch/dedup-prompt")" -eq 1 ] && grep -q '1b.*saved' "$scratch/dedup-log" || return 1
+    [ "$1" != combined ] || grep -q '1a.*saved' "$scratch/dedup-log"
+  }
+  check 0 'dedup two byte-identical relayed tokens' '' twins exact
+  check 0 'dedup 1a/1b share one complete source and unique anchor' '' twins combined
+  check 0 'dedup nearly identical relayed tokens stay verbatim' '' twins near
+  check 0 'dedup equal decoded strings with different raw escaping stay verbatim' '' twins escaping
+  check 0 'dedup relayed token with mismatched sidecar stays verbatim' '' twins mismatch
+  roundtrip_failure() {
+    fixture
+    eval "$(declare -f dedup_replace | sed '1s/dedup_replace/real_replace/')"
+    dedup_replace() { if [[ "$2" == '<<<CANDIDATE '* ]] && [[ "$2" == *'Exact candidate:'* ]]; then printf broken; else real_replace "$@"; fi; }
+    fallback
+  }
+  check 0 'dedup failed byte-for-byte re-substitution falls back' '' roundtrip_failure
+  ambiguous() {
+    fixture
+    jq -c '. + {nested:{proposal:.proposal}}' "$RUN/posts/fixture-r1-A.json" >"$scratch/ambiguous.json"
+    cp "$scratch/ambiguous.json" "$RUN/posts/fixture-r1-A.json"
+    { echo '```json'; cat "$scratch/ambiguous.json"; echo '```'; } >"$RUN/posts/fixture-r1-A.md"
+    write_post C "$proposal"; sts '.candidate.text="other"'
+    # A remains a complete source, but C contains the same token in two tail fields.
+    cp "$RUN/posts/fixture-r1-A.json" "$RUN/posts/fixture-r1-C.json"; cp "$RUN/posts/fixture-r1-A.md" "$RUN/posts/fixture-r1-C.md"
+    fallback
+  }
+  check 0 'dedup ambiguous token occurrence falls back' '' ambiguous
+  fixture; sts '.last_votes=[{member:"A",vote:"agree"},{member:"B",vote:"agree"},{member:"C",vote:"agree"}]'
+  check 0 'unanimity still accepts all agree' '' all_agree
+  check 0 'agree position is authoritative candidate text' "$proposal" position_of 0
+  sts '.last_votes[1]={member:"B",vote:"disagree",proposal:"Revised"}'
+  check 1 'unanimity still rejects a dissent' '' all_agree
+  check 0 'rotating proposer retains revised position' Revised position_of 1
+  render_transcript() { :; }; launch() { echo called >>"$scratch/launched"; return 99; }
+  sts '.reuse_posts=true'; cp "$RUN/posts/fixture-r1-B.md" "$RUN/posts/fixture-r2-B.md"; cp "$RUN/posts/fixture-r1-B.json" "$RUN/posts/fixture-r2-B.json"
+  check 0 'resume reuses valid post without regenerating or calling a member' '' run_step r2 prompt_roundN "$task" 2 1
+  check 1 'resume reused post did not launch' '' test -e "$scratch/launched"
+  launch() { sts --argjson i "$1" --arg tag "$3" '.members[$i].inflight={tag:$tag}'; }
+  collect() { printf '%s\n' '```json' '{"vote":"propose","proposal":"not settled","open":[{"item":"choice","settled_by":"ask","where":"Which?"}],"questions":[]}' '```' >"$RUN/raw/fixture-r2-B.md"; }
+  check 0 'no-assumptions guard still converts proposals to questions' '' run_step r2 prompt_roundN "$task" 2 1
+  check 0 'question conversion keeps original post and nulls parsed proposal' '' jq -e '.last_votes[0] | .vote=="question" and .proposal==null and .questions==["Which?"]' "$ST"
+)
+
+report_tests() (
+  load council.sh; RUN="$scratch/report"; ST="$RUN/state.json"; DIR="$scratch/working directory"; OC=fake_diff
+  mkdir -p "$RUN/posts" "$DIR"
+  jq -n '{members:[{id:"A",kind:"opencode",session_tokens:10,session_cost:1,retired:[{tokens:20,cost:2},{tokens:30,cost:3}]},{id:"B",session_tokens:40,session_cost:4}],config:{tasks:[]},results:[],log:[]}' >"$ST"
+  check 0 'member final + retired subtotal' 'member A: final-generation 10 tokens / $1 + retired 50 tokens / $5 = subtotal 60 tokens / $6' usage_totals
+  check 0 'run totals include all generations and missing retired arrays' 'RUN TOTAL: 100 tokens / $10' usage_totals
+  check 0 'transcript renders usage totals' '' render_transcript
+  check 0 'transcript contains run total' 'RUN TOTAL: 100 tokens / $10' cat "$RUN/transcript.md"
+  fake_diff() { jq -jn --argjson n "$size" '"x"*$n'; }
+  diff_case() {
+    size=$1; diff_text 0 >"$scratch/diff"
+    if [ "$size" -gt 20000 ]; then
+      grep -Fq "[DIFF TRUNCATED: 20000-byte cap; inspect the full working directory: $DIR]" "$scratch/diff" &&
+        [ "$(head -c 20000 "$scratch/diff" | tr -d x | wc -c)" -eq 0 ]
+    else [ "$(wc -c <"$scratch/diff")" -eq "$size" ] && ! grep -q TRUNCATED "$scratch/diff"; fi
+  }
+  check 0 'diff below cap is byte-identical (no final newline)' '' diff_case 19999
+  check 0 'diff at exact cap is not marked truncated' '' diff_case 20000
+  check 0 'diff truncated mid-line names 20000-byte cap and directory' '' diff_case 20001
+  sts '.members[0].kind="claude"'
+  git() { case "$*" in *rev-parse*) return 0;; 'status --short') :;; diff) fake_diff;; *) return 99;; esac; }
+  check 0 'git fallback diff also reports truncation' '' diff_case 21000
+  local cfg='{"members":[{"id":"A","model":"astra","effort":"xhigh"},{"id":"B","model":"fable","effort":"xhigh"},{"id":"C","model":"kimi","effort":"max"}],"tasks":["one","two"],"max_rounds":4}'
+  check 0 'cost note config-only member-round count' '3 members x 4 rounds x 2 tasks = 24' cost_note "$cfg"
+  check 0 'cost note warns in measured expensive range' WARNING cost_note "$cfg"
+  check 0 'cost note quotes measured Fable cost' 'Claude Fable alone: $20.2' cost_note "$cfg"
+)
+style_tests() (
+  load council.sh; ST="$scratch/style-state.json"; N=2
+  jq -n '{members:[{id:"A",kind:"opencode",model:"m",effort:"low",mode:"read",style:"caveman"},
+                   {id:"B",kind:"claude",model:"opus",effort:"high",mode:"read",style:"normal"}],
+          config:{dir:"/tmp",executor:null}}' >"$ST"
+  DIR=/tmp; EXEC=""
+  check 0 'style normal adds no rule' '' test -z "$(style_rules normal)"
+  check 0 'style unknown adds no rule' '' test -z "$(style_rules grunt)"
+  for lvl in lite caveman ultra; do
+    check 0 "style $lvl is rule 6" '6. Style' style_rules "$lvl"
+  done
+  for lvl in caveman ultra; do
+    check 0 "style $lvl protects the JSON tail" 'NEVER compress: the JSON tail' style_rules "$lvl"
+    check 0 "style $lvl protects precision" 'Precision beats brevity' style_rules "$lvl"
+  done
+  check 0 'rules_text carries the member style' '6. Style — caveman' rules_text 0
+  check 0 'rules_text omits the rule for a normal member' '' test -z "$(rules_text 1 | grep '6. Style')"
+  check 0 'rules_text still states the tail rule for a styled member' 'MUST end with a JSON tail' rules_text 0
+)
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests; do "$suite" || exit 1; done
+echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

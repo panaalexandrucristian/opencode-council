@@ -99,9 +99,13 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | project directory | `dir` | absolute; the sessions inspect/edit it |
 | the tasks | `tasks[]` | strings, or `{"id","text","execute":true}` for a build task (plan → executor implements → council ratifies the diff) |
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |
+| prose style (optional) | `style` (top level and/or per member) | `normal` (default), `lite`, `caveman`, `ultra` — compresses only the prose a member writes for the others, modelled on the [caveman skill](https://github.com/juliusbrussee/caveman). The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
 | context handover threshold | `handover_at` (0..1] | at ≥ this fraction of the model's context window the session writes a handover note and is replaced by a fresh session (same member id, next generation); the user asked for **0.5** |
 
 Then: `council.sh show --config council.json` → paste the roster to the user and get a yes before `start`.
+`show` also prints members × rounds × tasks, the high/highest-effort members, and a
+config-only cost note with two measured comparisons and cost-reduction levers. Its warning
+is advisory; the measurements are not dollar predictions.
 
 ### 2. Run
 
@@ -139,15 +143,24 @@ last assistant message vs the model's context limit; Claude: `usage` of the last
 `modelUsage.contextWindow`). At ≥ `handover_at` (after at least 2 calls on that session) the session
 writes a handover note, a fresh session is created for the same member id (generation +1), and the
 note + council rules are prepended to its first prompt. `status` and the transcript show per member:
-generation, context %, session tokens, cost, calls, retired sessions.
+generation, context %, session tokens, cost, calls, retired sessions. Both include each
+member's final-generation + retired subtotal and a **RUN TOTAL** across all generations.
+
+**Lossless prompt de-duplication.** In voting rounds, an exactly matching candidate or a
+byte-identical proposal token can refer to a uniquely anchored peer post in the same prompt.
+The source stays complete; exact comparisons and a byte-for-byte reconstruction check guard
+every substitution, with full-text fallback on ambiguity. Substitutions go through the run log.
+Votes still target the authoritative candidate in state. Capped diffs end with a visible
+`DIFF TRUNCATED` line naming the 20000-byte cap and the directory to inspect.
 
 ### 3. Tests
 
-`scripts/test-completion.sh` is an offline contract suite (no network, no model calls, ~1 s): it
+`scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
 loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and
 HTTP failures, permission-reply propagation, `wait_idle` completion, `show_result` validation,
-`prompt`/`run` status propagation, and the council's rejection of votes from failed turns. Run it
-(plus `bash -n` on both scripts) after any change to `oc.sh` or `council.sh`.
+`prompt`/`run` status propagation, failed council turns, exact prompt references/fallbacks,
+post reuse, the question guard, diff truncation, and run totals. Run it plus **separate**
+`/bin/bash -n` invocations for `oc.sh`, `council.sh`, and `test-completion.sh` after changes.
 
 ### 4. Report
 
@@ -157,6 +170,17 @@ by round and member, dissent, Q&A, and the log (handovers included). Report to t
 and agreed text per task, who dissented and why if unresolved, files changed for build tasks (verify
 them yourself with `oc.sh diff <ses>` / `git diff`), and the token/context summary. Session ids are
 in the roster table — any member can be continued with `oc.sh prompt <ses_id>` / `claude -p --resume <uuid>`.
+
+Optional analysis tools (Python 3 standard library only; no pip, network, or model calls):
+
+```bash
+python3 scripts/ptools/prompt_report.py D  # section bytes, largest prompts, measure 1a/1b replay savings
+python3 scripts/ptools/dedup_check.py D    # verbatim repeated blocks >=128 bytes within each prompt
+```
+
+Both are read-only and support `-h`. `prompt_report.py` documents its section boundaries in
+its docstring; byte counts are not token counts. The council never invokes these helpers:
+the skill works identically without Python or with `scripts/ptools/` absent.
 
 ## Targeting another server
 

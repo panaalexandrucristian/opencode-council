@@ -9,6 +9,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | `SKILL.md` | the skill Claude Code loads (`/opencode …`): workflow, permissions, the council checklist |
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
+| `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit |
 | `reference.md` | OpenCode HTTP endpoint notes |
 | `.claude-plugin/` | plugin + marketplace manifests, so the repo installs with `/plugin install` |
 | `examples/` | a real end-to-end run (config, answers, console output, transcript) |
@@ -110,16 +111,23 @@ How it works:
 
 - **Roster first.** `show` prints how many sessions there are, how many OpenCode vs Claude Code, each member's model, effort (validated against the model's variants), mode and context window — before anything runs.
 - **Members talk to each other.** Every round the orchestrator relays the other members' posts (by name) into each session. Posts are prose plus a mandatory JSON tail the orchestrator parses.
+- **Exact same-prompt references.** Voting prompts de-duplicate only identical candidate/proposal text against a complete, uniquely anchored peer post in that prompt. Byte-for-byte reconstruction checks and full-text fallback protect identity; stored posts and voting state stay authoritative. Every substitution is logged.
 - **Unanimous consensus.** Round 1 = proposals; then a rotating proposer's position is the frozen candidate and everyone votes `agree` / `disagree` (with a complete revised proposal). All `agree` = consensus. `max_rounds` reached = `unresolved` (exit 5), dissent preserved — never a forced verdict.
 - **Build tasks.** Consensus on a plan → the single `executor` implements it → the council ratifies the report + diff (fix rounds if needed).
 - **No assumptions.** Each member must list every choice the task leaves open and what settles it (`task` / `dir` / `user` / `ask`). Anything not settled by the task, the working directory or an earlier answer becomes a question for the user: the run pauses (exit 4, `questions.json`), you answer, `resume` re-runs the round.
 - **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` the session writes a handover note and is replaced by a fresh session (same member, next generation) that starts from the note.
 - **Transcript.** `D/transcript.md`: roster, per-member tokens/context/cost/generations, every post by task and round, outcomes, Q&A, log.
+- **Visible truncation.** Diffs retain their 20000-byte cap; truncated output ends with the cap and the working directory to inspect.
 
 - **Resume is cheap and swappable.** `resume` re-runs only what is missing — a member that already
   has a valid post for the current round is reused. `--replace ID=kind:model:effort` moves a member
   to a fresh session on another model (its provider failed or ran out of quota); the new session
   keeps the member's id and gets a handover note built from that member's own earlier posts.
+- **Prose style (optional).** `"style": "normal" | "lite" | "caveman" | "ultra"`, top level and/or per member,
+  compresses the prose members write for each other (after the [caveman skill](https://github.com/juliusbrussee/caveman)).
+  The JSON tail's `proposal`/`report` — the text that is voted on and implemented — plus quoted code, paths,
+  commands, errors and numbers are never compressed. Expect single-digit % of output tokens in this council,
+  not the headline figures: the JSON tail is 74–99% of a post.
 - **Tests.** `scripts/test-completion.sh` — offline contract suite (no network, no model calls),
   run it together with `bash -n` on both scripts after any change.
 
@@ -141,6 +149,18 @@ Council members are billed exactly like any other Claude Code / OpenCode session
 - **OpenCode members** are billed by the provider behind the model (OpenAI, Google, Kimi plan, …); `cost` comes from OpenCode's own accounting (0 on flat-rate plans).
 - N members = N full agent contexts per round, so a council uses a multiple of what one session would. Effort (`variant` / `--effort`) is the main lever.
 - Token/cost accounting follows the Claude Code version: from v2.1.277 a resumed session reports its cumulative spend, so `council.sh` reads the latest result instead of summing (detected at `start`, stored as `cl_cumulative` in `state.json`).
+- `status` and the transcript show final-generation + retired subtotals per member and one **RUN TOTAL**, including handovers and replacements.
+- `show` adds an advisory cost note computed from the config: members × rounds × tasks, high-cost efforts, two measured similar runs, and levers (fewer members, lower effort, narrower tasks, fewer rounds). It never predicts a dollar bill or blocks a run.
+
+Optional read-only analysis (Python 3 standard library, no pip or model calls):
+
+```bash
+python3 scripts/ptools/prompt_report.py D  # section bytes, biggest prompts, exact measure-1 savings
+python3 scripts/ptools/dedup_check.py D    # repeated verbatim blocks >=128 bytes in each prompt
+```
+
+Both support `-h`. These tools are independent of the shell runtime; Python and `scripts/ptools/`
+are optional. Prompt bytes measure file content, not token usage or billing.
 
 ## `oc.sh` on its own
 

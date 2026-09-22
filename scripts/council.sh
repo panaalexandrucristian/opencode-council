@@ -117,12 +117,17 @@ validate_config() {  # $1 = config file -> prints normalised config json
   # claude effort values; opencode efforts are checked against the model's variants below
   err=$(jq -r '.members[] | select(.kind=="claude") | select(.effort|IN("low","medium","high","xhigh","max")|not) | "  member \(.id): claude effort must be low|medium|high|xhigh|max"' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
+  # optional prose-compression style (see style_rules): normal (default) | lite | caveman | ultra
+  err=$(jq -r '(if (.style // "normal")|IN("normal","lite","caveman","ultra")|not then "  style must be normal|lite|caveman|ultra" else empty end),
+               (.members[] | select((.style // "normal")|IN("normal","lite","caveman","ultra")|not) | "  member \(.id): style must be normal|lite|caveman|ultra")' "$1")
+  [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
   # normalise: tasks -> {id,text,execute}; members -> +agent/permission_mode
   jq '.tasks |= [to_entries[] | (if (.value|type)=="string" then {id:("t"+((.key+1)|tostring)), text:.value, execute:false}
                                   else {id:(.value.id // ("t"+((.key+1)|tostring))), text:.value.text, execute:(.value.execute==true)} end)]
       | .max_turns = (.max_turns // 30)
-      | .members |= [ .[] | . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
-                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' "$1"
+      | .style = (.style // "normal")
+      | .members |= [ .[] | {style: $s} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
+                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "normal"' "$1")" "$1"
 }
 
 check_opencode_models() {  # $1 = normalised config json -> validates model + variant against the live server; prints ctx limits json
@@ -145,16 +150,31 @@ print_roster() {  # $1 = normalised config json, $2 = ctx-limit tsv (id<TAB>limi
   local cfg=$1 lim=$2
   echo "COUNCIL ROSTER"
   echo "  sessions: $(jq -r '.members|length' <<<"$cfg") total = $(jq -r '[.members[]|select(.kind=="opencode")]|length' <<<"$cfg") OpenCode + $(jq -r '[.members[]|select(.kind=="claude")]|length' <<<"$cfg") Claude Code"
-  printf '  %-4s %-9s %-34s %-8s %-6s %-12s %s\n' id kind model effort mode agent/perm ctx-window
-  jq -r '.members[] | "\(.id)\t\(.kind)\t\(.model)\t\(.effort)\t\(.mode)\t\(.agent // .permission_mode)"' <<<"$cfg" | while IFS=$'\t' read -r id kind model effort mode ag; do
+  printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %s\n' id kind model effort mode agent/perm style ctx-window
+  jq -r '.members[] | "\(.id)\t\(.kind)\t\(.model)\t\(.effort)\t\(.mode)\t\(.agent // .permission_mode)\t\(.style // "normal")"' <<<"$cfg" | while IFS=$'\t' read -r id kind model effort mode ag sty; do
     local l; l=$(printf '%s\n' "$lim" | awk -F'\t' -v i="$id" '$1==i{print $2}')
     [ -n "$l" ] && l="$((l/1000))k" || l="(from first reply)"
-    printf '  %-4s %-9s %-34s %-8s %-6s %-12s %s\n' "$id" "$kind" "$model" "$effort" "$mode" "$ag" "$l"
+    printf '  %-4s %-9s %-34s %-8s %-6s %-12s %-8s %s\n' "$id" "$kind" "$model" "$effort" "$mode" "$ag" "$sty" "$l"
   done
   echo "  executor (only member allowed to edit files): $(jq -r '.executor // "none — read-only council"' <<<"$cfg")"
   echo "  dir: $(jq -r .dir <<<"$cfg")"
   echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at*100|floor' <<<"$cfg")% context · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
   echo "  tasks:"; jq -r '.tasks[] | "    \(.id)\(if .execute then " [build]" else "" end): \(.text|gsub("\n";" ")|.[0:110])"' <<<"$cfg"
+}
+
+cost_note() {  # config only; measured comparisons, never a dollar forecast or a gate
+  jq -r '
+    (.members|length) as $n | (.tasks|length) as $t |
+    [.members[] | select(.effort|IN("high","xhigh","max")) | "\(.id) \(.model) [\(.effort)]"] as $high |
+    "COST NOTE: \($n) members x \(.max_rounds) rounds x \($t) tasks = \($n*.max_rounds*$t) deliberation member-rounds (execution, retries and handovers can add calls).",
+    "  High-cost efforts (high/xhigh/max): \(if ($high|length)>0 then $high|join(", ") else "none" end).",
+    (if $n>=3 and .max_rounds>=4 and ($high|length)>=2 then
+      "  WARNING: this configuration is in the size/effort range of expensive measured runs; task breadth also matters."
+     else empty end),
+    "  Similar runs measured: 3 members (Astra xhigh + Claude Fable xhigh + Kimi max), 2 broad tasks, max_rounds 4: 27.9M tokens / ~$17.6.",
+    "  Similar runs measured: 3-member research council (Astra xhigh + Fable xhigh + Gemini 3.8 Flash high), 1 broad task, max_rounds 4: 11.3M tokens / ~$21.4; Claude Fable alone: $20.2.",
+    "  These are measurements, not predictions. Levers: fewer members, lower effort, narrower tasks, fewer rounds."
+  ' <<<"$1"
 }
 
 # --------------------------------------------------------------- adapters ----
@@ -239,6 +259,31 @@ tail_json() {
 
 # ---------------------------------------------------------------- prompts ----
 roster_lines() { st '.members[] | "  - member \(.id): \(.kind) \(.model), effort \(.effort), \(if .mode=="edit" then "may edit files (executor)" else "read-only" end)"'; }
+# Prose compression, modelled on the "caveman" skill (github.com/juliusbrussee/caveman): drop throat-clearing,
+# keep substance. It applies ONLY to the prose a member writes for the other members — never to the JSON tail's
+# proposal/report (that text is voted on, ratified and implemented, so it stays complete), and never to quoted
+# code, paths, commands, errors or numbers. Measured expectation: the JetBrains lab found ~8.5% fewer output
+# tokens on real agentic tasks (the skill's own README claims ~50% on output-only evals); in this council the
+# JSON tail is 74-99% of a post, so treat single-digit percent as the honest expectation.
+style_rules() {  # member style -> extra rule text (empty for "normal")
+  case "$1" in
+    lite) cat <<'TXT'
+6. Style — lite: write your prose for the other members without throat-clearing. No preamble, no restating the task, no summary of what you are about to say, no closing pleasantries. Full sentences are fine; just drop the filler.
+TXT
+;;
+    caveman) cat <<'TXT'
+6. Style — caveman: compress the prose you write for the other members. Drop articles, pleasantries, hedging and transitions; use fragments and lists; one line per point; no preamble and no recap. Keep every technical fact.
+   NEVER compress: the JSON tail (its "proposal"/"report" must stay complete, unambiguous English — it is what gets voted on and implemented), quoted code, file paths, commands, error messages, numbers, names, and anything you quote from the task, the working directory or the user's answers. Precision beats brevity: if compressing a sentence could change its meaning, write it out.
+TXT
+;;
+    ultra) cat <<'TXT'
+6. Style — ultra: telegraphic prose. Fragments only, one line per point, symbols over words (-> = becomes, != = not). No articles, no hedging, no preamble, no recap.
+   NEVER compress: the JSON tail (its "proposal"/"report" must stay complete, unambiguous English — it is what gets voted on and implemented), quoted code, file paths, commands, error messages, numbers, names, and anything you quote from the task, the working directory or the user's answers. Precision beats brevity: if compressing a sentence could change its meaning, write it out.
+TXT
+;;
+  esac
+}
+
 rules_text() {  # sent on a session's first contact (and after handover)
   cat <<TXT
 You are member $(mid $1) of a council of $N AI agents. The council receives tasks, discusses them through an orchestrator that relays every member's post to the others each round, and must reach an explicit, unanimous consensus on each task. Members:
@@ -252,6 +297,7 @@ Rules:
 3. Engage with the other members by name: say what you agree/disagree with and why. Change your mind when they are right.
 4. Answer in the language of the task. Be concrete and complete; no padding.
 5. Every post MUST end with a JSON tail — one fenced \`\`\`json block as the LAST thing in your reply. The orchestrator parses only that block, so the "proposal" field must contain your COMPLETE proposed answer (self-contained text; the prose above it is for the other members). Nothing may follow the JSON tail.
+$(style_rules "$(mget $1 style)")
 TXT
 }
 task_header() { local t=$1 r=$2; echo "=== TASK $(jq -r .id <<<"$t") — round $r of $MAXR ==="; }
@@ -274,7 +320,7 @@ JSON tail — exactly one of:
 \`\`\`
 TXT
 }
-prompt_roundN() {  # idx task round -> uses state.candidate and posts of round-1
+prompt_roundN_full() {  # lossless fallback; also the baseline for the round-trip check
   local i=$1 t=$2 r=$3 prev=$((r-1)) tid; tid=$(jq -r .id <<<"$t")
   cat <<TXT
 $(task_header "$t" "$r")
@@ -307,6 +353,133 @@ JSON tail — exactly one of:
 \`\`\`
 TXT
 }
+
+# A literal, unique substitution. ENVIRON avoids awk -v escape interpretation. Callers
+# append a sentinel when capturing stdout so bash never strips meaningful final newlines.
+dedup_replace() {
+  COUNCIL_TEXT=$1 COUNCIL_OLD=$2 COUNCIL_NEW=$3 LC_ALL=C awk 'BEGIN {
+    s=ENVIRON["COUNCIL_TEXT"]; old=ENVIRON["COUNCIL_OLD"]; new=ENVIRON["COUNCIL_NEW"];
+    p=index(s,old); if (!length(old) || !p || index(substr(s,p+length(old)),old)) exit 1;
+    printf "%s%s%s",substr(s,1,p-1),new,substr(s,p+length(old));
+  }'
+}
+
+dedup_source() {  # md, stored json -> DEDUP_TAIL and DEDUP_TOKEN, or failure
+  local md=$1 stored=$2 parsed
+  [ -s "$md" ] && [ -s "$stored" ] || return 1
+  # Shell/ENVIRON cannot carry NUL. Reject it rather than silently dropping bytes.
+  jq -en --rawfile p "$md" '$p|contains("\u0000")|not' >/dev/null 2>&1 || return 1
+  parsed=$(tail_json "$md") || return 1
+  jq -e -s 'length==2 and .[0]==.[1] and (.[0].proposal|type)=="string"
+    and (.[0].proposal|contains("\u0000")|not)' <(printf '%s' "$parsed") "$stored" >/dev/null 2>&1 || return 1
+  DEDUP_TAIL=$(awk 'BEGIN{b=0;last=""} /^[[:space:]]*```[[:space:]]*[Jj][Ss][Oo][Nn][[:space:]]*$/{b=1;buf="";next}
+    /^[[:space:]]*```[[:space:]]*$/{if(b){b=0;last=buf};next} {if(b)buf=buf $0 "\n"} END{printf "%s.",last}' "$md")
+  DEDUP_TAIL=${DEDUP_TAIL%.}
+  # Locate a single top-level, literally-spelled proposal key, scanning JSON strings
+  # without decoding their escapes. Unusual/duplicate/escaped keys conservatively fall back.
+  DEDUP_TOKEN=$(COUNCIL_TAIL=$DEDUP_TAIL LC_ALL=C awk 'BEGIN {
+    s=ENVIRON["COUNCIL_TAIL"]; depth=0; count=0;
+    for (i=1;i<=length(s);i++) {
+      c=substr(s,i,1);
+      if (c=="\"") {
+        start=i++; while (i<=length(s)) { c=substr(s,i,1); if(c=="\\") i+=2; else if(c=="\"") break; else i++; }
+        token=substr(s,start,i-start+1); j=i+1; while(substr(s,j,1) ~ /[ \t\r\n]/ && j<=length(s)) j++;
+        if(depth==1 && substr(s,j,1)==":") {
+          if(index(token,"\\")) exit 1;
+          key=token; if(key=="\"proposal\"") count++;
+        } else if(depth==1 && key=="\"proposal\"") { value=token; key=""; }
+      } else if(c=="{" || c=="[") depth++; else if(c=="}" || c=="]") depth--;
+    }
+    if(count!=1 || !length(value)) exit 1; printf "%s",value;
+  }') || return 1
+  jq -en --argjson token "$DEDUP_TOKEN" --argjson p "$parsed" '$token==$p.proposal' >/dev/null 2>&1
+}
+
+prompt_roundN() (  # idx task round; all edits are prompt-local, never stored posts/state
+  local i=$1 t=$2 r=$3 prev=$(($3-1)) tid tmp original work restored x hn
+  local j k source=-1 candidate ref anchor saving total=0
+  local ids=() posts=() tails=() tokens=() anchors=() changed=() oldblocks=() newblocks=() messages=()
+  local LC_ALL=C; export LC_ALL
+  tid=$(jq -r .id <<<"$t")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/council-dedup.XXXXXX") || { prompt_roundN_full "$@"; return; }
+  trap 'rm -rf "$tmp"' EXIT
+  prompt_roundN_full "$@" >"$tmp/original"
+  # Include first-contact material in the collision check, even though run_step emits
+  # it before this body. Any pre-existing use of the reference namespace disables edits.
+  hn=$(mget "$i" handover_note)
+  if grep -Fq COUNCIL_POST "$tmp/original" ||
+     jq -e 'any(..|strings; contains("COUNCIL_POST"))' "$ST" >/dev/null 2>&1 ||
+     { [ "$(mget "$i" fresh)" = true ] && [ -f "$hn" ] && grep -Fq COUNCIL_POST "$hn"; }; then
+    cat "$tmp/original"; return
+  fi
+  original=$(cat "$tmp/original"; printf .); original=${original%.}; work=$original
+  for j in $(seq 0 $((N-1))); do
+    [ "$j" = "$i" ] && continue
+    ids[$j]="$tid-r$prev-$(mid "$j")"
+    case "${ids[$j]}" in *[!a-zA-Z0-9._-]*) continue ;; esac  # unambiguous anchor spelling
+    if dedup_source "$RUN/posts/${ids[$j]}.md" "$RUN/posts/${ids[$j]}.json"; then
+      posts[$j]=$(cat "$RUN/posts/${ids[$j]}.md"; printf .); posts[$j]=${posts[$j]%.}
+      tails[$j]=$DEDUP_TAIL; tokens[$j]=$DEDUP_TOKEN
+    fi
+  done
+  candidate=$(st .candidate.text)
+  for j in $(seq 0 $((N-1))); do
+    [ -n "${tokens[$j]:-}" ] || continue
+    jq -e --slurpfile p "$RUN/posts/${ids[$j]}.json" '.candidate.text==$p[0].proposal' "$ST" >/dev/null 2>&1 || continue
+    ref="Exact candidate: JSON-decode the 'proposal' string in COUNCIL_POST ${ids[$j]} below."
+    anchor="<<<COUNCIL_POST ${ids[$j]}>>>"$'\n'
+    saving=$((${#candidate}-${#ref}-${#anchor})); [ "$saving" -gt 0 ] || continue
+    source=$j; anchors[$j]=$anchor; total=$((total+saving))
+    messages+=("1a candidate $(st .candidate.id) -> ${ids[$j]} for member $(mid "$i"): saved $saving bytes")
+    break
+  done
+  for j in $(seq 0 $((N-1))); do
+    [ -n "${tokens[$j]:-}" ] && [ "$j" -ne "$source" ] || continue
+    for ((k=0;k<j;k++)); do
+      [ -n "${tokens[$k]:-}" ] && [ -z "${changed[$k]:-}" ] || continue
+      [ "${tokens[$j]}" = "${tokens[$k]}" ] || continue
+      local replacement tail post back
+      replacement=$(jq -cn --arg id "${ids[$k]}" '"(identical to the proposal string in COUNCIL_POST " + $id + " above)"')
+      anchor="<<<COUNCIL_POST ${ids[$k]}>>>"$'\n'
+      saving=$((${#tokens[$j]}-${#replacement})); [ -n "${anchors[$k]:-}" ] || saving=$((saving-${#anchor}))
+      [ "$saving" -gt 0 ] || continue
+      tail=$(dedup_replace "${tails[$j]}" "${tokens[$j]}" "$replacement" && printf .) || continue; tail=${tail%.}
+      back=$(dedup_replace "$tail" "$replacement" "${tokens[$j]}" && printf .) || continue; back=${back%.}
+      [ "$back" = "${tails[$j]}" ] || continue
+      # Ensure the located token really is the top-level proposal, not other prose/data.
+      jq -en --argjson old "${tails[$j]}" --argjson new "$tail" --argjson ref "$replacement" '$new==($old|.proposal=$ref)' >/dev/null 2>&1 || continue
+      post=$(dedup_replace "${posts[$j]}" "${tails[$j]}" "$tail" && printf .) || continue; post=${post%.}
+      back=$(dedup_replace "$post" "$tail" "${tails[$j]}" && printf .) || continue; back=${back%.}
+      [ "$back" = "${posts[$j]}" ] || continue
+      changed[$j]=$post; anchors[$k]=$anchor; total=$((total+saving))
+      messages+=("1b ${ids[$j]} proposal -> ${ids[$k]} for member $(mid "$i"): saved $saving bytes")
+      break
+    done
+  done
+  if [ "$source" -ge 0 ]; then
+    oldblocks+=("<<<CANDIDATE $(st .candidate.id)"$'\n'"$candidate"$'\n'">>>")
+    newblocks+=("<<<CANDIDATE $(st .candidate.id)"$'\n'"Exact candidate: JSON-decode the 'proposal' string in COUNCIL_POST ${ids[$source]} below."$'\n'">>>")
+  fi
+  for j in $(seq 0 $((N-1))); do
+    [ -n "${anchors[$j]:-}${changed[$j]:-}" ] || continue
+    oldblocks+=("--- member $(mid "$j") ---"$'\n'"${posts[$j]}"$'\n')
+    newblocks+=("--- member $(mid "$j") ---"$'\n'"${anchors[$j]:-}${changed[$j]:-${posts[$j]}}"$'\n')
+  done
+  for ((j=0;j<${#oldblocks[@]};j++)); do
+    x=$(dedup_replace "$work" "${oldblocks[$j]}" "${newblocks[$j]}" && printf .) || { cat "$tmp/original"; return; }; work=${x%.}
+  done
+  restored=$work
+  for ((j=${#oldblocks[@]}-1;j>=0;j--)); do
+    x=$(dedup_replace "$restored" "${newblocks[$j]}" "${oldblocks[$j]}" && printf .) || { cat "$tmp/original"; return; }; restored=${x%.}
+  done
+  # Byte-for-byte re-substitution proof, and a strictly positive net saving, before send.
+  printf '%s' "$restored" >"$tmp/restored"
+  if [ "$total" -le 0 ] || [ "$((${#original}-${#work}))" -ne "$total" ] || ! cmp -s "$tmp/original" "$tmp/restored"; then
+    cat "$tmp/original"; return
+  fi
+  for x in "${messages[@]}"; do log "prompt dedup $tid-r$r: $x"; done
+  printf '%s' "$work"
+)
 prompt_exec() {  # idx task round
   cat <<TXT
 === TASK $(jq -r .id <<<"$2") — EXECUTION ===
@@ -526,10 +699,19 @@ deliberate() {  # task json -> sets .results[-1] {task, outcome, text, rounds}; 
 
 executor_idx() { local i; for i in $(seq 0 $((N-1))); do [ "$(mid $i)" = "$EXEC" ] && { echo $i; return; }; done; }
 diff_text() {  # executor idx -> diff of the working dir as seen by the executor's tool
-  local i=$1; if [ "$(mget $i kind)" = opencode ]; then "$OC" diff "$(mget $i session)" --patch 2>/dev/null | head -c 20000
-  elif git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then (cd "$DIR" && git status --short && git diff) | head -c 20000
+  local i=$1; if [ "$(mget $i kind)" = opencode ]; then "$OC" diff "$(mget $i session)" --patch 2>/dev/null | cap_diff
+  elif git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then (cd "$DIR" && git status --short && git diff) | cap_diff
   else echo "(dir is not a git repository — no diff available; rely on the report and inspect the files)"; fi
 }
+cap_diff() (  # consume the stream, preserve head's byte cap, make truncation explicit
+  local tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/council-diff.XXXXXX") || return 1
+  trap 'rm -f "$tmp"' EXIT
+  cat >"$tmp" || return 1
+  head -c 20000 "$tmp"
+  if [ "$(wc -c <"$tmp")" -gt 20000 ]; then
+    printf '\n[DIFF TRUNCATED: 20000-byte cap; inspect the full working directory: %s]\n' "$DIR"
+  fi
+)
 execute_and_ratify() {  # task json; assumes .results[-1] is the consensus plan; returns 0 ratified / 1 unresolved
   local t=$1 tid ei r; tid=$(jq -r .id <<<"$t"); ei=$(executor_idx)
   r=$(st .round)
@@ -574,6 +756,16 @@ run_tasks() {  # from state.task_idx onward
 }
 
 # ------------------------------------------------------------ transcript ----
+usage_totals() {  # latest generation plus ALL retired generations; no API calls
+  st '
+    [.members[] | {id, final_tokens:(.session_tokens // 0), final_cost:(.session_cost // 0),
+      retired_tokens:([.retired[]? | .tokens // 0]|add // 0),
+      retired_cost:([.retired[]? | .cost // 0]|add // 0)}
+      | . + {tokens:(.final_tokens+.retired_tokens), cost:(.final_cost+.retired_cost)}] as $m |
+    ($m[] | "  member \(.id): final-generation \(.final_tokens) tokens / $\(.final_cost) + retired \(.retired_tokens) tokens / $\(.retired_cost) = subtotal \(.tokens) tokens / $\(.cost)"),
+    "RUN TOTAL: \($m|map(.tokens)|add // 0) tokens / $\($m|map(.cost)|add // 0) (all members, all generations)"
+  '
+}
 render_transcript() {
   {
     echo "# Council run — $(st .started) — $RUN"; echo
@@ -583,6 +775,7 @@ render_transcript() {
     echo "| member | generation | session | context used | session tokens | cost | calls | retired sessions |"; echo "|---|---|---|---|---|---|---|---|"
     st '.members[] | "| \(.id) | g\(.gen) | `\(.session // "-")` | \(.ctx_used // 0) / \(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)%) | \(.session_tokens // 0) | \(.session_cost // 0 | .*10000|round/10000) | \(.calls // 0) | \((.retired // []) | map("\(.session) (\(.tokens) tok)") | join(", ")) |"'
     echo
+    echo '```'; usage_totals; echo '```'; echo
     local nt ti; nt=$(st '.config.tasks|length')
     for ti in $(seq 0 $((nt-1))); do
       local t tid; t=$(stj ".config.tasks[$ti]"); tid=$(jq -r .id <<<"$t")
@@ -612,7 +805,7 @@ case "$CMD" in
     cfg=$(validate_config "$CONFIG") || exit 1
     "$OC" ensure >/dev/null || exit 1
     lim=$(check_opencode_models "$cfg") || exit 1
-    print_roster "$cfg" "$lim"; echo "config OK: $CONFIG" ;;
+    print_roster "$cfg" "$lim"; cost_note "$cfg"; echo "config OK: $CONFIG" ;;
 
   start)
     [ -n "$CONFIG" ] && [ -n "$RUN" ] || die "start needs --config F --run-dir D"
@@ -634,6 +827,7 @@ case "$CMD" in
     [ -n "$RUN" ] || die "status needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     echo "run: $RUN · status: $(st .status) · task $(st '.task_id // "-"') ($(st .task_idx)/$(st '.config.tasks|length') done) · phase $(st .phase) · round $(st .round)/$MAXR"
     st '.members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)%) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
+    usage_totals
     st '.results[] | "  task \(.task): \(.outcome) (\(.rounds) rounds)"'
     jq -r '.pending_questions[]? | "  PENDING [\(.id)] member \(.member): \(.question)"' "$ST"
     echo "  transcript: $RUN/transcript.md" ;;
