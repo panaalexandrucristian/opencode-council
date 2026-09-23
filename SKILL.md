@@ -154,20 +154,153 @@ every substitution, with full-text fallback on ambiguity. Substitutions go throu
 Votes still target the authoritative candidate in state. Capped diffs end with a visible
 `DIFF TRUNCATED` line naming the 20000-byte cap and the directory to inspect.
 
+**Code map (attributed evidence, avoiding re-reading the same files over and over).** Every new
+run stamps `state.codemap_version=1` automatically (no config field; an older run without it runs
+exactly as before). `scripts/council_codemap.py` (Python 3 stdlib only) keeps a content-addressed,
+append-only map of `config.dir`'s files under `D/codemap/`: captured full-file bytes stored as
+labelled base64 and addressed by SHA-256 (`sources/`, text and binary alike, with a tombstone for
+any object recorded as lost so it is never recreated from later bytes under its old digest), the
+recorded identities that actually held those bytes (`versions/` — root, display path and resolved
+path, which is what a historical claim must bind against, and what keeps "some file somewhere had
+these bytes" from being mistaken for evidence about *this* path), immutable
+per-validation freshness records addressed by their own exact-byte digest and re-verified on every
+read (`snapshots/`), one durable record per capture/validation/publication operation (`events/`),
+the current published index of byte-range entries (`index.json`, mirrored to an immutable
+content-addressed `index-snapshots/` entry named by `index-head.json` — the only thing a lost
+index is ever recovered from, never posts and never today's source bytes), and a private per-attempt
+staging/archive area (`attempts/`) — this is the map's own storage, not a generic object store.
+The root is always `config.dir` from the run's own state: an orchestrator-supplied `--dir` is
+verified against it, never trusted on its own. A member may optionally
+add `code_reads` to its JSON tail: `{"path","lines":[first,last],"observed_sha256","symbol",
+"conclusion","inspection"}`, all optional beyond `path`; omitting `code_reads` entirely means
+unknown coverage. `symbol`/`conclusion`/`inspection` are the author's own claims, never proof of
+examination — the locator delivered before every round-1/round-N prompt says this verbatim, and a
+malformed optional item is recorded as a diagnostic without ever touching the post's vote or
+triggering a retry. Round 1 of every task (even a later task in the same run) only ever sees a
+raw-only, claim-free projection — identities, byte ranges, hashes, freshness — so independent
+first-round reasoning is preserved; later rounds see attributed reports published by completed
+earlier steps. A newly accepted member's claims are staged privately and never exposed to a peer
+in the same still-in-progress step.
+
+Before a step's outcome can affect consensus, a conservative round-level freshness guard
+re-captures (by full content, never size/mtime) every source version the frozen view exposed as
+current. Each capture is two complete reads, each fenced by before/after descriptor-identity and
+resolved-path checks and hashed in its own right; a file modified while it is being read is never
+accepted. A rejected read still counts as work done: the bytes it read, and — if it reached EOF
+before the checks rejected it — the bytes it hashed, so an unstable source is never reported as
+having cost nothing. That holds for **every** failure path, including one raised inside a helper
+that knows nothing of the read (a symlink that escapes the root only after the read finished, a
+re-resolution that itself fails, or a failure closing the descriptor, which happens past every
+inner handler), because the counters belong to the read operation and are attached at a single
+boundary rather than at each raise site — and an operational filesystem error never leaves that
+boundary raw, it becomes the ordinary retry-worthy "unreadable" carrying those counters. What did
+not happen is still never counted: a capture that failed before its hash reports zero bytes hashed. Only a demonstrated identity or path change counts against a vote — a parent directory
+that merely became unreadable is "we could not check", not "it changed". An unrelated new capture never invalidates it; a whole-file edit, deletion, or symlink
+retarget/escape of a guarded source does — even if the specific claimed excerpt was untouched. On
+a confirmed change the attempt is marked with a distinct "stale" status, its posts are purged so
+resume cannot reuse them, and the run checkpoints through the existing exit 2 path — the round is
+replayed from scratch (same round/candidate, round budget not consumed) rather than the run trying
+to guess which member's vote actually relied on the changed source. **Trade-off, accepted
+deliberately:** without per-vote reliance declarations there is no sound way to tell which member
+ignored a changed source, so the whole attempt replays even if only one claim was affected — a
+false positive (an unrelated member re-answering) is preferred over a false negative (trusting a
+vote that may have depended on stale evidence). If the guard itself cannot be evaluated (storage
+broken, a capture unreadable/unstable) the accepted votes are preserved and the run checkpoints
+pending verification — never classified as stale just because the map failed. "Checkpoint" here
+means the run stops at exit 2 *before* the step's posts can be used for candidate selection,
+consensus or reuse: an unverifiable guard is never treated as a pass. Everything is preserved —
+accepted posts, staged reports, the attempt identity and its unresolved guard obligation (recorded
+in `state.codemap_pending` together with the attempt, view and guard ids and the exact source
+versions that attempt exposed). A resume re-verifies. Unchanged does **not** release the obligation, and the resume re-check
+publishes nothing: the same attempt, frozen view, original exposed-source guard and accepted-event
+attribution are all kept, and the step's own end-of-step barrier — reached again by the resumed
+round, with those posts reused — is the only place the guard is discharged. That is also where an
+outstanding publication (one that failed before the checkpoint) is retried. So a source that
+changes *after* an unchanged re-check is still caught before the decision, because the decision is
+made behind the *original* guard and never behind a fresh one captured after the change. An end
+validation that could not verify the guard records no completed-step barrier at all. If publication
+itself does not complete, the run holds at the same barrier rather than advancing with the work
+outstanding. A stale verdict
+is terminal — restoring the original bytes afterwards never revives the attempt, because nothing
+can establish what the members read in between — and it archives the complete original posts (Markdown, accepted JSON tail
+and attribution) inside the attempt's private area behind a durable ineligible marker, then replays
+the same round and candidate.
+
+Attribution is orchestration-owned and written **before** a member is launched, and every
+genuinely new launch — a replacement, a handover, a re-dispatched retry — has its **own immutable
+record** inside the attempt, never a rewrite of an earlier one. An accepted reply is bound to the
+record of the launch that produced it, so neither an already accepted reply nor a replacement's
+new one is ever re-labelled as the other, and reusing a checkpointed post allocates no launch and
+keeps its original binding. Acceptance also writes an orchestration-owned **association** from the
+live post file to the one accepted event those exact bytes were accepted as — its event id, launch
+and attempt. Archives *resolve* that association, never the generation as it reads at archival
+time and never a search for a record matching the member and the tail digest: the same member can
+produce byte-identical tails from two launches, so that pair names no single event. Where no exact
+association and no unambiguous single launch can speak for a post, the archive preserves it without
+claiming provenance. Without a record for the launch being staged an accepted event is preserved in
+full but stays **unattributed**: the caller's own word is not authentication, no other launch record
+may stand in for the missing one, and none of its claims become bound findings. The same holds when
+a member was launched more than once in an attempt and nothing identifies which launch produced the
+reply — an ambiguous attribution is refused rather than guessed. Staging is exactly-once as well as publication: re-ingesting the same accepted
+event preserves its original binding decisions verbatim, so a source that changed since acceptance
+can never turn an unmatched report into a bound claim. Publication is exactly-once: each report is keyed by its accepted event plus its array
+position, so replaying or republishing an attempt never duplicates reports, unbound records or
+diagnostics, and publication itself requires both the recorded completed-step barrier and a passing
+end-of-step guard. Captured bytes are stored at the moment of capture and never re-derived from the
+live file at publication time; a stored object that is missing or fails its digest is reported as
+missing evidence, never repaired from today's bytes. A published entry is labelled `current`, and
+carries the validation's snapshot id, only when that validation actually re-captured **this** source
+version and found it unchanged — same root, same display path, same resolved path, same digest.
+Anything else is `historical` or `unverified` with no snapshot id: a matching path is not coverage,
+and neither are equal bytes behind another real file. The end validation is also the last word on
+what each display path holds, so an observation staged earlier in the step never overwrites it.
+While a step is owed a decision, **every**
+lookup route serves that one frozen view: naming another snapshot or another task/step returns an
+explicit `unavailable_for_this_step` rather than widening what the step may read.
+
 ### 3. Tests
 
 `scripts/ptools/` is part of the skill, not an extra: `python3` is required and `council.sh` refuses to
 start without it. Every finished run's transcript ends with a **Token report** — prompt bytes by section,
 the de-duplication replay and the verbatim duplication still present — and `council.sh report --run-dir D`
-prints the same report for any run at any time (offline, no model calls). `scripts/ptools/test_ptools.py`
-is their unittest suite (28 cases), run automatically by `scripts/test-completion.sh`.
+prints the same report for any run at any time (offline, no model calls). On a run with the code
+map enabled, both the transcript's Token report and `council.sh report` append a **Code map**
+section from `scripts/ptools/codemap_report.py`. Everything there is counted from what the run
+actually recorded — `index.json`, the durable per-operation records in `codemap/events/`, and the
+locator byte boundaries the orchestrator recorded in `codemap/deliveries.jsonl` at the moment it
+wrote each block, together with the identity (digest and size) of the prompt it then actually
+launched. Nothing is inferred by searching a generated prompt for delimiter text, so marker text
+inside a task, a stored handover note or a relayed author post is never counted; a prompt written
+but never launched is reported as written, not delivered; a span that does not fit the prompt
+recorded at launch is reported as a corrupt accounting record rather than counted; and intentional
+duplicate deliveries are counted honestly. It reports distinct source identity by root/path/resolved_path/digest,
+CAPTURED coverage (bytes the map holds and can reproduce) strictly apart from ATTESTED coverage
+(what an author claims to have inspected), inspection-label counts (never presented as
+verification), per-entry current/changed/missing/unreadable/unstable counts, and bytes actually
+READ versus actually HASHED (the capture contract is two complete reads, each with its own full-file
+hash, so the two counts move together on every successful capture and diverge exactly where a read
+was aborted before EOF and therefore never hashed). Snapshots are
+content-addressed, so two identical validation outcomes share one snapshot; events are not, so they
+remain two countable events. Lookup is strictly read-only with no built-in log, so repeated-lookup
+and stale/missing-lookup counts are unknown unless an explicit `--trace FILE` is supplied (and then
+only as far as that trace claims completeness); trace repetition uses lookup's own request
+normalisation and stale/missing counts come from the real response contract. Byte counts are never
+converted into token or dollar figures and savings are never estimated.
+`scripts/ptools/test_ptools.py` is their unittest suite (156 cases), run automatically by
+`scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
 loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and
 HTTP failures, permission-reply propagation, `wait_idle` completion, `show_result` validation,
 `prompt`/`run` status propagation, failed council turns, exact prompt references/fallbacks,
-post reuse, the question guard, diff truncation, and run totals. Run it plus **separate**
-`/bin/bash -n` invocations for `oc.sh`, `council.sh`, and `test-completion.sh` after changes.
+post reuse, the question guard, diff truncation, run totals, and the code map's version gating,
+prompt delivery, staging/publish pipeline, freshness-guard replay, resume re-verification,
+handover framing, pre-launch attribution, recorded locator-delivery boundaries, the exit-2
+checkpoint on an unverifiable guard, and the stale archive/replay path. It also pins the COMPLETE
+execution, ratification and fix deliveries — fresh-session rules and predecessor-handover framing
+included — to SHA-256 baselines recovered from the pre-change commit `d62a356`, asserted with the
+map both enabled and disabled, so map content cannot leak into a non-deliberation prompt. Run it plus **separate** `/bin/bash -n` invocations for `oc.sh`, `council.sh`,
+and `test-completion.sh` after changes.
 
 ### 4. Report
 
@@ -181,13 +314,25 @@ in the roster table — any member can be continued with `oc.sh prompt <ses_id>`
 Optional analysis tools (Python 3 standard library only; no pip, network, or model calls):
 
 ```bash
-python3 scripts/ptools/prompt_report.py D  # section bytes, largest prompts, measure 1a/1b replay savings
-python3 scripts/ptools/dedup_check.py D    # verbatim repeated blocks >=128 bytes within each prompt
+python3 scripts/ptools/prompt_report.py D   # section bytes, largest prompts, measure 1a/1b replay savings
+python3 scripts/ptools/dedup_check.py D     # verbatim repeated blocks >=128 bytes within each prompt
+python3 scripts/ptools/codemap_report.py D  # code map: coverage, bound/unbound reports, freshness-guard status
 ```
 
-Both are read-only and support `-h`. `prompt_report.py` documents its section boundaries in
-its docstring; byte counts are not token counts. The council never invokes these helpers:
-the skill works identically without Python or with `scripts/ptools/` absent.
+All three are read-only and support `-h`. `prompt_report.py` documents its section boundaries in
+its docstring; byte counts are not token counts. All three are invoked by the council's own
+**Token report**: `prompt_report.py` and `dedup_check.py` on every finished run, and
+`codemap_report.py` additionally when `state.codemap_version=1`. `prompt_report.py` and
+`dedup_check.py` are hard startup requirements (`council.sh` refuses to start without them);
+`codemap_report.py` is not — if it is missing, the report says the code map section is unavailable
+and keeps its established exit behaviour, never failing the report. `scripts/council_codemap.py` is the code map itself
+(`ingest`/`validate`/`lookup`/`locator`), and `council.sh` invokes it directly in every
+deliberation round once `state.codemap_version=1` (stamped on every new run). Neither file is a
+hard startup requirement: a run directory that predates the code map (no `state.codemap_version`)
+keeps working with them absent, and on a supported-version run a helper that cannot be invoked
+before any exposure disables map delivery for that whole attempt with a diagnostic — while an
+attempt that has ALREADY exposed map-backed evidence checkpoints instead of silently dropping its
+freshness obligation.
 
 ## Targeting another server
 

@@ -44,6 +44,12 @@ PTOOLS="$HERE/ptools"
 for t in prompt_report.py dedup_check.py; do
   [ -f "$PTOOLS/$t" ] || { echo "council: missing $PTOOLS/$t" >&2; exit 1; }
 done
+# council_codemap.py/codemap_report.py are NOT hard startup requirements: an old run directory
+# predating the code map (no state.codemap_version) must keep working even if a partial/minimal
+# install is missing them. Every call site below already degrades gracefully on a nonzero/failed
+# python3 invocation (map delivery disabled for that attempt, or the report section marked
+# unavailable) — exactly what a missing-file invocation naturally produces.
+CM="$HERE/council_codemap.py"
 
 die() { echo "council: $*" >&2; exit 1; }
 log() { echo "council: $*" >&2; }
@@ -80,11 +86,277 @@ ST=""
 st()  { jq -r "$1" "$ST"; }                                   # read
 stj() { jq -c "$1" "$ST"; }                                   # read json
 sts() { jq "$@" "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"; }     # update (atomic)
-N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; EXEC=""
+N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; EXEC=""; CODEMAP=0
 load_state() {
   ST="$RUN/state.json"; [ -f "$ST" ] || die "no state in $RUN (not a council run dir)"
   N=$(st '.members|length'); DIR=$(st '.config.dir'); MAXR=$(st '.config.max_rounds'); TIMEOUT=$(st '.config.timeout_s')
   HANDOVER=$(st '.config.handover_at'); MAXT=$(st '.config.max_turns // 30'); EXEC=$(st '.config.executor // ""')
+  codemap_check_version
+}
+
+# ---------------------------------------------------------------- codemap ----
+# state.codemap_version=1 is stamped on every new run; no opt-in field. Absent -> every
+# map-related state mutation/prompt addition/report addition/post interpretation is disabled.
+# An unsupported present version disables new exposure (diagnostic only); a pending map-backed
+# attempt whose freshness still needs checking is checkpointed rather than having its guard
+# bypassed. See SKILL.md for the whole-attempt-replay trade-off this guard accepts.
+codemap_check_version() {
+  CODEMAP=0
+  local v; v=$(st '.codemap_version // empty')
+  [ -n "$v" ] || return 0
+  if [ "$v" = "1" ]; then CODEMAP=1; return 0; fi
+  log "codemap: unsupported state.codemap_version=$v — new map exposure disabled"
+  local pend; pend=$(st '.codemap_pending // empty')
+  if [ -n "$pend" ]; then
+    sts '.status="failed"'
+    log "codemap: a pending attempt has map-backed evidence whose freshness still needs checking under an unsupported version — checkpointed (its votes are preserved); run: council.sh resume --run-dir $RUN"
+    exit 2
+  fi
+}
+codemap_is_deliberation() { [ "$1" = prompt_round1 ] || [ "$1" = prompt_roundN ]; }
+CODEMAP_STEP=0   # this attempt's map delivery: 0 disabled (absent version, non-deliberation step, or prepare failure) / 1 enabled
+codemap_pending_attempt() { stj '.codemap_pending.attempt // empty' | tr -d '"'; }
+codemap_archive_posts() {  # tid tag -> archives the COMPLETE posts (Markdown + JSON tail + attribution)
+  # inside the attempt's own private area before a replay can purge or overwrite them.
+  local tid=$1 tag=$2 aid dest f
+  aid=$(codemap_pending_attempt); [ -n "$aid" ] || aid="unknown-$tid-$tag"
+  ls "$RUN"/posts/"$tid-$tag-"* >/dev/null 2>&1 || return 0
+  dest="$RUN/codemap/attempts/$aid/archived-posts/$(date +%s)-$$"
+  mkdir -p "$dest" || codemap_checkpoint "cannot create the archive directory $dest — refusing to purge $tid/$tag's posts before they are safely archived"
+  # The archive must succeed BEFORE anything is deleted: an archive that silently failed would
+  # turn "preserved for inspection" into data loss at exactly the moment it matters.
+  cp "$RUN"/posts/"$tid-$tag-"* "$dest"/ \
+    || codemap_checkpoint "could not archive $tid/$tag's posts into $dest — refusing to purge them"
+  for f in "$RUN"/posts/"$tid-$tag-"*.json; do
+    [ -e "$f" ] || continue
+    local mem; mem=$(basename "$f" .json); mem=${mem##*-}
+    # Attribution comes from the ACCEPTED EVENT this post's exact bytes were staged as — the
+    # durable record that already names the launch that produced them. Never from the member's
+    # generation as it reads at archival time, and never from "the" launch record: a member may
+    # have been launched more than once in one attempt, and guessing between those launches is
+    # exactly how a replacement's reply would be relabelled as the session it replaced.
+    local sha ameta assoc aeid lr gen=null lseq=null lid=null eid=null known=false
+    sha=$(shasum -a 256 <"$f" | cut -d' ' -f1)
+    # The association written at acceptance names the ONE event these exact bytes were accepted
+    # as. Member plus digest is not an identity — two launches of the same member can produce
+    # byte-identical tails — so the association is resolved and validated, never searched for.
+    assoc="$RUN/codemap/attempts/$aid/post-assoc/$(basename "$f").assoc.json"
+    ameta=""
+    if [ -s "$assoc" ]; then
+      aeid=$(jq -r --arg m "$mem" --arg t "$tid" --arg s "$tag" --arg a "$aid" --arg sha "$sha" \
+             'select(.member==$m and .task==$t and .step==$s and .attempt==$a and .accepted_sha256==$sha)
+              | .event_id // empty' "$assoc" 2>/dev/null)
+      if [ -n "$aeid" ] && [ -s "$RUN/codemap/attempts/$aid/accepted/$aeid.meta.json" ]; then
+        # the named event must itself agree about who and what it is, or it speaks for nothing
+        ameta=$(jq -c --arg m "$mem" --arg sha "$sha" --arg e "$aeid" \
+                'select(.member==$m and .accepted_sha256==$sha and .event_id==$e)' \
+                "$RUN/codemap/attempts/$aid/accepted/$aeid.meta.json" 2>/dev/null)
+      fi
+    fi
+    if [ -n "$ameta" ]; then
+      gen=$(jq -c '.generation // null' <<<"$ameta"); lseq=$(jq -c '.launch_seq // null' <<<"$ameta")
+      lid=$(jq -c '.launch_id // null' <<<"$ameta"); eid=$(jq -c '.event_id // null' <<<"$ameta")
+      known=$(jq -c 'if .attributed then true else false end' <<<"$ameta")
+    else
+      # No exact association (never staged, or the association does not match these bytes): only
+      # an unambiguous single launch can speak for the post. Anything else stays unattributed —
+      # an ambiguous match is not provenance.
+      local n; n=$(ls "$RUN/codemap/attempts/$aid/launches" 2>/dev/null | grep -c "^$mem\(-s[0-9]*\)\{0,1\}\.json$")
+      if [ "$n" = 1 ]; then
+        lr=$(ls "$RUN/codemap/attempts/$aid/launches"/$mem*.json 2>/dev/null | head -1)
+        if [ -s "$lr" ]; then
+          gen=$(jq -c '.generation // null' "$lr"); lseq=$(jq -c '.launch_seq // null' "$lr")
+          lid=$(jq -c '.launch_id // null' "$lr"); known=true
+        fi
+      fi
+    fi
+    jq -n --arg m "$mem" --arg t "$tid" --arg s "$tag" --arg a "$aid" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg sha "$sha" --argjson g "$gen" --argjson q "$lseq" --argjson lid "$lid" --argjson eid "$eid" \
+      --argjson known "$known" \
+      '{member:$m,task:$t,step:$s,attempt:$a,archived_at:$ts,generation:$g,launch_seq:$q,
+        launch_id:$lid,event_id:$eid,accepted_sha256:$sha,
+        attribution_from_launch_record:$known,marker:"stale_or_ineligible"}' \
+      >"$dest/$mem.attribution.json" \
+      || codemap_checkpoint "could not write the archive attribution for $mem in $tid/$tag"
+  done
+  # a durable marker so the archive is never mistaken for reusable material
+  jq -n --arg t "$tid" --arg s "$tag" --arg a "$aid" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{task:$t,step:$s,attempt:$a,archived_at:$ts,status:"stale_or_ineligible",reusable:false}' >"$dest/MARKER.json" \
+    || codemap_checkpoint "could not write the durable archive marker for $tid/$tag"
+}
+codemap_checkpoint() {  # message -> preserve everything, stop before any decision is made
+  sts '.status="failed"'
+  log "codemap: $1; run: council.sh resume --run-dir $RUN"
+  render_transcript 2>/dev/null || true
+  exit 2
+}
+codemap_prepare() {  # tid tag raw(0/1) -> sets CODEMAP_STEP; writes the locator cache file on success
+  local tid=$1 tag=$2 raw=$3 out rc pend
+  CODEMAP_STEP=0
+  pend=$(stj '.codemap_pending // empty')
+  if [ -n "$pend" ] && [ "$pend" != null ] && [ "$(jq -r .task <<<"$pend")" = "$tid" ] && [ "$(jq -r .step <<<"$pend")" = "$tag" ]; then
+    # An attempt for this exact task/step is already open (resume of a partial step) — reuse it,
+    # never re-prepare. A missing locator cache here means an already-open evidentiary commitment
+    # (a real attempt, with its own guard list) was lost, not that the map is simply absent —
+    # checkpoint rather than silently downgrading this attempt to "map delivery disabled".
+    if [ -s "$RUN/codemap/.locator-$tid-$tag.md" ]; then CODEMAP_STEP=1; return 0; fi
+    codemap_checkpoint "the locator cache for the already-open attempt $tid/$tag is missing — checkpointed (its freshness obligation is unresolved, not silently bypassed)"
+  fi
+  local extra=(); [ "$raw" = 1 ] && extra=(--raw)
+  out=$(python3 "$CM" validate --run-dir "$RUN" --dir "$DIR" --task "$tid" --step "$tag" --mode begin "${extra[@]}" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then log "codemap: view preparation failed for $tid/$tag — running this attempt with map delivery disabled: $out"; return 0; fi
+  # The pending record carries the attempt, view and guard identity plus the exact source versions
+  # this attempt exposed, so the obligation survives even if a derived map file is later lost.
+  sts --arg t "$tid" --arg s "$tag" --argjson b "$out" \
+    '.codemap_pending={task:$t,step:$s,attempt:$b.attempt,view_snapshot_id:$b.snapshot_id,
+                       guard_snapshot_id:$b.guard_snapshot_id,exposed_sources:$b.exposed_sources}'
+  if python3 "$CM" locator --run-dir "$RUN" --task "$tid" --step "$tag" >"$RUN/codemap/.locator-$tid-$tag.md" 2>"$RUN/codemap/.locator-$tid-$tag.err"; then
+    CODEMAP_STEP=1
+  else
+    # Nothing was ever exposed, so there is no freshness obligation to owe. Clear the pending
+    # record completely: leaving it set would block this step's own later partial-step resume (and
+    # could leak a phantom obligation into another step) for an attempt that delivered no map
+    # bytes at all.
+    sts '.codemap_pending=null'
+    log "codemap: locator failed for $tid/$tag before any map evidence was exposed — this attempt runs entirely map-disabled, with no freshness obligation: $(cat "$RUN/codemap/.locator-$tid-$tag.err" 2>/dev/null)"
+  fi
+}
+codemap_append_locator() {  # prompt-file tid tag site -> append the locator AND record its span
+  # The orchestrator writes these bytes itself, so it knows their exact offset and length without
+  # ever searching the generated prompt for marker text. Author posts, task text, stored handover
+  # notes and relayed replies can contain "=== CODE MAP ===" all they like: none of it is counted,
+  # because none of it was written here.
+  [ "$CODEMAP_STEP" = 1 ] || return 0
+  local pf=$1 tid=$2 tag=$3 site=$4 loc="$RUN/codemap/.locator-$2-$3.md" off len
+  [ -s "$loc" ] || return 0
+  [ -e "$pf" ] || : >"$pf"
+  off=$(wc -c <"$pf" | tr -d ' ')
+  len=$(wc -c <"$loc" | tr -d ' ')
+  cat "$loc" >>"$pf" || codemap_checkpoint "could not deliver the code map locator into $pf"
+  mkdir -p "$RUN/codemap"
+  jq -n --arg p "$(basename "$pf")" --arg s "$site" --argjson o "$off" --argjson l "$len" \
+     --arg a "$(codemap_pending_attempt)" --arg t "$tid" --arg g "$tag" \
+     '{kind:"span",prompt:$p,site:$s,offset:$o,length:$l,attempt:$a,task:$t,step:$g}' -c \
+     >>"$RUN/codemap/deliveries.jsonl" \
+     || codemap_checkpoint "could not record the locator delivery boundary for $pf"
+}
+codemap_record_launched() {  # prompt-file tid tag -> the prompt was actually DELIVERED, and these
+  # were its exact bytes. A later replay that overwrites the prompt file cannot make this record
+  # point at different bytes, and a prompt written but never launched is never counted as delivered.
+  [ "$CODEMAP_STEP" = 1 ] || return 0
+  local pf=$1
+  [ -s "$pf" ] || return 0
+  jq -n --arg p "$(basename "$pf")" --arg a "$(codemap_pending_attempt)" \
+     --arg h "$(shasum -a 256 <"$pf" | cut -d' ' -f1)" --argjson n "$(wc -c <"$pf" | tr -d ' ')" \
+     --arg t "$2" --arg g "$3" \
+     '{kind:"launched",prompt:$p,attempt:$a,prompt_sha256:$h,prompt_size:$n,task:$t,step:$g}' -c \
+     >>"$RUN/codemap/deliveries.jsonl" || true
+}
+codemap_record_launch() {  # idx tid tag launch_gen -> prelaunch, orchestration-owned attribution;
+  # sets CODEMAP_LAUNCH_ID to the identity of THIS launch. Every genuinely new launch of a member
+  # inside one attempt — a replacement, a handover, a re-dispatched retry — gets its own immutable
+  # record, so a reply is always bound to the session that actually produced it. Earlier records
+  # are never rewritten, and reusing an already accepted checkpoint post allocates no launch at all
+  # (run_step skips this call entirely on the reuse path).
+  CODEMAP_LAUNCH_ID=""
+  [ "$CODEMAP_STEP" = 1 ] || return 0
+  local i=$1 tid=$2 tag=$3 lgen=$4 aid d f m seq lid
+  aid=$(codemap_pending_attempt); [ -n "$aid" ] || return 0
+  m=$(mid $i)
+  d="$RUN/codemap/attempts/$aid/launches"; mkdir -p "$d"
+  seq=$(( $(ls "$d" 2>/dev/null | wc -l) + 1 ))
+  # the member's first launch in the attempt keeps the member's own name as its launch id
+  lid=$m; [ "$seq" -gt 1 ] && lid="$m-s$seq"
+  f="$d/$lid.json"
+  [ -e "$f" ] && { CODEMAP_LAUNCH_ID=$lid; return 0; }   # immutable: never rewritten in place
+  # Checked BEFORE the member is launched: without this record staging refuses to authenticate the
+  # reply at all, so launching anyway would produce an accepted post that can never be attributed.
+  jq -n --arg m "$m" --argjson g "$lgen" --arg t "$tid" --arg s "$tag" --arg a "$aid" \
+     --arg lid "$lid" --argjson ts "$(date +%s)" --argjson seq "$seq" \
+     '{member:$m,generation:$g,task:$t,step:$s,attempt:$a,launched_at:$ts,launch_seq:$seq,launch_id:$lid}' >"$f" \
+    || codemap_checkpoint "could not record pre-launch attribution for member $m in $tid/$tag — refusing to launch a reply that could never be attributed"
+  [ -s "$f" ] || codemap_checkpoint "the pre-launch attribution record for member $m in $tid/$tag is empty — refusing to launch"
+  CODEMAP_LAUNCH_ID=$lid
+}
+codemap_schema_text() {
+  [ "$CODEMAP_STEP" = 1 ] || return 0
+  cat <<'TXT'
+If the code map locator appears above, you may OPTIONALLY add "code_reads" to your JSON tail: an array of {"path":"<repo-relative path>","lines":[first,last] (1-based inclusive; omit for a whole-file claim),"observed_sha256":"<sha256 of the exact bytes you believe you read>","symbol":"<optional>","conclusion":"<optional short claim>","inspection":"<optional note>"}. code_reads is optional; omitting it means unknown coverage. symbol and conclusion are author claims, not verification by the map; observed_sha256 describes the bytes you actually inspected — a mismatch with the map's current capture leaves the claim unbound.
+TXT
+}
+codemap_stage_accepted() {  # idx tid tag postjson launch_gen launch_id -> the accepted reply is
+  # bound to the orchestration-owned record of the launch that produced it (the caller's arrays),
+  # never a live re-read of state, so a handover/replace that launched the member again after this
+  # reply was launched cannot relabel either reply.
+  [ "$CODEMAP_STEP" = 1 ] || return 0
+  local i=$1 tid=$2 tag=$3 pj=$4 lgen=$5 lid=${6:-} out rc
+  local -a sel=(); [ -n "$lid" ] && sel=(--launch-id "$lid")
+  out=$(python3 "$CM" ingest --run-dir "$RUN" --dir "$DIR" --task "$tid" --step "$tag" --mode stage \
+        --member "$(mid $i)" --generation "$lgen" "${sel[@]}" --post-json "$pj" 2>&1); rc=$?
+  [ $rc -eq 0 ] || log "codemap: staging member $(mid $i)'s optional reports failed (post's vote is unaffected): $out"
+}
+codemap_finish_step() {  # tid tag -> 0 normal, 1 stale (caller must fail the step; posts already purged)
+  [ "$CODEMAP_STEP" = 1 ] || return 0
+  local tid=$1 tag=$2 out status rc
+  out=$(python3 "$CM" validate --run-dir "$RUN" --dir "$DIR" --task "$tid" --step "$tag" --mode end 2>&1); rc=$?
+  # A guard that cannot be evaluated is NOT a pass. Accepted posts, staging, the attempt identity
+  # and the unresolved obligation are all preserved, and the run checkpoints before this step's
+  # posts can be used for candidate selection or consensus.
+  if [ $rc -ne 0 ]; then
+    codemap_checkpoint "the end-of-step freshness check for $tid/$tag could not be completed, so its guard is unverified — checkpointed with every accepted post and staged report preserved: $out"
+  fi
+  status=$(jq -r .guard_status <<<"$out" 2>/dev/null)
+  case "$status" in
+    current)
+      out=$(python3 "$CM" ingest --run-dir "$RUN" --dir "$DIR" --task "$tid" --step "$tag" --mode publish 2>&1); rc=$?
+      case "$( [ $rc -eq 0 ] && jq -r '.status // "error"' <<<"$out" 2>/dev/null || echo error)" in
+        published|already_published) sts '.codemap_pending=null' ;;
+        *) # Everything is retryable and nothing is lost — but the run must NOT advance past this
+           # barrier while a publication is outstanding, or the next preparation would overwrite
+           # the pending record that is the only thing remembering the work.
+           codemap_checkpoint "publication of $tid/$tag's staged reports did not complete — its votes are unaffected and every staged report is preserved, but the run holds at this barrier rather than advancing with an outstanding publication: $out" ;;
+      esac
+      return 0 ;;
+    changed)
+      log "codemap: a source exposed as current in $tid/$tag's frozen view changed during the round — checkpointing and replaying this round (its posts are not reused)"
+      codemap_archive_posts "$tid" "$tag"
+      rm -f "$RUN"/posts/"$tid-$tag-"*
+      sts '.codemap_pending=null'
+      return 1 ;;
+    *)
+      codemap_checkpoint "$tid/$tag's freshness guard could not be verified (pending_verification) — its votes are preserved and NOT classified as stale, but they are not used for a decision until the obligation is resolved"
+      ;;
+  esac
+}
+codemap_resume_check() {  # called before an ordinary resume reuses posts of the in-progress step
+  [ "$CODEMAP" = 1 ] || return 0
+  local pend; pend=$(stj '.codemap_pending // empty'); [ -n "$pend" ] && [ "$pend" != null ] || return 0
+  local tid tag out status
+  tid=$(jq -r .task <<<"$pend"); tag=$(jq -r .step <<<"$pend")
+  out=$(python3 "$CM" validate --run-dir "$RUN" --dir "$DIR" --task "$tid" --step "$tag" --mode resume 2>&1) || {
+    codemap_checkpoint "the resume freshness re-check for $tid/$tag could not be completed — its posts are preserved and NOT classified as stale, but they are not reused until the guard is verified: $out"; }
+  status=$(jq -r .guard_status <<<"$out" 2>/dev/null)
+  if [ "$status" = pending_verification ]; then
+    codemap_checkpoint "$tid/$tag's guard is still unverifiable on resume — its posts are preserved and NOT reused until the obligation is resolved"
+  fi
+  if [ "$status" = changed ]; then
+    log "codemap: a guarded source changed while checkpointed — purging $tid/$tag's posts so they are not reused on resume"
+    codemap_archive_posts "$tid" "$tag"
+    rm -f "$RUN"/posts/"$tid-$tag-"*
+    sts '.codemap_pending=null'
+  elif [ "$status" = current ]; then
+    # Unchanged — and that is ALL this re-check establishes. The obligation is not discharged here
+    # and nothing is published here, whatever the attempt's recorded barrier says: the orchestration
+    # decision for this step has not been made yet (these posts are about to be reused by run_step),
+    # so the only safe state is the one we already have. Publishing and clearing codemap_pending now
+    # would let run_step open a brand-new attempt with a brand-new guard list while reusing these
+    # posts — exactly the hole through which a source changed after this re-check reaches consensus
+    # unnoticed. The attempt, its frozen view, its original exposed-source guard and its
+    # accepted-event attribution all stay in place; run_step reuses that same attempt and
+    # codemap_finish_step re-verifies that same original guard at the decision barrier, which is
+    # also where an outstanding publication (a publish that failed before the checkpoint) is retried.
+    log "codemap: $tid/$tag's guarded sources are unchanged on resume — its posts are reusable, but the same attempt, view and guard are kept until the end-of-step decision barrier re-verifies them"
+  fi
 }
 mid()  { st ".members[$1].id"; }
 mget() { st ".members[$1].$2"; }
@@ -317,12 +589,14 @@ task_intro()  { local t=$1; task_text "$t"; jq -e '.execute' <<<"$t" >/dev/null 
 (This is a BUILD task: the council first agrees on a PLAN — concrete files, changes, verification commands. Then executor $EXEC implements the plan, and the council ratifies the actual result.)"; }
 
 prompt_round1() {  # idx task
+  local tid; tid=$(jq -r .id <<<"$2")
+  local schema; schema=$(codemap_schema_text); [ -n "$schema" ] && schema="$schema"$'\n'
   cat <<TXT
 $(task_header "$2" 1)
 $(task_intro "$2")
 $(answers_block)
 Your job this round: (1) list EVERY choice the task leaves open and every fact you need, and for each say what settles it: "task" (quote it), "dir" (path you verified), "user" (an answer from the user, quoted) or "ask" (the user must decide); (2) if any item is "ask", vote "question" (or vote "propose" — the orchestrator turns "ask" items into questions anyway); otherwise give your complete proposed $( jq -e '.execute' <<<"$2" >/dev/null && echo plan || echo answer ). Other members do the same; next round you will see their proposals.
-JSON tail — exactly one of:
+${schema}JSON tail — exactly one of:
 \`\`\`json
 {"vote": "propose", "open": [{"item": "<open choice or needed fact>", "settled_by": "task|dir|user|ask", "where": "<quote from the task / file path / the user's answer, or the exact question for the user>"}], "proposal": "<your complete $( jq -e '.execute' <<<"$2" >/dev/null && echo plan || echo answer )>", "questions": []}
 \`\`\`
@@ -333,6 +607,7 @@ TXT
 }
 prompt_roundN_full() {  # lossless fallback; also the baseline for the round-trip check
   local i=$1 t=$2 r=$3 prev=$((r-1)) tid; tid=$(jq -r .id <<<"$t")
+  local schema; schema=$(codemap_schema_text); [ -n "$schema" ] && schema="$schema"$'\n'
   cat <<TXT
 $(task_header "$t" "$r")
 Candidate for this round — proposed by member $(st .candidate.member). Vote on this EXACT text:
@@ -352,7 +627,7 @@ Your job this round: reply to the other members where you disagree (by name), th
 - If the candidate is acceptable to you AS WRITTEN: vote "agree" (no proposal needed). Consensus needs every member to agree.
 - Otherwise vote "disagree" and give a COMPLETE revised proposal (not a diff of the candidate — the full text), so it can become the next candidate.
 - If you still lack information: vote "question".
-JSON tail — exactly one of:
+${schema}JSON tail — exactly one of:
 \`\`\`json
 {"vote": "agree", "reason": "<one line>", "proposal": null, "questions": []}
 \`\`\`
@@ -593,16 +868,39 @@ run_step() {
   local tag=$1 gen=$2 t=$3 tid i pf r=${4:-1} only=${5:-}
   tid=$(jq -r .id <<<"$t"); mkdir -p "$RUN/prompts" "$RUN/posts" "$RUN/raw"
   local idxs; if [ -n "$only" ]; then idxs=$only; else idxs=$(seq 0 $((N-1))); fi
+  local -a launch_gen=()   # generation recorded at launch time, for attribution (see codemap_stage_accepted)
+  local -a launch_id=()    # the orchestration-owned identity of the launch that produced the reply
+  CODEMAP_STEP=0
+  if [ "$CODEMAP" = 1 ] && codemap_is_deliberation "$gen"; then
+    codemap_prepare "$tid" "$tag" "$( [ "$gen" = prompt_round1 ] && echo 1 || echo 0 )"
+  fi
   for i in $idxs; do
     needs_handover $i && do_handover $i
     pf="$RUN/prompts/$tid-$tag-$(mid $i).md"
     if [ "$(st '.reuse_posts // false')" = true ] && post_valid "$RUN/posts/$tid-$tag-$(mid $i).json" && [ -s "$RUN/posts/$tid-$tag-$(mid $i).md" ]; then
       log "member $(mid $i): reusing its $tag post from the checkpoint (not re-run)"; sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'; continue
     fi
-    { if [ "$(mget $i fresh)" = true ]; then rules_text $i; echo
-        local hn; hn=$(mget $i handover_note); [ "$hn" != null ] && [ -n "$hn" ] && { echo "Handover note from your predecessor session (same member id):"; echo "<<<HANDOVER"; cat "$hn"; echo ">>>"; echo; }; fi
-      notices_block; $gen $i "$t" "$r"; } >"$pf"
+    launch_gen[$i]=$(mget $i gen)
+    codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID
+    # The prompt is assembled in place rather than in one redirected block, so the orchestrator
+    # knows the exact byte offset of every locator block IT writes (see codemap_append_locator).
+    # The resulting bytes are identical to the single-block form: the locator sat at the start of
+    # the generator's output and inside the handover section, which is exactly where it goes here.
+    : >"$pf"
+    if [ "$(mget $i fresh)" = true ]; then
+      { rules_text $i; echo; } >>"$pf"
+      local hn; hn=$(mget $i handover_note)
+      if [ "$hn" != null ] && [ -n "$hn" ]; then
+        { echo "Handover note from your predecessor session (same member id):"; echo "<<<HANDOVER"; cat "$hn"; } >>"$pf"
+        codemap_append_locator "$pf" "$tid" "$tag" handover
+        { echo ">>>"; echo; } >>"$pf"
+      fi
+    fi
+    notices_block >>"$pf"
+    codemap_append_locator "$pf" "$tid" "$tag" prompt
+    $gen $i "$t" "$r" >>"$pf"
     launch $i "$pf" "$tid-$tag" || { log "member $(mid $i): launch failed"; return 1; }
+    codemap_record_launched "$pf" "$tid" "$tag"
   done
   local fail=0
   for i in $idxs; do
@@ -613,7 +911,9 @@ run_step() {
                  (if .vote=="propose" or .vote=="disagree" then ((.proposal|type)=="string" and (.proposal|length)>0)
                   elif .vote=="done" then ((.report|type)=="string" and (.report|length)>0)
                   elif .vote=="question" then ((.questions|type)=="array" and (.questions|length)>0) else true end)' "$RUN/posts/$tid-$tag-$id.json" >/dev/null; then ok=1; break; fi
-      [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || break; }
+      # A re-dispatched retry is a genuinely new launch: it gets its own immutable record, so the
+      # reply it produces is bound to it and not to the launch whose reply was unusable.
+      [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch_gen[$i]=$(mget $i gen); codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || break; }
     done
     sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null'
     if [ $ok -eq 1 ]; then
@@ -623,11 +923,15 @@ run_step() {
         jq -c '.questions = ((.questions // []) + [ .open[] | select((.settled_by|ascii_downcase|IN("task","dir","user"))|not) | (.where // .item) ]) | .vote="question" | .proposal=null' "$RUN/posts/$tid-$tag-$id.json" >"$RUN/posts/$tid-$tag-$id.json.tmp" && mv "$RUN/posts/$tid-$tag-$id.json.tmp" "$RUN/posts/$tid-$tag-$id.json"
         log "member $id: proposal had open items not settled by task/dir — converted to questions for the user"
       fi
+      codemap_stage_accepted $i "$tid" "$tag" "$RUN/posts/$tid-$tag-$id.json" "${launch_gen[$i]}" "${launch_id[$i]}"
     else fail=1; log "member $id: failed twice in step $tag"; fi
     local vote=FAILED; [ $ok -eq 1 ] && vote=$(jq -r '.vote' "$RUN/posts/$tid-$tag-$id.json")
     local cu cl stt; cu=$(st ".members[$i].ctx_used // 0"); cl=$(st ".members[$i].ctx_limit // \"?\""); stt=$(st ".members[$i].session_tokens // 0")
     log "$(now) $tid $tag member $id: $vote · ctx $(ctx_pct $i)% [$cu/$cl] · session tokens $stt"
   done
+  if [ "$fail" -eq 0 ] && [ "$CODEMAP_STEP" = 1 ]; then
+    codemap_finish_step "$tid" "$tag" || fail=1
+  fi
   # collect votes from the post tails
   local votes="[]"; for i in $idxs; do local id; id=$(mid $i); [ -f "$RUN/posts/$tid-$tag-$id.json" ] && votes=$(jq -c --arg m "$id" --slurpfile p "$RUN/posts/$tid-$tag-$id.json" '. + [ $p[0] + {member:$m} ]' <<<"$votes"); done
   sts --argjson v "$votes" '.last_votes=$v | .notices=[] | .reuse_posts=false'
@@ -782,6 +1086,11 @@ token_report() {  # prints the report; returns non-zero only if both tools fail
   echo '```'
   python3 "$PTOOLS/dedup_check.py" "$RUN" 2>&1 | tail -40 || rc=1
   echo '```'
+  if [ "$(st '.codemap_version // empty')" = "1" ]; then
+    echo; echo "### Code map"; echo; echo '```'
+    python3 "$PTOOLS/codemap_report.py" "$RUN" 2>&1 || echo "(the code map report is unavailable: see above)"
+    echo '```'
+  fi
   return $rc
 }
 
@@ -850,6 +1159,7 @@ case "$CMD" in
     jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" '
       ($lim | split("\n") | map(select(length>0) | split("\t") | {key:.[0], value:(.[1]|tonumber)}) | from_entries) as $L |
       {config:$cfg, run_dir:$run, started:$ts, status:"created", cl_cumulative:$cum, task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
+       codemap_version:1, codemap_pending:null,
        answers:[], pending_questions:null, notices:[], reuse_posts:false, results:[], log:[],
        members:[ $cfg.members[] | . + {session:null, gen:1, fresh:true, handover_note:null, ctx_used:0, ctx_limit:($L[.id] // null), session_tokens:0, session_cost:0, calls:0, session_calls:0, retired:[], inflight:null} ]}' >"$RUN/state.json"
     load_state
@@ -887,11 +1197,14 @@ case "$CMD" in
           sts --arg a "$ANSWER_TEXT" '.answers += [ .pending_questions[] | . + {answer:$a} ]'
         else die "pending questions — pass --answers answers.json ({qid: answer}) or --answer TEXT (same answer to all). See $RUN/questions.json"; fi
         sts '.pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; rm -f "$RUN/questions.json"
+        # a run without a supported codemap_version gains no map-related state mutation at all
+        [ "$CODEMAP" = 1 ] && sts '.codemap_pending=null'
         # the round is redone with the answers: discard the posts of that step so nobody's earlier post is reused
         case "$(st .phase)" in exec) stag="exec$(st .round)" ;; ratify) stag="x$(st .round)" ;; *) stag="r$(st .round)" ;; esac
         rm -f "$RUN"/posts/"$(st .task_id)-$stag-"*
-        log "answers recorded — re-running task $(st .task_id) phase $(st .phase) round $(st .round) with the answers (round budget not consumed)" ;;
+        log "answers recorded — re-running task $(st .task_id) phase $(st .phase) round $(st .round) with the answers (round budget not consumed)$( [ "$CODEMAP" = 1 ] && echo "; a new code map attempt begins for this step" )" ;;
       failed|running|created)
+        codemap_resume_check
         log "resuming task $(st '.task_id // "-"') phase $(st .phase) round $(st .round) — members with a valid post in that round are not re-run"
         sts '.status="running" | .last_votes=[] | .reuse_posts=true | .members |= map(.inflight=null)' ;;
       done) die "this run is finished (see $RUN/transcript.md)" ;;

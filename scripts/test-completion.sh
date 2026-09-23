@@ -4,6 +4,7 @@ set -o pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d /tmp/opencode-completion.XXXXXX) || exit 1
 export TMPDIR="$scratch"
+export PYTHONDONTWRITEBYTECODE=1  # every python3 invocation below must not dirty tracked ptools/__pycache__
 : >"$scratch/passed"
 trap '[ "$BASH_SUBSHELL" -ne 0 ] || rm -rf "$scratch"' EXIT
 curl() { echo "unexpected network call" >&2; return 99; }
@@ -287,5 +288,480 @@ ptools_tests() (
   check 2 'prompt_report rejects a directory with no run' '' python3 "$HERE/ptools/prompt_report.py" "$scratch/nope"
   check 2 'dedup_check rejects a directory with no run' '' python3 "$HERE/ptools/dedup_check.py" "$scratch/nope"
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests handover_tests ptools_tests; do "$suite" || exit 1; done
+codemap_version_tests() (
+  load council.sh; RUN="$scratch/cmver"; ST="$RUN/state.json"; DIR="$scratch"; N=1
+  mkdir -p "$RUN"
+  jq -n '{codemap_pending:null}' >"$ST"
+  codemap_check_version
+  check 0 'absent codemap_version disables the map' '' test "$CODEMAP" = 0
+  sts '.codemap_version=1'
+  codemap_check_version
+  check 0 'codemap_version=1 enables the map' '' test "$CODEMAP" = 1
+  sts '.codemap_version=2 | .codemap_pending=null'
+  codemap_check_version; local rc=$?
+  check 0 'unsupported version without a pending attempt does not checkpoint' '' test "$rc" -eq 0
+  check 0 'unsupported version leaves the map disabled' '' test "$CODEMAP" = 0
+  sts '.codemap_pending={task:"t1",step:"r1"}'
+  check 2 'unsupported version with a pending map-backed attempt checkpoints via exit 2' '' codemap_check_version
+)
+codemap_prompt_tests() (
+  load council.sh; RUN="$scratch/cmprompt"; ST="$RUN/state.json"; N=2; MAXR=4
+  mkdir -p "$RUN/posts" "$RUN/codemap"
+  local task='{"id":"t1","text":"Do X","execute":false}'
+  jq -n --argjson t "$task" '{candidate:{id:"t1-c1",member:"A",text:"CAND"},answers:[],config:{tasks:[$t],max_rounds:4},members:[{id:"A"},{id:"B"}]}' >"$ST"
+  not_contains() { ! grep -q "$2" "$1"; }
+  CODEMAP_STEP=0
+  prompt_round1 0 "$task" >"$scratch/r1-disabled"
+  check 0 'round1 prompt has no code map text when the step is disabled' '' not_contains "$scratch/r1-disabled" 'CODE MAP'
+  check 0 'round1 prompt has no code_reads schema text when disabled' '' not_contains "$scratch/r1-disabled" 'code_reads'
+  check 0 'round1 prompt starts with the task header when disabled (no stray leading blank line)' '=== TASK t1' head -1 "$scratch/r1-disabled"
+  printf '=== CODE MAP ===\nfixture locator\n=== END CODE MAP ===\n' >"$RUN/codemap/.locator-t1-r1.md"
+  CODEMAP_STEP=1
+  # The generator NEVER emits the locator; the orchestrator appends it and records the span. This
+  # is the real delivery path, so the test exercises it exactly as run_step does.
+  prompt_round1 0 "$task" >"$scratch/r1-gen-only"
+  check 0 'the round1 generator itself emits no code map bytes' '' not_contains "$scratch/r1-gen-only" 'CODE MAP'
+  check 0 'round1 prompt carries the code_reads schema when enabled' 'code_reads is optional' cat "$scratch/r1-gen-only"
+  : >"$scratch/r1-enabled"
+  codemap_append_locator "$scratch/r1-enabled" t1 r1 prompt
+  prompt_round1 0 "$task" >>"$scratch/r1-enabled"
+  check 0 'round1 prompt carries the locator when the step is enabled' 'fixture locator' cat "$scratch/r1-enabled"
+  check 0 'the locator is the first thing in the delivered round1 prompt' '=== CODE MAP ===' head -1 "$scratch/r1-enabled"
+  check 0 'the recorded span is the real offset and length of the appended block' \
+    '0 '"$(wc -c <"$RUN/codemap/.locator-t1-r1.md" | tr -d ' ')" \
+    jq -r 'select(.kind=="span")|"\(.offset) \(.length)"' "$RUN/codemap/deliveries.jsonl"
+  check 0 'the recorded span really does delimit the locator bytes in the delivered prompt' \
+    '=== CODE MAP ===' head -1 "$scratch/r1-enabled"
+  # author text that merely CONTAINS the marker is never recorded as a delivery
+  : >"$RUN/codemap/deliveries.jsonl"
+  { printf 'A member wrote: === CODE MAP === in their post\n'; } >"$scratch/r1-impostor"
+  prompt_round1 0 "$task" >>"$scratch/r1-impostor"
+  check 0 'marker text inside relayed author prose records no delivery at all' '' \
+    test ! -s "$RUN/codemap/deliveries.jsonl"
+  printf '=== CODE MAP ===\nfixture locator r2\n=== END CODE MAP ===\n' >"$RUN/codemap/.locator-t1-r2.md"
+  CODEMAP_STEP=0
+  prompt_roundN_full 0 "$task" 2 >"$scratch/rN-disabled"
+  check 0 'roundN prompt has no code map text when disabled' '' not_contains "$scratch/rN-disabled" 'CODE MAP'
+  CODEMAP_STEP=1
+  : >"$scratch/rN-enabled"
+  codemap_append_locator "$scratch/rN-enabled" t1 r2 prompt
+  prompt_roundN_full 0 "$task" 2 >>"$scratch/rN-enabled"
+  check 0 'roundN prompt carries the locator when enabled' 'fixture locator r2' cat "$scratch/rN-enabled"
+)
+codemap_pipeline_tests() (
+  load council.sh; RUN="$scratch/cmpipe"; ST="$RUN/state.json"; N=1; MAXR=4; EXEC=""
+  not_contains() { ! grep -q "$2" "$1"; }
+  mkdir -p "$RUN/posts" "$RUN/raw" "$RUN/prompts"
+  DIR="$scratch/proj"; mkdir -p "$DIR/src"; printf 'one\ntwo\n' >"$DIR/src/a.py"
+  local sha; sha=$(python3 -c "import hashlib;print(hashlib.sha256(open('$DIR/src/a.py','rb').read()).hexdigest())")
+  local task='{"id":"t1","text":"Do X","execute":false}'
+  reset_state() {
+    jq -n --arg d "$DIR" --argjson t "$task" '{codemap_version:1,codemap_pending:null,candidate:null,answers:[],notices:[],log:[],
+       results:[],reuse_posts:false,round:1,
+       config:{dir:$d,tasks:[$t],max_rounds:4},
+       members:[{id:"A",kind:"opencode",model:"m",effort:"h",mode:"read",fresh:false,session_calls:0,retired:[],gen:1}]}' >"$ST"
+    codemap_check_version
+  }
+  reset_state
+  render_transcript() { :; }
+  local tail; tail=$(jq -cn --arg sha "$sha" '{vote:"propose",proposal:"x",questions:[],code_reads:[{path:"src/a.py",lines:[1,1],observed_sha256:$sha,symbol:"foo",conclusion:"looks fine"}]}')
+  launch() { :; }
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  check 0 'a round-1 deliberation step with code_reads succeeds' '' run_step r1 prompt_round1 "$task" 1
+  check 0 'the accepted code_reads report is published into the index' '' jq -e '.entries|length==1' "$RUN/codemap/index.json"
+  check 0 'the published report carries the symbol claim' foo jq -r '[.entries[].reports[].symbol]|.[0]' "$RUN/codemap/index.json"
+  check 0 'codemap_pending is cleared after a clean publish' 'null' st '.codemap_pending'
+  check 0 'the accepted vote itself is unaffected by the optional report' propose jq -r '.last_votes[0].vote' "$ST"
+
+  # malformed code_reads item must never change the vote or retry
+  reset_state
+  local bad_tail; bad_tail=$(jq -cn '{vote:"agree",questions:[],code_reads:[{path:"src/a.py",bogus_key:1}]}')
+  collect() { printf '%s\n' 'Prose.' '```json' "$bad_tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  check 0 'a malformed code_reads item does not fail the step' '' run_step r1 prompt_round1 "$task" 1
+  check 0 'the vote is unaffected by a malformed optional item' agree jq -r '.last_votes[0].vote' "$ST"
+
+  # freshness guard: a guarded source mutated after round-1 publish must fail round 2 (stale) and purge its posts
+  reset_state
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts --arg m A --arg tid t1 '.candidate={id:"t1-c1",member:$m,text:"CAND"}'
+  codemap_prepare t1 r2 0   # freeze the guard on today's a.py before it changes
+  printf 'one\nCHANGED\n' >"$DIR/src/a.py"
+  collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r2-A.md"; return 0; }
+  check 1 'a guarded source changing mid-round fails the step (stale)' '' run_step r2 prompt_roundN "$task" 2
+  check 0 'the stale round purges its own posts so they are never reused' '' test ! -e "$RUN/posts/t1-r2-A.md"
+  check 0 'codemap_pending is cleared after stale handling' 'null' st '.codemap_pending'
+
+  # resume: an already-checkpointed step must be re-verified and its posts purged if the guard changed meanwhile
+  reset_state
+  # restore the exact bytes the member's observed_sha256 names, so its claim binds to the LIVE
+  # version and the round-2 guard actually has an exposed current source to watch
+  printf 'one\ntwo\n' >"$DIR/src/a.py"
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts '.candidate={id:"t1-c1",member:"A",text:"CAND"}'
+  codemap_prepare t1 r2 0
+  : >"$RUN/posts/t1-r2-A.md"; echo '{"vote":"agree","questions":[]}' >"$RUN/posts/t1-r2-A.json"
+  printf 'one\nCHANGED AGAIN\n' >"$DIR/src/a.py"
+  codemap_resume_check
+  check 0 'resuming re-verifies the guard and purges posts if it changed' '' test ! -e "$RUN/posts/t1-r2-A.md"
+  printf 'one\nCHANGED AGAIN\n' >"$DIR/src/a.py"  # unchanged since the previous check
+  : >"$RUN/posts/t1-r2-A.md"; echo '{"vote":"agree","questions":[]}' >"$RUN/posts/t1-r2-A.json"
+  codemap_prepare t1 r2 0
+  codemap_resume_check
+  check 0 'resuming keeps posts when the guard is unchanged' '' test -e "$RUN/posts/t1-r2-A.md"
+
+  # handover: original note bytes are preserved on disk; the delivered prompt adds the locator, never mutating the file
+  reset_state
+  echo "Original note text." >"$scratch/note.md"
+  sts --arg n "$scratch/note.md" '.members[0].fresh=true | .members[0].handover_note=$n'
+  collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  check 0 'the delivered prompt renders the original handover note bytes' 'Original note text.' cat "$RUN/prompts/t1-r1-A.md"
+  check 0 'the delivered prompt embeds the locator inside the handover section' 'CODE MAP' cat "$RUN/prompts/t1-r1-A.md"
+  check 0 'the stored handover note file is never mutated (still exactly its original line)' '1 '"$scratch/note.md" wc -l "$scratch/note.md"
+  check 0 'the stored handover note file gained no code map bytes on disk' '' not_contains "$scratch/note.md" 'CODE MAP'
+)
+# Byte-exact baselines for the deliveries the code map must never touch. The digests below were
+# recovered from the immutable pre-change commit d62a356 with exactly the fixture built here (the
+# only environment-dependent text, the scratch path, is normalised away). They cover the COMPLETE
+# execution / ratification / fix prompt as delivered to a FRESH session — i.e. including the
+# rules block and the predecessor-handover framing — with the map enabled and disabled.
+BASELINE_EXEC=27a50eabb90cb446c025a420020d097459acbe52a036276ec154f9503a9bd71c
+BASELINE_RATIFY=5102c70d74878f06e2f9a048d48a8037eaeb128382613b1e68898573d8f9b7e1
+BASELINE_FIX=6e9542d66c9b572460123caa3b486e5a841f4a28c96f25d92168ebcfb049c4ac
+prompt_baseline_digests() (  # map(0|1) -> "<tag> <sha256>" per non-deliberation delivery
+  local map=$1 base="$scratch/baseline-$1"
+  load council.sh
+  RUN="$base/run"; ST="$RUN/state.json"; N=2; MAXR=4; EXEC=A; DIR="$base/proj"
+  mkdir -p "$RUN/posts" "$RUN/raw" "$RUN/prompts" "$RUN/codemap" "$DIR"
+  local task='{"id":"t1","text":"Do X","execute":true}'
+  jq -n --argjson t "$task" --arg d "$DIR" '{
+    codemap_version:1, codemap_pending:null, status:"running", task_id:"t1", task_idx:0, round:1,
+    phase:"exec", started:"S", run_dir:"R",
+    candidate:{id:"t1-c1",member:"A",text:"CANDIDATE BODY"},
+    answers:[{id:"t1/r1/A/q1",task:"t1",member:"A",question:"Q?",answer:"A!"}],
+    notices:["a notice"], log:[], results:[{task:"t1",outcome:"consensus",rounds:2,text:"PLAN BODY"}],
+    fixes:[{member:"B",reason:"because",proposal:"fix this"}],
+    reuse_posts:false, config:{dir:$d,tasks:[$t],max_rounds:4,executor:"A"},
+    members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"edit",fresh:true,handover_note:null,
+              gen:1,session_calls:0,retired:[],ctx_used:0,ctx_limit:1000,style:null},
+             {id:"B",kind:"opencode",model:"p/m2",effort:"high",mode:"read",fresh:false,handover_note:null,
+              gen:1,session_calls:0,retired:[],ctx_used:0,ctx_limit:1000,style:null}]}' >"$ST"
+  printf 'Predecessor note body.\n' >"$base/note.md"
+  render_transcript() { :; }
+  launch() { :; }
+  collect() { local i=$1; printf '%s\n' 'Prose.' '```json' '{"vote":"done","report":"r","questions":[]}' '```' >"$RUN/raw/t1-$TAG-$(mid $i).md"; return 0; }
+  needs_handover() { return 1; }
+  # Really turn the map on: loading council.sh resets CODEMAP to 0, so without this the
+  # "map enabled" half of the baseline would be testing the disabled path twice over.
+  if [ "$map" = 1 ]; then
+    codemap_check_version
+    [ "$CODEMAP" = 1 ] || { echo "FAIL baseline fixture: CODEMAP is $CODEMAP, expected 1"; echo x >>"$scratch/failed"; }
+    # a locator cache exists for these steps: if any non-deliberation delivery ever consulted it,
+    # the digest would change
+    for s in exec x1 fix1; do printf '=== CODE MAP ===\nfixture\n=== END CODE MAP ===\n' >"$RUN/codemap/.locator-t1-$s.md"; done
+  else
+    CODEMAP=0
+    [ "$CODEMAP" = 0 ] || { echo "FAIL baseline fixture: CODEMAP is $CODEMAP, expected 0"; echo x >>"$scratch/failed"; }
+  fi
+  local spec
+  for spec in "exec:prompt_exec" "x1:prompt_ratify" "fix1:prompt_fix"; do
+    TAG=${spec%%:*}
+    sts --arg n "$base/note.md" '.members[0].fresh=true | .members[0].handover_note=$n | .notices=["a notice"] | .reuse_posts=false'
+    run_step "$TAG" "${spec#*:}" "$task" 1 0 >/dev/null 2>&1
+    printf '%s %s\n' "$TAG" "$(sed "s|$base|@SCRATCH@|g" "$RUN/prompts/t1-$TAG-A.md" | shasum -a 256 | cut -d' ' -f1)"
+  done
+)
+codemap_baseline_tests() (
+  local off on
+  off=$(prompt_baseline_digests 0); on=$(prompt_baseline_digests 1)
+  digest() { awk -v t="$2" '$1==t{print $2}' <<<"$1"; }
+  check 0 'execution delivery is byte-identical to the d62a356 baseline (map disabled)' "$BASELINE_EXEC" digest "$off" exec
+  check 0 'ratification delivery is byte-identical to the d62a356 baseline (map disabled)' "$BASELINE_RATIFY" digest "$off" x1
+  check 0 'fix delivery is byte-identical to the d62a356 baseline (map disabled)' "$BASELINE_FIX" digest "$off" fix1
+  check 0 'execution delivery is byte-identical to the baseline with the map ENABLED' "$BASELINE_EXEC" digest "$on" exec
+  check 0 'ratification delivery is byte-identical to the baseline with the map ENABLED' "$BASELINE_RATIFY" digest "$on" x1
+  check 0 'fix delivery is byte-identical to the baseline with the map ENABLED' "$BASELINE_FIX" digest "$on" fix1
+  check 0 'enabling the map changes no non-deliberation delivery at all' '' test "$off" = "$on"
+  # the same fixture, regenerated from the immutable commit itself, must produce those digests
+  if git -C "$HERE/.." rev-parse --verify -q d62a356 >/dev/null 2>&1; then
+    git -C "$HERE/.." show d62a356:scripts/council.sh >"$scratch/d62a356-council.sh"
+    cp "$HERE/oc.sh" "$scratch/oc.sh"; ln -sfn "$HERE/ptools" "$scratch/ptools"
+    local recovered
+    recovered=$( HERE_OVERRIDE=1; load() { eval "$(sed '/^# .* commands /,$d' "$scratch/d62a356-council.sh")"; }
+                 prompt_baseline_digests 0 )
+    check 0 'the embedded digests really are the pre-change d62a356 bytes' "$BASELINE_EXEC" digest "$recovered" exec
+  else
+    echo "PASS (skipped) d62a356 is not present in this clone; the embedded digests stand alone"
+    echo x >>"$scratch/passed"
+  fi
+)
+codemap_engine_tests() (
+  load council.sh; RUN="$scratch/cmeng"; ST="$RUN/state.json"; N=1; MAXR=4; EXEC=""
+  mkdir -p "$RUN/posts" "$RUN/raw" "$RUN/prompts"
+  DIR="$scratch/eng"; mkdir -p "$DIR/src"; printf 'one\ntwo\n' >"$DIR/src/a.py"
+  local sha; sha=$(python3 -c "import hashlib;print(hashlib.sha256(open('$DIR/src/a.py','rb').read()).hexdigest())")
+  local task='{"id":"t1","text":"Do X","execute":false}'
+  reset_state() {
+    jq -n --arg d "$DIR" --argjson t "$task" '{codemap_version:1,codemap_pending:null,candidate:null,answers:[],notices:[],log:[],
+       results:[],reuse_posts:false,round:1,status:"running",
+       config:{dir:$d,tasks:[$t],max_rounds:4},
+       members:[{id:"A",kind:"opencode",model:"m",effort:"h",mode:"read",fresh:false,session_calls:0,retired:[],gen:1}]}' >"$ST"
+    codemap_check_version
+  }
+  render_transcript() { :; }
+  launch() { :; }
+  local tail; tail=$(jq -cn --arg sha "$sha" '{vote:"propose",proposal:"x",questions:[],code_reads:[{path:"src/a.py",lines:[1,1],observed_sha256:$sha,symbol:"foo"}]}')
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+
+  # attribution is recorded BEFORE the member is launched, and survives a later handover
+  reset_state
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  local aid; aid=$(stj '.codemap_pending.attempt // empty' | tr -d '"')
+  check 0 'the pending record carries the attempt identity' '' test -n "$(ls -d "$RUN"/codemap/attempts/t1-r1-a* 2>/dev/null)"
+  local ldir; ldir=$(ls -d "$RUN"/codemap/attempts/t1-r1-a*/launches 2>/dev/null | head -1)
+  check 0 'a pre-launch attribution record exists for the member' 1 jq -r .generation "$ldir/A.json"
+  check 0 'the pre-launch record names the attempt it belongs to' t1 jq -r .task "$ldir/A.json"
+  check 0 'the published report is attributed to the launch generation' 1 jq -r '[.entries[].reports[].reader.generation]|.[0]' "$RUN/codemap/index.json"
+  check 0 'locator delivery boundaries are recorded, not searched for later' 't1-r1-A.md' cat "$RUN/codemap/deliveries.jsonl"
+
+  # an unverifiable guard checkpoints instead of quietly passing
+  reset_state
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts '.candidate={id:"t1-c1",member:"A",text:"CAND"}'
+  codemap_prepare t1 r2 0
+  collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r2-A.md"; return 0; }
+  # make the guarded source unreadable-but-present: a directory in its place is not "missing"
+  chmod 000 "$DIR/src/a.py"
+  check 2 'an unverifiable freshness guard checkpoints via exit 2 instead of passing' '' run_step r2 prompt_roundN "$task" 2
+  chmod 644 "$DIR/src/a.py"
+  check 0 'the checkpointed attempt keeps its posts (they are preserved, not stale)' '' test -e "$RUN/posts/t1-r2-A.md"
+  check 0 'the unresolved obligation is still recorded in state' t1 jq -r '.codemap_pending.task' "$ST"
+  check 0 'the run is left checkpointed, not advanced' failed st '.status'
+
+  # once the guard verifies unchanged, the very same posts are reused and the step publishes
+  codemap_resume_check
+  check 0 'an unchanged recheck keeps the posts for reuse' '' test -e "$RUN/posts/t1-r2-A.md"
+
+  # a stale replay archives the complete original posts before purging them
+  reset_state
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts '.candidate={id:"t1-c1",member:"A",text:"CAND"}'
+  codemap_prepare t1 r3 0
+  local aid3; aid3=$(codemap_pending_attempt)
+  : >"$RUN/posts/t1-r3-A.md"; printf 'ORIGINAL POST BODY\n' >"$RUN/posts/t1-r3-A.md"
+  echo '{"vote":"agree","questions":[]}' >"$RUN/posts/t1-r3-A.json"
+  printf 'one\nCHANGED\n' >"$DIR/src/a.py"
+  codemap_resume_check
+  check 0 'the stale replay purged the live posts' '' test ! -e "$RUN/posts/t1-r3-A.md"
+  check 0 'the complete original post is archived in the private attempt area' 'ORIGINAL POST BODY' cat "$RUN/codemap/attempts/$aid3"/archived-posts/*/t1-r3-A.md
+  check 0 'the archived accepted JSON tail is kept too' agree jq -r .vote "$RUN/codemap/attempts/$aid3"/archived-posts/*/t1-r3-A.json
+  check 0 'the archive carries a durable ineligible marker' stale_or_ineligible jq -r .status "$RUN/codemap/attempts/$aid3"/archived-posts/*/MARKER.json
+  check 0 'the round and candidate are untouched by the replay' 't1-c1' st '.candidate.id'
+  check 0 'the round number is not advanced by the replay' 1 st '.round'
+
+  # ---- A's reproduction: an unchanged resume recheck must NOT release the obligation, or a
+  # source that changes afterwards reaches consensus behind a brand-new, empty guard.
+  reset_state
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  printf 'one\ntwo\n' >"$DIR/src/a.py"
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts '.candidate={id:"t1-c1",member:"A",text:"CAND"}'
+  codemap_prepare t1 r4 0
+  local aid4; aid4=$(codemap_pending_attempt)
+  printf 'ORIGINAL\n' >"$RUN/posts/t1-r4-A.md"; echo '{"vote":"agree","questions":[]}' >"$RUN/posts/t1-r4-A.json"
+  codemap_resume_check                       # unchanged: the step is NOT complete yet
+  check 0 'an unchanged resume recheck keeps the SAME attempt, not a fresh one' "$aid4" codemap_pending_attempt
+  check 0 'the obligation is still owed after an unchanged recheck' t1 jq -r '.codemap_pending.task' "$ST"
+  check 0 'the original guard list is still the one on disk' '' test -s "$RUN/codemap/attempts/$aid4/guard.json"
+  # the source now changes, AFTER the unchanged recheck but BEFORE the decision
+  printf 'one\nCHANGED AFTER THE RECHECK\n' >"$DIR/src/a.py"
+  CODEMAP_STEP=1
+  check 1 'a change after an unchanged recheck is still caught at the decision barrier' '' codemap_finish_step t1 r4
+  check 0 'its posts are purged rather than reaching consensus' '' test ! -e "$RUN/posts/t1-r4-A.md"
+
+  # ---- stale is terminal: restoring the original bytes never revives the attempt
+  check 0 'the stale attempt is marked stale' stale jq -r .status "$RUN/codemap/attempts/$aid4/meta.json"
+  printf 'one\ntwo\n' >"$DIR/src/a.py"          # the exact original bytes are back
+  local reout; reout=$(python3 "$CM" validate --run-dir "$RUN" --dir "$DIR" --task t1 --step r4 --mode resume 2>&1)
+  check 0 'a restored source does not turn an already-stale attempt back into guard_ok' changed jq -r .guard_status <<<"$reout"
+  check 0 'the terminal verdict is reported as terminal' true jq -r .terminal_stale <<<"$reout"
+  check 0 'the attempt stays stale on disk' stale jq -r .status "$RUN/codemap/attempts/$aid4/meta.json"
+  check 0 'a stale attempt never publishes' stale jq -r .status \
+    <(python3 "$CM" ingest --run-dir "$RUN" --dir "$DIR" --task t1 --step r4 --mode publish 2>&1)
+
+  # ---- a publication that does not complete holds the run at the barrier
+  reset_state
+  printf 'one\ntwo\n' >"$DIR/src/a.py"
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts '.candidate={id:"t1-c1",member:"A",text:"CAND"}'
+  codemap_prepare t1 r5 0
+  printf 'ORIGINAL\n' >"$RUN/posts/t1-r5-A.md"; echo '{"vote":"agree","questions":[]}' >"$RUN/posts/t1-r5-A.json"
+  CODEMAP_STEP=1
+  export CM_REAL="$CM"; CM="$scratch/broken-cm.py"
+  cat >"$CM" <<'PYX'
+import sys, subprocess, os
+if "--mode" in sys.argv and "publish" in sys.argv:
+    sys.stderr.write("simulated publication failure\n"); sys.exit(1)
+sys.exit(subprocess.run([sys.executable, os.environ["CM_REAL"]] + sys.argv[1:]).returncode)
+PYX
+  check 2 'a publication that does not complete checkpoints instead of advancing the run' '' codemap_finish_step t1 r5
+  CM="$CM_REAL"
+  check 0 'the staged work is retained after a failed publication' t1 jq -r '.codemap_pending.task' "$ST"
+  check 0 'the posts survive a failed publication' '' test -e "$RUN/posts/t1-r5-A.md"
+  # recovery: the outstanding publication is retried at the DECISION barrier, never at the resume
+  # re-check — releasing the obligation there would hand the reused posts a brand-new guard.
+  codemap_resume_check
+  check 0 'a resume re-check does not release the obligation of a failed publication' t1 jq -r '.codemap_pending.task' "$ST"
+  CODEMAP_STEP=1
+  check 0 'the decision barrier completes the outstanding publication' '' codemap_finish_step t1 r5
+  check 0 'and only then is the obligation released' null jq -r '.codemap_pending // "null"' "$ST"
+  check 0 'the recovered publication really did publish' published \
+    jq -r .status "$RUN/codemap/attempts/$(ls -t "$RUN/codemap/attempts" | grep '^t1-r5-a' | head -1)/meta.json"
+
+  # ---- A's full sequence: a REAL end-of-step checkpoint, an unchanged resume, then a change
+  # before the decision. The votes of the original attempt must never be decided behind a new guard.
+  reset_state
+  printf 'one\ntwo\n' >"$DIR/src/a.py"
+  collect() { printf '%s\n' 'Prose.' '```json' "$tail" '```' >"$RUN/raw/t1-r1-A.md"; return 0; }
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  sts '.candidate={id:"t1-c1",member:"A",text:"CAND"}'
+  # the guarded source becomes unreadable WHILE the round is in flight, so the end-of-step guard
+  # genuinely cannot be evaluated — the view was frozen and delivered before that happened
+  collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r6-A.md"
+              chmod 000 "$DIR/src/a.py"; return 0; }
+  check 2 'the real end-of-step validation checkpoints on an unverifiable guard' '' run_step r6 prompt_roundN "$task" 2
+  chmod 644 "$DIR/src/a.py"
+  local aid8; aid8=$(codemap_pending_attempt)
+  check 0 'the checkpointed step still owes its obligation' t1 jq -r '.codemap_pending.task' "$ST"
+  codemap_resume_check               # readable again and unchanged
+  check 0 'the ORIGINAL attempt survives the unchanged resume re-check' "$aid8" codemap_pending_attempt
+  check 0 'the unchanged re-check publishes nothing' '' test "$(jq -r .status "$RUN/codemap/attempts/$aid8/meta.json")" != published
+  printf 'one\nCHANGED BEFORE THE DECISION\n' >"$DIR/src/a.py"
+  sts '.reuse_posts=true'
+  check 1 'the resumed step reuses the same attempt, and its own guard catches the change' '' \
+    run_step r6 prompt_roundN "$task" 2
+  check 0 'run_step never opened a second attempt for that step' 1 \
+    sh -c 'ls -d "$1"/codemap/attempts/t1-r6-a* | wc -l | tr -d " "' _ "$RUN"
+  check 0 'the reused votes are purged rather than reaching consensus' '' test ! -e "$RUN/posts/t1-r6-A.md"
+  check 0 'and no vote survives into the decision' 0 jq -r '.last_votes|length' "$ST"
+  check 0 'the original attempt is the one marked stale' stale jq -r .status "$RUN/codemap/attempts/$aid8/meta.json"
+
+  # ---- the archive attribution comes from the LAUNCH record, not the current generation
+  reset_state
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  local aid6; aid6=$(basename "$(ls -dt "$RUN"/codemap/attempts/t1-r1-a* | head -1)")
+  sts --arg a "$aid6" '.codemap_pending={task:"t1",step:"r1",attempt:$a}|.members[0].gen=7'                        # a handover bumped the generation since the launch
+  printf 'BODY\n' >"$RUN/posts/t1-r1-A.md"
+  codemap_archive_posts t1 r1
+  check 0 'the archive attributes the post to the generation it was LAUNCHED with' 1 \
+    jq -r .generation "$RUN/codemap/attempts/$aid6"/archived-posts/*/A.attribution.json
+  check 0 'the archive records that the attribution came from a real launch record' true \
+    jq -r .attribution_from_launch_record "$RUN/codemap/attempts/$aid6"/archived-posts/*/A.attribution.json
+
+  # ---- a REPLACEMENT launched inside one attempt: its reply is its own, not the old session's.
+  # The member is launched at generation 1 and never produces an accepted reply; it is replaced,
+  # and the new session is genuinely launched again inside the SAME attempt.
+  reset_state
+  codemap_prepare t1 r7 0
+  check 0 'the replacement scenario runs with the map enabled' 1 echo "$CODEMAP_STEP"
+  local aidr; aidr=$(codemap_pending_attempt)
+  codemap_record_launch 0 t1 r7 1;                      local lid1=$CODEMAP_LAUNCH_ID
+  sts '.members[0].gen=2'                               # replaced: a new session, same attempt
+  codemap_record_launch 0 t1 r7 2;                      local lid2=$CODEMAP_LAUNCH_ID
+  printf '%s\n' "$tail" >"$RUN/posts/t1-r7-A.json"; printf 'BODY\n' >"$RUN/posts/t1-r7-A.md"
+  codemap_stage_accepted 0 t1 r7 "$RUN/posts/t1-r7-A.json" 2 "$lid2"
+  check 0 "the replacement's accepted reply is staged as generation 2" 2 \
+    sh -c 'jq -r .attribution.generation "$1"/codemap/attempts/"$2"/staged/A-*.json' _ "$RUN" "$aidr"
+  check 0 'the generation-1 launch record is still there, unchanged' 1 \
+    jq -r .generation "$RUN/codemap/attempts/$aidr/launches/A.json"
+  check 0 'the replacement launch has its OWN immutable record' 2 \
+    sh -c 'jq -r .generation "$1/codemap/attempts/$2/launches/$3.json"' _ "$RUN" "$aidr" "$lid2"
+  check 0 'and the two launches are distinct identities' '' test "$lid1" != "$lid2"
+  check 0 'its bound report is attributed to generation 2' 2 \
+    sh -c 'jq -r "[.entries[].reports[].reader.generation]|.[0]" "$1"/codemap/attempts/"$2"/staged/A-*.json' _ "$RUN" "$aidr"
+  check 0 'the durable acceptance metadata names generation 2' 2 \
+    sh -c 'cat "$1"/codemap/attempts/"$2"/accepted/*.meta.json | jq -s -r "map(select(.member==\"A\"))|.[0].generation"' _ "$RUN" "$aidr"
+  check 0 'and names the launch that produced it' "$lid2" \
+    sh -c 'cat "$1"/codemap/attempts/"$2"/accepted/*.meta.json | jq -s -r "map(select(.member==\"A\"))|.[0].launch_id"' _ "$RUN" "$aidr"
+  # archival binds to that accepted event even after the member's generation moves on again
+  sts '.members[0].gen=9'
+  codemap_archive_posts t1 r7
+  check 0 'the archive attributes the post to the accepted event, not the current generation' 2 \
+    jq -r .generation "$RUN/codemap/attempts/$aidr"/archived-posts/*/A.attribution.json
+  check 0 'the archive names the launch the accepted event was bound to' "$lid2" \
+    jq -r .launch_id "$RUN/codemap/attempts/$aidr"/archived-posts/*/A.attribution.json
+
+  # ---- byte-identical tails from two launches of one member. Both accepted events carry the SAME
+  # member and the SAME accepted_sha256, so "the first metadata record matching member+digest" is a
+  # coin toss between generation 1 and generation 2. Only the association written at acceptance
+  # says which event the live post actually is.
+  reset_state
+  codemap_prepare t1 r8 0
+  local aidt; aidt=$(codemap_pending_attempt)
+  codemap_record_launch 0 t1 r8 1;                       local tl1=$CODEMAP_LAUNCH_ID
+  sts '.members[0].gen=2'
+  codemap_record_launch 0 t1 r8 2;                       local tl2=$CODEMAP_LAUNCH_ID
+  printf '%s\n' "$tail" >"$RUN/posts/t1-r8-A.json"; printf 'BODY\n' >"$RUN/posts/t1-r8-A.md"
+  codemap_stage_accepted 0 t1 r8 "$RUN/posts/t1-r8-A.json" 1 "$tl1"
+  codemap_stage_accepted 0 t1 r8 "$RUN/posts/t1-r8-A.json" 2 "$tl2"
+  check 0 'the identical tails are two accepted events under one digest' 2 \
+    sh -c 'ls "$1/codemap/attempts/$2/accepted"/*.meta.json | wc -l | tr -d " "' _ "$RUN" "$aidt"
+  # Make the live post belong to whichever event does NOT sort first, so a first-match selection
+  # provably names the wrong generation whatever order the event ids happen to hash into.
+  local tsfirst tgen tlid teid ASSOC="$RUN/codemap/attempts/$aidt/post-assoc/t1-r8-A.json.assoc.json"
+  tsfirst=$(jq -r .generation "$(ls "$RUN/codemap/attempts/$aidt/accepted"/*.meta.json | head -1)")
+  if [ "$tsfirst" = 1 ]; then tgen=2; tlid=$tl2; else tgen=1; tlid=$tl1; fi
+  codemap_stage_accepted 0 t1 r8 "$RUN/posts/t1-r8-A.json" "$tgen" "$tlid"   # the live post's event
+  teid=$(jq -r '.event_id // empty' "$ASSOC" 2>/dev/null)
+  # the member moves on; the post is REUSED from the checkpoint, so it is never staged again
+  sts '.members[0].gen=9|.reuse_posts=true'
+  codemap_archive_posts t1 r8
+  check 0 'the archive resolves the association instead of the first member+digest match' "$tgen" \
+    jq -r .generation "$RUN/codemap/attempts/$aidt"/archived-posts/*/A.attribution.json
+  check 0 'and the launch that produced it' "$tlid" \
+    jq -r .launch_id "$RUN/codemap/attempts/$aidt"/archived-posts/*/A.attribution.json
+  check 0 'and that exact accepted event, which is NOT the one that sorts first' "$teid" \
+    sh -c 'test -s "$2" && test "$(jq -r .event_id "$2")" != "$(jq -r .event_id "$(ls "$3"/*.meta.json | head -1)")" && jq -r .event_id "$1"/archived-posts/*/A.attribution.json' \
+      _ "$RUN/codemap/attempts/$aidt" "$ASSOC" "$RUN/codemap/attempts/$aidt/accepted"
+  check 0 'the reused post kept its original association untouched' "$teid" jq -r .event_id "$ASSOC"
+  # without an exact association, an ambiguous member+digest match is not provenance
+  rm -rf "$RUN/codemap/attempts/$aidt/archived-posts" "$ASSOC"
+  codemap_archive_posts t1 r8
+  check 0 'with no association and two launches the archive claims no generation' null \
+    jq -r .generation "$RUN/codemap/attempts/$aidt"/archived-posts/*/A.attribution.json
+  check 0 'and says plainly that nothing authenticated it' false \
+    jq -r .attribution_from_launch_record "$RUN/codemap/attempts/$aidt"/archived-posts/*/A.attribution.json
+  check 0 'while the post itself is preserved in full' 1 \
+    sh -c 'ls "$1/codemap/attempts/$2"/archived-posts/*/t1-r8-A.md | wc -l | tr -d " "' _ "$RUN" "$aidt"
+
+  # ---- an archive that cannot be written stops the run before anything is purged
+  reset_state
+  run_step r1 prompt_round1 "$task" 1 >/dev/null
+  local aid7; aid7=$(basename "$(ls -dt "$RUN"/codemap/attempts/t1-r1-a* | head -1)")
+  sts --arg a "$aid7" '.codemap_pending={task:"t1",step:"r1",attempt:$a}'
+  printf 'MUST SURVIVE\n' >"$RUN/posts/t1-r1-A.md"
+  mkdir -p "$RUN/codemap/attempts/$aid7/archived-posts"
+  chmod 500 "$RUN/codemap/attempts/$aid7/archived-posts"
+  check 2 'an archive that cannot be written checkpoints instead of purging the originals' '' codemap_archive_posts t1 r1
+  chmod 755 "$RUN/codemap/attempts/$aid7/archived-posts"
+  check 0 'the original post was never deleted' 'MUST SURVIVE' cat "$RUN/posts/t1-r1-A.md"
+
+  # ---- a locator failure before any exposure leaves no dangling obligation
+  reset_state
+  export CM_REAL2="$CM"; CM="$scratch/nolocator-cm.py"
+  cat >"$CM" <<'PYX'
+import sys, subprocess, os
+if sys.argv[1] == "locator":
+    sys.stderr.write("simulated locator failure\n"); sys.exit(1)
+sys.exit(subprocess.run([sys.executable, os.environ["CM_REAL2"]] + sys.argv[1:]).returncode)
+PYX
+  codemap_prepare t1 r9 0
+  check 0 'a locator failure before exposure disables map delivery for the attempt' 0 echo "$CODEMAP_STEP"
+  check 0 'and leaves NO pending freshness obligation behind' null jq -r '.codemap_pending // "null"' "$ST"
+  CM="$CM_REAL2"
+)
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"
