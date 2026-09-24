@@ -96,6 +96,7 @@ council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member 
 ```json
 {
   "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "handover_at": 0.5, "max_turns": 30,
+  "map_code": false,
   "executor": "C",
   "tasks": [
     "What does scripts/oc.sh status print when the service is stopped? Cite the lines.",
@@ -108,6 +109,42 @@ council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member 
   ]
 }
 ```
+
+Before writing a council config, ask once: **“Map the code for this council?”** Record the answer in the run-wide `map_code` boolean. `true` maps every task; `false` or an omitted field preserves the current path without mapping or a confirmation pause. Optional mapper settings live in `map_prepass`, for example `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium","timeout_s":120,"max_output_bytes":65536}`. If model or effort is missing while `map_code` is true, `start` proposes the missing value(s) and stops before any inference call. Confirm the exact displayed tuple with `resume --run-dir D --confirm-mapper FILE`, where FILE is JSON with `kind`, `model`, and `effort`. After each original task's map, review the complete locator and provide `resume --run-dir D --map-decision FILE` with `{"action":"keep"}` or `{"action":"split","contract_file":"..."}`. User-authored split contracts are validated offline before any following model call.
+
+Split contract paths are resolved relative to the directory containing the map-decision JSON. The archived contract is validated and then used as the source for child tasks. Its schema is `schema_version: 1`, `parent_id`, the exact **contract `map_seed_id` printed in map review** (from `coverage.json`), and a non-empty `subtasks` array. The locator's `snapshot_id` is a separate lookup identity; do not substitute it for `map_seed_id`. Each child has a unique `id`, complete `text`, boolean `execute`, arrays `requires`/`modifies`/`deletes`/`creates`/`acceptance`/`unresolved`. Baseline path declarations use `{ "path": "src/file.py", "sha256": "<64 lowercase hex>" }`; `creates` contains absent project-relative paths. Acceptance entries contain a unique `id`, `description`, non-empty `argv`, integer `expected_exit`, and `requires` paths limited to the child's baseline inputs and own outputs. Shared read-only prerequisites are permitted; sibling output dependencies and overlapping writes are rejected. Invalid contracts stop at the map-review checkpoint (exit 4) for correction or `keep`.
+
+Minimal executable contract shape (replace the digest with the actual baseline SHA-256, and copy the contract `map_seed_id` printed at review; configure an executor because both children execute):
+
+```json
+{
+  "schema_version": 1,
+  "parent_id": "implement-feature",
+  "map_seed_id": "<reviewed-contract-map-seed-id>",
+  "subtasks": [
+    {
+      "id": "update-source",
+      "text": "Update the source behavior and its focused test.",
+      "execute": true,
+      "requires": [{"path": "src/app.py", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+      "modifies": [{"path": "src/app.py", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+      "deletes": [], "creates": [], "unresolved": [],
+      "acceptance": [{"id": "focused-test", "description": "Focused test passes", "argv": ["python3", "-m", "unittest", "tests.test_app"], "expected_exit": 0, "requires": ["src/app.py"]}]
+    },
+    {
+      "id": "write-docs",
+      "text": "Document the feature using the current source as read-only context.",
+      "execute": true,
+      "requires": [{"path": "docs/style-guide.md", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+      "modifies": [], "deletes": [], "creates": ["docs/feature.md"], "unresolved": [], "acceptance": []
+    }
+  ]
+}
+```
+
+Mapper calls are read-only, ask before permission, and deny everything by default. Inside the project the mapper may `read` (including directory listings), `grep` and `glob` everywhere: the orchestrator excludes nothing, so repository metadata (`.git`, `.hg`, `.svn`) and an in-project run directory are readable, searchable and capturable like any other path (`exclusions` in `input.json` and `coverage.json` is `[]`). Parent paths (`..`) are denied, and outside paths are denied through `external_directory`. OpenCode checks paths lexically and never resolves a symlink, so the orchestrator enforces the project boundary itself before the mapper session exists. It scans the whole project, metadata and run directory included, without following links. It records every in-project symlink whose resolved target lies outside the project, and every in-project directory symlink whose target contains such a link. It denies read of each recorded link and of everything beneath it, in relative and absolute form. OpenCode's permission matcher is case-sensitive, so when the scan's probe finds that the project filesystem ignores letter case (for example default APFS), each recorded link is also denied in a case-folded form: every ASCII letter becomes `?` and every non-ASCII character `*`, which also covers Unicode normalization variants. These folded denies may also block in-project names of the same shape (the same length, with non-letters in the same places), for example a six-letter directory when `outdir` escapes; the probe result is recorded as `boundary.case_insensitive`, and a change of it at rescan discards the map. `grep` and `glob` are authorized by their search pattern, and they search the directory named by their path argument, following a symlink there, so no rule can keep them off an escaping link. When the scan finds any, `grep` and `glob` are denied for that mapper session only; the reason is stored in `state.json` (`map_prepasses.<task>.boundary`) and `coverage.json` (`boundary`) and shown at map review, and the mapper still runs with `read`. If the scan cannot complete (for example an unreadable directory), the mapper is not dispatched and the pre-pass is unavailable. After the mapper finishes, a completed session recovered on `resume` included, the project is scanned again. If the escaping-link records (paths and resolved targets) differ from the persisted baseline, or the rescan fails, the map is discarded as unavailable with the reason recorded. Capture still resolves every selector and rejects any that leaves the project. These are scan-time protections, not access-time isolation: see [Known gaps / future tests](#known-gaps--future-tests). A timeout, blocked permission, malformed/oversized response, or uncertain interrupted dispatch is recorded as partial/unavailable; uncertain work is not relaunched automatically. The map is a navigation aid, never exhaustive. Seed evidence remains historical after executor edits; current-source claims still require inspection. Usage and capture telemetry can be incomplete and are labelled unknown rather than priced or treated as savings.
+
+When a previously approved split is replaced or resolved with `keep`, superseded prompts, posts, raw outputs, evidence and results are archived under the old contract identity before the new state is published. The transition starts at round 1 and does not reuse old posts, even if a child ID is reused. If archival or state publication fails, the run stays checkpointed.
 
 How it works:
 
@@ -134,11 +171,22 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `scripts/test-completion.sh` — 130 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (28 unittest cases for the analysis tools). Run it together with
-  `bash -n` on both scripts after any change.
+- **Tests.** `bash scripts/test-completion.sh` — 1280 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (192 Python standard-library unittest cases for the analysis tools).
+  Run `/bin/bash -n` separately on each changed shell script after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
+
+## Known gaps / future tests
+
+Tracked limitations of the map pre-pass and the tests not yet written:
+
+- **Links changed during the mapper run.** The boundary comes from a scan just before the session and a rescan after it. A symlink created or retargeted by another process while the mapper runs is not blocked when it is accessed. The rescan discards the map when the final set differs, but it cannot undo a read, and it cannot see a link that was created and removed again between the two scans. The mapper itself cannot create links (edit and shell are denied).
+- **OpenCode's built-in search filters.** OpenCode's own `grep` and `glob` always pass `--glob=!**/.git/**` to ripgrep, `glob` skips dot-paths unless the mapper passes `hidden: true`, and ripgrep honours `.gitignore`. The orchestrator adds no exclusion of its own, and `read` reaches `.git`, but these built-in skips remain. OpenCode is not modified.
+- **Directory aliases are blocked as a whole.** An in-project directory symlink whose target contains an escaping link is denied entirely, so its other in-project content is reachable only through the real path.
+- **Case-folded denies over-match.** On a filesystem that ignores letter case, OpenCode's case-sensitive matcher would let a case variant of an escaping link (`ESCAPE.PY` for `escape.py`) through, so the per-link denies are case-folded (`?` per ASCII letter, `*` per non-ASCII character). They can also block unrelated in-project names of the same shape, which the mapper then cannot read.
+- **Hard links** cannot be told apart from ordinary files by path, so a hard link to an outside file is neither blocked nor detected.
+- **Future tests:** the exhaustive alias/hard-link permutation matrix; fault injection at every persistence boundary not yet covered (the initial state write, the version marker, the authorization and the mapper checkpoints are covered); byte-level parity of the reports.
 
 ## Example
 

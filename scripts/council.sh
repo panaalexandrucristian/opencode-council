@@ -8,7 +8,7 @@
 #   council.sh status --run-dir D                     where the run is: task, round, member context/tokens, pending questions
 #   council.sh report --run-dir D                     token report for the run: prompt bytes by section, de-duplication
 #                                                     replay and the remaining verbatim duplication (scripts/ptools, offline)
-#   council.sh resume --run-dir D [--answers F|--answer TEXT]   continue after exit 4 (questions) or exit 2 (member failure)
+#   council.sh resume --run-dir D [--answers F|--answer TEXT] [--confirm-mapper FILE] [--map-decision FILE]
 #                     [--replace ID=kind:model:effort]         swap a member's model/session (e.g. its provider ran out of quota):
 #                                                              C=claude:sonnet:xhigh or C=opencode:google/gemini-3.8-flash:high
 #
@@ -54,10 +54,10 @@ CM="$HERE/council_codemap.py"
 die() { echo "council: $*" >&2; exit 1; }
 log() { echo "council: $*" >&2; }
 now() { date +%H:%M:%S; }
-CMD=""; CONFIG=""; RUN=""; ANSWERS_FILE=""; ANSWER_TEXT=""; REPLACE=()
+CMD=""; CONFIG=""; RUN=""; ANSWERS_FILE=""; ANSWER_TEXT=""; CONFIRM_MAPPER_FILE=""; MAP_DECISION_FILE=""; REPLACE=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --config|--run-dir|--answers|--answer|--replace) [ $# -ge 2 ] || die "missing value for $1" ;;
+    --config|--run-dir|--answers|--answer|--replace|--confirm-mapper|--map-decision) [ $# -ge 2 ] || die "missing value for $1" ;;
   esac
   case "$1" in
     --replace) REPLACE+=("$2"); shift 2 ;;
@@ -65,6 +65,8 @@ while [ $# -gt 0 ]; do
     --run-dir) RUN=$2; shift 2 ;;
     --answers) ANSWERS_FILE=$2; shift 2 ;;
     --answer)  ANSWER_TEXT=$2; shift 2 ;;
+    --confirm-mapper) CONFIRM_MAPPER_FILE=$2; shift 2 ;;
+    --map-decision) MAP_DECISION_FILE=$2; shift 2 ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     --*)       die "unknown option: $1" ;;
     *)         [ -z "$CMD" ] && CMD=$1 || die "unexpected argument: $1"; shift ;;
@@ -86,11 +88,13 @@ ST=""
 st()  { jq -r "$1" "$ST"; }                                   # read
 stj() { jq -c "$1" "$ST"; }                                   # read json
 sts() { jq "$@" "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"; }     # update (atomic)
-N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; EXEC=""; CODEMAP=0
+N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; EXEC=""; CODEMAP=0; MAP_PREPASS=0
 load_state() {
   ST="$RUN/state.json"; [ -f "$ST" ] || die "no state in $RUN (not a council run dir)"
   N=$(st '.members|length'); DIR=$(st '.config.dir'); MAXR=$(st '.config.max_rounds'); TIMEOUT=$(st '.config.timeout_s')
   HANDOVER=$(st '.config.handover_at'); MAXT=$(st '.config.max_turns // 30'); EXEC=$(st '.config.executor // ""')
+  MAP_PREPASS=0
+  if [ "$(st '.map_prepass_version // 0')" = 1 ] && [ "$(st '.config.map_code // false')" = true ]; then MAP_PREPASS=1; fi
   codemap_check_version
 }
 
@@ -220,6 +224,491 @@ codemap_prepare() {  # tid tag raw(0/1) -> sets CODEMAP_STEP; writes the locator
     sts '.codemap_pending=null'
     log "codemap: locator failed for $tid/$tag before any map evidence was exposed — this attempt runs entirely map-disabled, with no freshness obligation: $(cat "$RUN/codemap/.locator-$tid-$tag.err" 2>/dev/null)"
   fi
+}
+SCAN_SHAPE='type=="object" and (.links|type=="array") and (.case_insensitive|type=="boolean")'   # scan-escapes output
+map_key() { printf '%s' "$1" | shasum -a 256 | cut -c1-16; }
+map_prepass_enabled() { [ "$MAP_PREPASS" = 1 ]; }
+map_finalize_failure() {  # terminal optimization failure still gets complete durable accounting artifacts
+  local tid=$1 dir=$2 reason=$3 outcome=${4:-unavailable} sid usage model effort
+  mkdir -p "$dir" || { log "cannot create mapper failure archive $dir"; return 1; }
+  sid=$(jq -r --arg t "$tid" '.map_prepasses[$t].session // empty' "$ST")
+  model=$(st '.config.map_prepass.model // "google/gemini-3.8-flash"'); effort=$(st '.config.map_prepass.effort // "medium"')
+  usage='{}'
+  if [ -n "$sid" ]; then
+    [ -s "$dir/session.json" ] || "$OC" api GET "/api/session/$sid" >"$dir/session.json" 2>"$dir/session.err" || true
+    [ -s "$dir/tool-records.json" ] || "$OC" messages "$sid" --raw >"$dir/tool-records.json" 2>"$dir/tools.err" || true
+    usage=$(jq -c '.data | {input:(.tokens.input // null),cache_read:(.tokens.cache.read // null),cache_write:(.tokens.cache.write // null),output:(.tokens.output // null),reasoning:(.tokens.reasoning // null),cost:(.cost // null)}' "$dir/session.json" 2>/dev/null)
+    [ -n "$usage" ] || usage='{}'
+  fi
+  [ -f "$dir/response.txt" ] || : >"$dir/response.txt"
+  [ -f "$dir/tool-records.json" ] || echo '[]' >"$dir/tool-records.json"
+  [ -f "$dir/candidates.json" ] || echo '[]' >"$dir/candidates.json"
+  [ -f "$dir/capture-results.json" ] || echo '{"results":[]}' >"$dir/capture-results.json"
+  local input_digest selector_digest failure_captures failure_index
+  failure_index="$RUN/codemap/index.json"
+  if [ ! -s "$failure_index" ]; then printf '{"entries":{}}\n' >"$dir/failure-empty-index.json"; failure_index="$dir/failure-empty-index.json"; fi
+  failure_captures=$(jq -cn --slurpfile cap "$dir/capture-results.json" --slurpfile idx "$failure_index" '
+    [$cap[0].results[]? | . as $r | (if (($r.entry_id|type)=="string" and ($idx[0].entries|type)=="object") then ($idx[0].entries[$r.entry_id] // {}) else {} end) as $e |
+      {path:$r.path,status:$r.status,reason:$r.reason,entry_id:$r.entry_id,resolved_path:$e.resolved_path,
+       source_sha256:$e.source_sha256,byte_range:$e.byte_range,lines:$e.lines}]' 2>"$dir/failure-coverage.err") || {
+         failure_captures='[]'; reason="$reason; captured-version assembly failed: $(cat "$dir/failure-coverage.err")"
+      }
+  # A later failure does not erase a usable captured subset: that outcome is partial, not unavailable.
+  if [ "$outcome" = unavailable ] && jq -e 'any(.[]; .status=="ok")' <<<"$failure_captures" >/dev/null 2>&1; then outcome=partial; fi
+  input_digest=$(jq -r --arg t "$tid" '.map_prepasses[$t].input_fingerprint // "unknown"' "$ST")
+  selector_digest=$(shasum -a 256 <"$dir/candidates.json" | cut -d' ' -f1)
+  local boundary; boundary=$(jq -c --arg t "$tid" '.map_prepasses[$t].boundary // null' "$ST" 2>/dev/null) || boundary=null
+  [ -n "$boundary" ] || boundary=null
+  jq -n --arg p "$tid" --arg d "$input_digest" --arg sd "$selector_digest" --arg r "$reason" --arg m "$model" --arg e "$effort" \
+    --argjson c "$failure_captures" --argjson b "$boundary" \
+    '{schema_version:1,parent_id:$p,map_seed_id:$d,mapping_input_digest:$d,selector_artifact_digest:$sd,
+      captured_versions_ranges:$c,capture_statuses:$c,
+      exclusions:[],boundary:$b,resource_schema_failures:[$r],
+      mapper_unresolved:{attribution:{kind:"opencode",model:$m,effort:$e},items:[]},
+      telemetry_complete:false,tool_records_complete:false,coverage:"unknown"}' >"$dir/coverage.json.tmp" || return 1
+  mv "$dir/coverage.json.tmp" "$dir/coverage.json" || return 1
+  # Preserve any validated mapper unresolved targets when failure happens after validation.
+  if [ -s "$dir/validation.json" ]; then
+    local unresolved; unresolved=$(jq -c '.result.unresolved // []' "$dir/validation.json" 2>/dev/null) || unresolved='[]'
+    [ -n "$unresolved" ] || unresolved='[]'
+    jq --argjson u "$unresolved" '.mapper_unresolved.items=$u' "$dir/coverage.json" >"$dir/coverage.json.tmp" && mv "$dir/coverage.json.tmp" "$dir/coverage.json" || return 1
+  fi
+  sts --arg t "$tid" --arg r "$reason" --arg s "$outcome" --arg dir "$dir" --argjson u "$usage" \
+    '.map_prepasses[$t].status=$s | .map_prepasses[$t].failure=$r | .map_prepasses[$t].usage=$u
+     | .map_prepasses[$t].artifacts={directory:$dir,coverage:($dir+"/coverage.json"),response:($dir+"/response.txt"),selectors:($dir+"/candidates.json"),session:($dir+"/session.json"),tools:($dir+"/tool-records.json")}
+     | .map_prepasses[$t].finished_at=(now|floor)'
+}
+map_prepass_run() {  # original task only; durable dispatch state prevents duplicate paid launches
+  local task=$1 tid key dir entry status sid prompt raw parsed errors maxbytes model effort timeout digest cmdrc answers recovered=0 result_tmp
+  tid=$(jq -r .id <<<"$task"); key=$(map_key "$tid"); dir="$RUN/map/$key"; entry=$(jq -c --arg t "$tid" '.map_prepasses[$t] // {}' "$ST")
+  mkdir -p "$dir" || { log "cannot create mapper artifact directory $dir"; return 1; }
+  status=$(jq -r '.status // "new"' <<<"$entry")
+  case "$status" in complete|partial|unavailable) return 0;; dispatching|dispatched)
+    sid=$(jq -r '.session // empty' <<<"$entry")
+    if [ -z "$sid" ]; then map_finalize_failure "$tid" "$dir" "dispatch state has no session; not relaunched" || return 1; return 0; else
+      "$OC" wait "$sid" --timeout 1 --ask >/dev/null 2>"$dir/resume-wait.err"; cmdrc=$?
+      if [ "$cmdrc" -eq 0 ]; then
+        result_tmp="$dir/response.txt.recovery-$$.tmp"
+        if ! "$OC" result "$sid" >"$result_tmp" 2>"$dir/result-recovery.err"; then
+          [ -s "$result_tmp" ] && mv "$result_tmp" "$dir/response-retrieval-partial.txt"
+          map_finalize_failure "$tid" "$dir" "completed mapper result could not be retrieved" || return 1; return 0
+        fi
+        mv "$result_tmp" "$dir/response.txt" || { log "could not publish recovered mapper response"; return 1; }
+        status=dispatched; recovered=1
+      else
+        [ "$cmdrc" -eq 2 ] && "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+        map_finalize_failure "$tid" "$dir" "incomplete or uncertain dispatch (wait exit $cmdrc); not relaunched" || return 1; return 0
+      fi
+    fi
+  esac
+  mkdir -p "$dir" || return 1
+  model=$(st '.config.map_prepass.model'); effort=$(st '.config.map_prepass.effort'); timeout=$(st '.config.map_prepass.timeout_s // 120'); maxbytes=$(st '.config.map_prepass.max_output_bytes // 65536')
+  if [ "$status" != dispatched ]; then
+    answers=$(jq -c --arg t "$tid" '[.answers[]? | select(.task==$t)]' "$ST")
+    local mapper_kind; mapper_kind=$(st '.config.map_prepass.kind // "opencode"')
+    jq -n --arg id "$tid" --arg text "$(jq -r .text <<<"$task")" --arg root "$DIR" --arg model "$model" --arg effort "$effort" --argjson answers "$answers" --argjson original "$task" \
+      --arg kind "$mapper_kind" --argjson timeout "$timeout" --argjson maxbytes "$maxbytes" \
+      '{task_id:$id,task_text:$text,original_task:$original,answers:$answers,root:$root,mapper:{kind:$kind,model:$model,effort:$effort,timeout_s:$timeout,max_output_bytes:$maxbytes},exclusions:[]}' >"$dir/input.json"
+    digest=$(shasum -a 256 <"$dir/input.json" | cut -d' ' -f1)
+    sts --arg t "$tid" --arg d "$digest" --arg dir "$dir" --arg now "$(date +%s)" \
+      '.map_prepasses[$t]={status:"preparing",input_fingerprint:$d,artifact_dir:$dir,started_at:($now|tonumber),usage:null,coverage:"unknown"}' || { log "could not persist mapper preparation checkpoint"; return 1; }
+    # Project boundary before mapper access. OpenCode checks paths lexically (it never resolves a
+    # symlink), so the orchestrator scans the whole project for in-project symlinks that resolve
+    # outside it (and for directory aliases leading to one) and denies them by name. grep/glob are
+    # authorized by their search PATTERN and then search the directory named by their path argument
+    # (a symlink is followed there), so no rule can keep them off an escaping link: when any exists,
+    # they are denied for this session only. The baseline is persisted before any session exists.
+    local scan escaping boundary_reason
+    if ! scan=$(python3 "$HERE/council_map_prepass.py" scan-escapes --root "$DIR" 2>"$dir/escape-scan.err") || ! jq -e "$SCAN_SHAPE" <<<"$scan" >/dev/null 2>&1; then
+      map_finalize_failure "$tid" "$dir" "symlink boundary scan failed before dispatch: $(cat "$dir/escape-scan.err")" || return 1; return 0
+    fi
+    printf '%s\n' "$scan" >"$dir/escape-scan.json" || { map_finalize_failure "$tid" "$dir" "symlink boundary baseline could not be written" || return 1; return 0; }
+    escaping=$(jq '.links|length' <<<"$scan")
+    boundary_reason=""
+    [ "$escaping" -gt 0 ] && boundary_reason="grep/glob denied for this mapper session: $escaping in-project symlink(s) resolve outside the project or lead to one: $(jq -r '[.links[].path]|join(", ")' <<<"$scan")"
+    [ "$escaping" -gt 0 ] && [ "$(jq -r .case_insensitive <<<"$scan")" = true ] && boundary_reason="$boundary_reason; the filesystem ignores letter case, so their read denies are case-folded and may also block same-shaped in-project names"
+    sts --arg t "$tid" --argjson scan "$scan" --arg r "$boundary_reason" \
+      '.map_prepasses[$t].boundary={blocked_symlinks:$scan.links,case_insensitive:$scan.case_insensitive,search_denied:($scan.links|length>0),reason:(if $r=="" then null else $r end)}' || { log "could not persist mapper boundary baseline"; return 1; }
+    local boundary_line="Boundary: only paths inside the project root are accessible; in-project symlinks that resolve outside it are blocked."
+    [ "$escaping" -gt 0 ] && boundary_line="$boundary_line grep and glob are unavailable in this session because such symlinks exist; use read to list directories and read files."
+    cat >"$dir/instruction.md" <<EOF
+Locate candidate source, test, configuration, and documentation regions relevant to this task. Return locations and unresolved search targets only. Do not explain code behavior, diagnose, propose implementation, invent requirements, decide a split, or claim exhaustive coverage. Check named task locations and look for relevant callers, callees, tests, and configuration. Return candidates:[{path,lines?}], unresolved:[{target,reason}], and stopped_reason. Paths are project-relative; lines are inclusive and 1-based. Omit lines for a whole-file selector. Selectors are hypotheses, not verified relevance.
+
+Project root: $DIR
+$boundary_line
+Task:
+$(jq -r .text <<<"$task")
+User answers:
+$(jq -r --arg t "$tid" --arg p "$(jq -r '.map_parent // .id' <<<"$task")" '.answers[]? | select(.task==$t or .task==$p) | "Q: \(.question)\nA: \(.answer)"' "$ST")
+EOF
+    # OpenCode evaluates the LAST rule whose action and resource wildcard-match (unmatched = ask), and
+    # names in-project files by their lexical project-relative path; outside paths are absolute and
+    # also need external_directory. The whole project is readable and searchable, repository
+    # metadata and the run directory included; the escaping links found above are denied after the
+    # allows (relative and absolute forms, the link and everything beneath it), and grep/glob are
+    # denied for the whole session when any exists. OpenCode's matcher is case-sensitive, so on a
+    # filesystem that ignores case (e.g. APFS) the scan's case-folded pattern (`?` per ASCII letter,
+    # `*` per non-ASCII character) is denied too; the absolute prefix stays literal, since a
+    # case-variant absolute path is not lexically inside and already needs external_directory.
+    local -a mapper_rules=(--ask --deny '*' --deny edit --deny bash --deny shell --deny task --deny subagent --deny external_directory
+      --deny webfetch --deny websearch --deny skill
+      --allow 'read:*' --allow 'list:*' --deny 'read:..' --deny 'read:../*')
+    if [ "$escaping" -gt 0 ]; then
+      mapper_rules+=(--deny grep --deny glob)
+      local link
+      while IFS= read -r -d '' link; do
+        mapper_rules+=(--deny "read:$link" --deny "read:$link/*" --deny "read:$DIR/$link" --deny "read:$DIR/$link/*"
+          --deny "list:$link" --deny "list:$link/*" --deny "list:$DIR/$link" --deny "list:$DIR/$link/*")
+      done < <(jq -j '.links[] | (.path, (select(.pattern != .path) | .pattern)) + "\u0000"' <<<"$scan")
+    else
+      mapper_rules+=(--allow grep --allow glob)
+    fi
+    sid=$("$OC" new --dir "$DIR" --model "$model" --variant "$effort" --agent plan --title "Council map pre-pass" "${mapper_rules[@]}") || {
+        map_finalize_failure "$tid" "$dir" "mapper session creation failed" || return 1; return 0; }
+    if ! sts --arg t "$tid" --arg s "$sid" '.map_prepasses[$t].session=$s | .map_prepasses[$t].status="created"'; then
+      "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      log "could not persist mapper session identity; no prompt dispatched"
+      return 1
+    fi
+    if ! sts --arg t "$tid" '.map_prepasses[$t].status="dispatching"'; then
+      "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      log "could not persist mapper dispatch checkpoint; no prompt dispatched"
+      return 1
+    fi
+    if ! "$OC" prompt "$sid" --file "$dir/instruction.md" --no-wait --ask >/dev/null 2>"$dir/dispatch.err"; then
+      "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      map_finalize_failure "$tid" "$dir" "mapper prompt dispatch failed" || return 1; return 0
+    fi
+    sts --arg t "$tid" '.map_prepasses[$t].status="dispatched"' || { log "mapper prompt may be dispatched; durable state remains dispatching for recovery"; return 1; }
+  fi
+  sid=$(jq -r --arg t "$tid" '.map_prepasses[$t].session' "$ST")
+  if [ "$recovered" -eq 0 ]; then
+    "$OC" wait "$sid" --timeout "$timeout" --ask >/dev/null 2>"$dir/wait.err"; cmdrc=$?
+    if [ "$cmdrc" -ne 0 ]; then
+      [ "$cmdrc" -eq 2 ] && "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      map_finalize_failure "$tid" "$dir" "timeout or blocked mapper permission (wait exit $cmdrc); no retry" || return 1; return 0
+    fi
+    result_tmp="$dir/response.txt.result-$$.tmp"
+    if ! "$OC" result "$sid" >"$result_tmp" 2>"$dir/result.err"; then
+      [ -s "$result_tmp" ] && mv "$result_tmp" "$dir/response-retrieval-partial.txt"
+      map_finalize_failure "$tid" "$dir" "mapper result retrieval failed" || return 1; return 0
+    fi
+    mv "$result_tmp" "$dir/response.txt" || { log "could not publish mapper response"; return 1; }
+  fi
+  "$OC" api GET "/api/session/$sid" >"$dir/session.json" 2>"$dir/session.err" || true
+  "$OC" messages "$sid" --raw >"$dir/tool-records.json" 2>"$dir/tools.err" || true
+  local usage; usage=$(jq -c '.data | {input:(.tokens.input // null),cache_read:(.tokens.cache.read // null),cache_write:(.tokens.cache.write // null),output:(.tokens.output // null),reasoning:(.tokens.reasoning // null),cost:(.cost // null)}' "$dir/session.json" 2>/dev/null)
+  [ -n "$usage" ] || usage='{}'
+  raw="$dir/response.txt"
+  # Links changed by another process during the run cannot be blocked by rules; they are detected:
+  # the persisted pre-dispatch baseline must equal a fresh scan, or the map is discarded.
+  local baseline rescan
+  baseline=$(jq -c --arg t "$tid" '.map_prepasses[$t].boundary | select(.blocked_symlinks != null) | {links:.blocked_symlinks,case_insensitive}' "$ST" 2>/dev/null)
+  if [ -z "$baseline" ]; then
+    map_finalize_failure "$tid" "$dir" "symlink boundary baseline missing; map discarded" || return 1; return 0
+  fi
+  if ! rescan=$(python3 "$HERE/council_map_prepass.py" scan-escapes --root "$DIR" 2>"$dir/escape-rescan.err") || ! jq -e "$SCAN_SHAPE" <<<"$rescan" >/dev/null 2>&1; then
+    map_finalize_failure "$tid" "$dir" "symlink boundary rescan failed after the mapper run; map discarded: $(cat "$dir/escape-rescan.err")" || return 1; return 0
+  fi
+  printf '%s\n' "$rescan" >"$dir/escape-rescan.json"
+  if ! jq -e --argjson a "$baseline" --argjson b "$rescan" -n '$a==$b' >/dev/null; then  # links, targets, patterns and case mode
+    map_finalize_failure "$tid" "$dir" "escaping symlink set changed during the mapper run; map discarded" || return 1; return 0
+  fi
+  if ! python3 "$HERE/council_map_prepass.py" "$raw" --max-output-bytes "$maxbytes" --root "$DIR" --run-dir "$RUN" --selectors "$dir/candidates.json" >"$dir/validation.json" 2>"$dir/validation.err"; then
+    [ -s "$dir/validation.json" ] || { map_finalize_failure "$tid" "$dir" "mapper validation helper failed" || return 1; return 0; }
+  fi
+  parsed=$(jq -c '.result' "$dir/validation.json" 2>/dev/null); errors=$(jq -c '.errors // []' "$dir/validation.json" 2>/dev/null); [ -n "$parsed" ] || { parsed='{"status":"unavailable","coverage":"unknown","candidates":[]}'; errors='["validation failed"]'; }
+  jq -n --argjson r "$parsed" '$r.candidates' >"$dir/captures.json"
+  if [ "$(jq -r '.candidates|length' <<<"$parsed")" -gt 0 ]; then
+    if ! python3 "$CM" ingest --run-dir "$RUN" --dir "$DIR" --capture-json "$dir/captures.json" --capture-lines >"$dir/capture-results.json" 2>"$dir/capture.err"; then
+      map_finalize_failure "$tid" "$dir" "codemap ingestion failed" || return 1; return 0
+    fi
+  else echo '{"results":[]}' >"$dir/capture-results.json"; fi
+  local index_for_coverage="$RUN/codemap/index.json"
+  if [ ! -s "$index_for_coverage" ]; then printf '{"entries":{}}\n' >"$dir/empty-index.json"; index_for_coverage="$dir/empty-index.json"; fi
+  local captured; captured=$(jq -cn --slurpfile cap "$dir/capture-results.json" --slurpfile idx "$index_for_coverage" '
+    [$cap[0].results[]? | . as $r | (if (($r.entry_id|type)=="string" and ($idx[0].entries|type)=="object") then ($idx[0].entries[$r.entry_id] // {}) else {} end) as $e |
+      {path:$r.path,status:$r.status,reason:$r.reason,entry_id:$r.entry_id,
+       resolved_path:$e.resolved_path,source_sha256:$e.source_sha256,byte_range:$e.byte_range,lines:$e.lines}]' 2>"$dir/coverage-assembly.err") || {
+      map_finalize_failure "$tid" "$dir" "coverage assembly failed: $(cat "$dir/coverage-assembly.err")" || return 1; return 0;
+    }
+  jq -n --arg p "$tid" --arg d "$(jq -r --arg t "$tid" '.map_prepasses[$t].input_fingerprint' "$ST")" \
+    --arg sd "$(shasum -a 256 <"$dir/candidates.json" | cut -d' ' -f1)" \
+    --argjson c "$captured" --argjson e "${errors:-[]}" --argjson r "$parsed" \
+    --arg m "$model" --arg effort "$effort" --argjson b "$(jq -c --arg t "$tid" '.map_prepasses[$t].boundary // null' "$ST")" \
+    '{schema_version:1,parent_id:$p,map_seed_id:$d,mapping_input_digest:$d,selector_artifact_digest:$sd,
+      captured_versions_ranges:$c,capture_statuses:$c,
+      exclusions:[],boundary:$b,resource_schema_failures:$e,
+      mapper_unresolved:{attribution:{kind:"opencode",model:$m,effort:$effort},items:($r.unresolved // [])},
+      tool_records_complete:false,telemetry_complete:false,coverage:"unknown"}' >"$dir/coverage.json.tmp" || { map_finalize_failure "$tid" "$dir" "coverage artifact write failed" || return 1; return 0; }
+  mv "$dir/coverage.json.tmp" "$dir/coverage.json" || { map_finalize_failure "$tid" "$dir" "coverage artifact publication failed" || return 1; return 0; }
+  status=$(jq -r '.status' <<<"$parsed")
+  local capture_total capture_ok
+  capture_total=$(jq -r '.results|length' "$dir/capture-results.json" 2>/dev/null) || capture_total=0
+  capture_ok=$(jq -r '[.results[]? | select(.status=="ok")]|length' "$dir/capture-results.json" 2>/dev/null) || capture_ok=0
+  if [ "$capture_total" -gt 0 ] && [ "$capture_ok" -eq 0 ]; then status=unavailable
+  elif [ "$capture_ok" -gt 0 ] && [ "$capture_ok" -lt "$capture_total" ]; then status=partial
+  elif jq -e 'any(.results[]?; .status!="ok")' "$dir/capture-results.json" >/dev/null 2>&1 && [ "$status" = ok ]; then status=partial; fi
+  [ "$status" = ok ] && status=complete
+  [ "$status" = "partial" ] && parsed=$(jq -c '.status="partial"' <<<"$parsed")
+  sts --arg t "$tid" --arg s "$status" --arg dir "$dir" --argjson result "$parsed" --argjson u "$usage" \
+    '.map_prepasses[$t].status=$s | .map_prepasses[$t].artifacts={directory:$dir,coverage:($dir+"/coverage.json"),response:($dir+"/response.txt"),selectors:($dir+"/candidates.json"),session:($dir+"/session.json"),tools:($dir+"/tool-records.json")} | .map_prepasses[$t].mapper_result=$result | .map_prepasses[$t].usage=$u | .map_prepasses[$t].finished_at=(now|floor)'
+}
+map_prepass_review() {  # pause once per original task until explicit user decision
+  local task=$1 tid key dir reviewed locator seed_id; tid=$(jq -r .id <<<"$task"); key=$(map_key "$tid"); dir="$RUN/map/$key"
+  reviewed=$(jq -r --arg t "$tid" '.map_prepasses[$t].reviewed // false' "$ST")
+  [ "$reviewed" = true ] && return 0
+  mkdir -p "$dir" || return 1
+  locator="$dir/seed-locator.md"
+  if ! python3 "$CM" seed-locator --run-dir "$RUN" --coverage "$dir/coverage.json" >"$locator" 2>"$dir/seed-locator.err"; then
+    echo "Complete map locator unavailable: $(cat "$dir/seed-locator.err")" >"$locator"
+  fi
+  seed_id=$(sed -n 's/^snapshot_id: //p' "$locator" | head -1)
+  local contract_seed_id; contract_seed_id=$(jq -r '.map_seed_id // "unknown"' "$dir/coverage.json" 2>/dev/null)
+  sts --arg t "$tid" --arg loc "$locator" --arg sid "$seed_id" \
+    '.map_prepasses[$t].seed_locator=$loc | .map_prepasses[$t].seed_snapshot_id=$sid | .map_prepasses[$t].scope_applicability="unknown"'
+  echo "Map review for task $tid: status=$(jq -r --arg t "$tid" '.map_prepasses[$t].status' "$ST"), coverage=unknown"
+  echo "Split contract map_seed_id (copy this exact value into contract JSON): $contract_seed_id"
+  echo "Lookup snapshot_id (locator identity; not the contract map_seed_id): ${seed_id:-unavailable}"
+  [ -s "$dir/candidates.json" ] && jq -r '.[] | "  \(.path)\(if .lines then ":\(.lines[0])-\(.lines[1])" else " (whole file)" end)"' "$dir/candidates.json"
+  [ -s "$dir/coverage.json" ] && { echo "Capture statuses:"; jq -r '.capture_statuses[]? | "  \(.path // "?"): \(.status // "unknown")\(.reason // "" | if .=="" then "" else " — "+. end)"' "$dir/coverage.json"; echo "Exclusions:"; jq -r '.exclusions[]? | "  "+.' "$dir/coverage.json"; echo "Project boundary:"; jq -r 'if .boundary==null then "  unknown (no boundary scan recorded)" elif .boundary.search_denied then "  "+.boundary.reason else "  no in-project symlink resolves outside the project; grep/glob allowed" end' "$dir/coverage.json"; }
+  [ -s "$dir/coverage.json" ] && { echo "Mapper schema/resource failures:"; jq -r '.resource_schema_failures[]? | "  "+.' "$dir/coverage.json"; echo "Unresolved targets (mapper-attributed):"; jq -r '.mapper_unresolved.items[]? | "  \(.target): \(.reason)"' "$dir/coverage.json"; }
+  echo "Complete-map locator (entries are enumerable and retrievable with its lookup command):"
+  cat "$locator"
+  echo "Map artifacts: $dir (see coverage.json; selectors are hypotheses, not verified relevance)."
+  sts --arg t "$tid" '.task_id=$t | .phase="map_review" | .status="questions" | .map_prepasses[$t].review_started_at=(now|floor) | .pending_questions=[{id:"map-decision",task:$t,member:"orchestrator",question:"Review the complete map and provide resume --map-decision FILE with action keep or split and a standalone contract."}]'
+  jq '.pending_questions' "$ST" >"$RUN/questions.json"; render_transcript
+  echo "council: map review pending; run council.sh resume --run-dir $RUN --map-decision FILE" >&2
+  exit 4
+}
+validate_child_launch() {  # contract prerequisite gate before every model launch, including handover
+  [ "$MAP_PREPASS" = 1 ] || return 0
+  local t child parent key contract writes
+  t=$(stj ".config.tasks[$(st .task_idx)]"); child=$(jq -r '.id' <<<"$t"); parent=$(jq -r '.map_parent // empty' <<<"$t")
+  local authorized; authorized=$(stj '.map_prepass_authorized // null')
+  if [ "$authorized" = null ] || [ "$(jq -r '.map_prepass_pending // null' "$ST")" != null ] || [ "$(st .phase)" = mapper_confirm ] || [ "$(st .phase)" = map_review ]; then
+    log "mapper authorization or map review is pending; refusing launch for $child"
+    return 1
+  fi
+  if ! jq -e '.map_prepass_authorized as $a | ($a.kind==(.config.map_prepass.kind // "opencode") and $a.model==(.config.map_prepass.model // "google/gemini-3.8-flash") and $a.effort==(.config.map_prepass.effort // "medium"))' "$ST" >/dev/null 2>&1; then
+    log "authorized mapper tuple differs from frozen run settings; refusing inference"
+    return 1
+  fi
+  if [ -z "$parent" ]; then
+    [ "$(jq -r --arg p "$child" '.map_prepasses[$p].reviewed // false' "$ST")" = true ] || {
+      log "original task $child has no completed map review; refusing launch"; return 1;
+    }
+    return 0
+  fi
+  local approval identity_file expected_digest actual_digest seed
+  approval=$(jq -c --arg p "$parent" '.map_prepasses[$p].approved_contract // null' "$ST")
+  [ "$approval" != null ] || { checkpoint_split_invalid "$child" "approved contract metadata is missing"; return 1; }
+  key=$(map_key "$parent"); contract=$(jq -r '.contract_file // empty' <<<"$approval")
+  [ -n "$contract" ] || contract="$RUN/map/$key/approved-contract.json"
+  if [ ! -r "$contract" ] || [ ! -s "$contract" ]; then
+    checkpoint_split_invalid "$child" "approved split contract for parent $parent is missing or unreadable"
+    return 1
+  fi
+  expected_digest=$(jq -r '.digest // empty' <<<"$approval"); actual_digest=$(shasum -a 256 <"$contract" | cut -d' ' -f1)
+  [ -n "$expected_digest" ] && [ "$expected_digest" = "$actual_digest" ] || { checkpoint_split_invalid "$child" "approved contract digest mismatch"; return 1; }
+  [ "$(jq -r '.contract_identity // empty' <<<"$t")" = "$expected_digest" ] || {
+    checkpoint_split_invalid "$child" "child task identity does not match the approved contract"; return 1;
+  }
+  [ "$(jq -r '.parent_id // empty' <<<"$approval")" = "$parent" ] || { checkpoint_split_invalid "$child" "approved contract parent identity mismatch"; return 1; }
+  seed=$(jq -r --arg p "$parent" '(.map_prepasses[$p].coverage|objects|.map_seed_id) // (.map_prepasses[$p].mapper_result|objects|.map_seed_id) // empty' "$ST")
+  [ -n "$seed" ] || seed=$(jq -r '.map_seed_id // empty' "$RUN/map/$key/coverage.json")
+  [ "$(jq -r '.seed_id // empty' <<<"$approval")" = "$seed" ] || { checkpoint_split_invalid "$child" "approved map seed identity mismatch"; return 1; }
+  identity_file=$(jq -r '.identity_file // empty' <<<"$approval")
+  [ -r "$identity_file" ] || { checkpoint_split_invalid "$child" "approved baseline identity file is missing or unreadable"; return 1; }
+  local expected_identity_digest actual_identity_digest
+  expected_identity_digest=$(jq -r '.identity_digest // empty' <<<"$approval")
+  actual_identity_digest=$(shasum -a 256 <"$identity_file" | cut -d' ' -f1)
+  [ -n "$expected_identity_digest" ] && [ "$expected_identity_digest" = "$actual_identity_digest" ] || { checkpoint_split_invalid "$child" "approved baseline identity digest mismatch"; return 1; }
+  if ! jq -e --arg c "$child" '.subtasks|any(.[]; .id==$c)' "$contract" >/dev/null 2>&1; then
+    checkpoint_split_invalid "$child" "child $child is absent from the approved contract for parent $parent"
+    return 1
+  fi
+  local entered; entered=$(jq -r --arg p "$parent" --arg c "$child" --arg d "$expected_digest" \
+    '(.map_prepasses[$p].execution_started[$c] // null) as $e | if (($e|type)=="object" and $e.contract_digest==$d) then "true" else "false" end' "$ST")
+  writes=false; [ "$entered" = false ] && case "$(st .phase)" in plan|exec) writes=true;; esac
+  local args=(--root "$DIR" --contract "$contract" --baseline-only --child "$child" --identity-file "$identity_file")
+  [ "$writes" = true ] && args+=(--include-writes)
+  [ "$entered" = false ] && { [ "$(st .phase)" = plan ] || [ "$(st .phase)" = exec ]; } && args+=(--include-creates)
+  [ "$entered" = true ] && args+=(--allow-authorized-changes)
+  if ! python3 "$HERE/council_splitcheck.py" "${args[@]}" >"$RUN/map/$key/child-$(map_key "$child")-gate.out" 2>"$RUN/map/$key/child-$(map_key "$child")-gate.err"; then
+    checkpoint_split_invalid "$child" "$(cat "$RUN/map/$key/child-$(map_key "$child")-gate.err")"
+    return 1
+  fi
+}
+checkpoint_split_invalid() {
+  local child=$1 error=$2
+  sts --arg t "$child" --arg e "$error" \
+    '.status="questions" | .phase="split_invalid" | .pending_questions=[{id:("split-invalid/"+$t),task:$t,member:"orchestrator",question:("Approved split contract/baseline is invalid: "+$e+". Resolve it with the user before continuing.")}]'
+  jq '.pending_questions' "$ST" >"$RUN/questions.json"
+  render_transcript
+}
+append_historical_map_locator() {  # prompt file/task id; informational snapshot only, no freshness guard
+  [ "$MAP_PREPASS" = 1 ] || return 0
+  local pf=$1 tid=$2 t parent loc
+  t=$(jq -c --arg t "$tid" '[.config.tasks[]|select(.id==$t)][0] // {}' "$ST")
+  parent=$(jq -r '.map_parent // .id // empty' <<<"$t"); [ -n "$parent" ] || return 0
+  local histdir snapshot
+  histdir="$RUN/codemap/historical-locators"; mkdir -p "$histdir"
+  loc="$histdir/$(map_key "$parent")-latest.md"
+  # Freeze the latest completed whole-index view now, so execution and later rounds can
+  # cite post-deliberation captures without turning the seed snapshot into a live claim.
+  python3 "$CM" seed-locator --run-dir "$RUN" --coverage "$RUN/map/$(map_key "$parent")/coverage.json" >"$loc.tmp" 2>"$loc.err" || {
+    loc=$(jq -r --arg p "$parent" '.map_prepasses[$p].seed_locator // empty' "$ST")
+    [ -s "$loc" ] || return 0
+  }
+  if [ -s "$loc.tmp" ]; then mv "$loc.tmp" "$loc"; fi
+  snapshot=$(sed -n 's/^snapshot_id: //p' "$loc" | head -1)
+  [ -n "$snapshot" ] && sts --arg p "$parent" --arg sid "$snapshot" --arg loc "$loc" \
+    '.map_prepasses[$p].historical_snapshot_id=$sid | .map_prepasses[$p].historical_locator=$loc | .map_prepasses[$p].historical_snapshot_at=(now|floor)'
+  [ -s "$loc" ] || return 0
+  { echo; echo "=== HISTORICAL CODE MAP (as of the completed pre-pass snapshot; not a live-source claim) ==="; cat "$loc"; echo "Live inspection is required for current-source claims. No deliberation freshness guard is applied to executor edits."; echo "=== END HISTORICAL CODE MAP ==="; } >>"$pf"
+}
+apply_mapper_confirmation() {
+  [ -n "$CONFIRM_MAPPER_FILE" ] && [ -f "$CONFIRM_MAPPER_FILE" ] || { log "mapper confirmation needs --confirm-mapper FILE"; exit 4; }
+  [ "$(st .phase)" = mapper_confirm ] && [ "$(st .status)" = questions ] || { log "there is no pending mapper confirmation"; exit 4; }
+  local pending got; pending=$(stj '.map_prepass_pending')
+  jq -e 'type=="object" and (keys|sort)==["effort","kind","model"] and all(.[];type=="string")' "$CONFIRM_MAPPER_FILE" >/dev/null 2>&1 || { log "confirmation file must contain exactly string fields {kind,model,effort}"; exit 4; }
+  got=$(jq -c 'select(type=="object" and (.kind|type)=="string" and (.model|type)=="string" and (.effort|type)=="string") | {kind,model,effort}' "$CONFIRM_MAPPER_FILE" 2>/dev/null) || { log "confirmation file must contain {kind,model,effort}"; exit 4; }
+  [ -n "$got" ] || { log "confirmation file must contain {kind,model,effort}"; exit 4; }
+  jq -e --argjson g "$got" '(.map_prepass_pending|{kind,model,effort})==$g' "$ST" >/dev/null || { log "mapper confirmation does not exactly match the pending proposal"; exit 4; }
+  local kind model effort; kind=$(jq -r .kind <<<"$got"); model=$(jq -r .model <<<"$got"); effort=$(jq -r .effort <<<"$got")
+  [ "$kind" = opencode ] || { log "mapper kind must be opencode"; exit 4; }
+  local cfg; cfg=$(stj '.config | .map_prepass += {kind:"opencode"}')
+  cfg=$(jq -c --arg m "$model" --arg e "$effort" '.map_prepass.model=$m | .map_prepass.effort=$e' <<<"$cfg")
+  check_mapper_available "$cfg"
+  sts --arg m "$model" --arg e "$effort" '.config.map_prepass.kind="opencode" | .config.map_prepass.model=$m | .config.map_prepass.effort=$e | .map_prepass_authorized={kind:"opencode",model:$m,effort:$e,source:"user-confirmed"} | .map_prepass_pending=null | .status="running" | .phase="plan" | .pending_questions=null | .last_votes=[] | .reuse_posts=false' || { log "could not persist mapper authorization; confirmation checkpoint is retained"; exit 4; }
+  rm -f "$RUN/questions.json"
+}
+archive_superseded_contract() {  # parent old-child-ids old-contract-identity -> retire stale work before state publication
+  local parent=$1 oldids=$2 identity=$3 base dest id file aid attempt_dir archive_leaf
+  SUPERSEDED_ARCHIVE=""
+  base="$RUN/map/$(map_key "$parent")/superseded"
+  dest="$base/$identity"
+  if [ -e "$dest" ]; then
+    # Never overwrite a prior archive for a reused contract digest.
+    dest=$(mktemp -d "$base/$identity.XXXXXX") || { log "cannot allocate non-overwriting superseded archive"; return 1; }
+  fi
+  mkdir -p "$dest/prompts" "$dest/posts" "$dest/raw" || { log "cannot create superseded-contract archive $dest"; return 1; }
+  for id in $(jq -r '.[]?' <<<"$oldids"); do
+    for file in "$RUN"/prompts/"$id"-*; do [ -f "$file" ] || continue; mv "$file" "$dest/prompts/" || { log "cannot retire superseded prompt $file"; return 1; }; done
+    for file in "$RUN"/posts/"$id"-*; do [ -f "$file" ] || continue; mv "$file" "$dest/posts/" || { log "cannot retire superseded post $file"; return 1; }; done
+    for file in "$RUN"/raw/"$id"-*; do [ -f "$file" ] || continue; mv "$file" "$dest/raw/" || { log "cannot retire superseded raw response $file"; return 1; }; done
+  done
+  aid=$(stj '.codemap_pending.attempt // empty' | tr -d '"')
+  if [ -n "$aid" ]; then
+    attempt_dir="$RUN/codemap/attempts/$aid"
+    if [ -d "$attempt_dir" ]; then
+      mkdir -p "$dest/codemap-attempt" || return 1
+       cp -R -n "$attempt_dir" "$dest/codemap-attempt/" || { log "cannot archive superseded code-map attempt $aid"; return 1; }
+    fi
+  fi
+  jq -n --arg p "$parent" --arg identity "$identity" --arg ids "$oldids" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '{parent:$p,old_contract_identity:$identity,child_ids:($ids|fromjson),archived_at:$ts,reusable:false}' >"$dest/MARKER.json.tmp" &&
+    mv "$dest/MARKER.json.tmp" "$dest/MARKER.json" || { log "cannot finalize superseded-contract archive $dest"; return 1; }
+  SUPERSEDED_ARCHIVE=$dest
+}
+apply_map_decision() {
+  [ -n "$MAP_DECISION_FILE" ] && [ -f "$MAP_DECISION_FILE" ] || { log "map review needs --map-decision FILE"; exit 4; }
+  [ "$(st .phase)" = map_review -o "$(st .phase)" = split_invalid ] && [ "$(st .status)" = questions ] || { log "there is no pending map review or split-resolution checkpoint"; exit 4; }
+  local decision action parent idx phase task original
+  phase=$(st .phase); task=$(st .task_id)
+  jq -e 'type=="object" and ((.action=="keep" and (keys|sort)==["action"]) or (.action=="split" and (keys|sort)==["action","contract_file"] and (.contract_file|type)=="string" and (.contract_file|length)>0))' "$MAP_DECISION_FILE" >/dev/null 2>&1 || { log "map decision must be exactly {action:keep} or {action:split,contract_file:string}"; exit 4; }
+  decision=$(jq -c . "$MAP_DECISION_FILE" 2>/dev/null) || { log "map decision must be valid JSON"; exit 4; }
+  action=$(jq -r '.action // empty' <<<"$decision")
+  parent=$(jq -r --arg t "$task" '.config.tasks[]|select(.id==$t)|(.map_parent // .id)' "$ST")
+  idx=$(jq -r --arg p "$parent" '[.config.tasks|to_entries[]|select(.value.id==$p or .value.map_parent==$p)|.key]|min' "$ST")
+  [ "$idx" != null ] || { log "cannot locate parent task $parent for map decision"; exit 4; }
+  local mapdir; mapdir="$RUN/map/$(map_key "$parent")"; mkdir -p "$mapdir" || { log "cannot create map-decision archive"; exit 4; }
+  cp "$MAP_DECISION_FILE" "$mapdir/decision.json.tmp" && mv "$mapdir/decision.json.tmp" "$mapdir/decision.json" || { log "cannot archive exact map decision"; exit 4; }
+  case "$action" in
+     keep)
+       if [ "$phase" = split_invalid ]; then
+         original=$(jq -c '.original_task' "$mapdir/input.json")
+         [ -n "$original" ] && [ "$original" != null ] || { log "archived original task is missing; cannot resolve split by keeping parent"; exit 4; }
+         local keep_oldids keep_identity
+         keep_oldids=$(jq -c --arg p "$parent" '[.config.tasks[]|select(.map_parent==$p)|.id]' "$ST") || { log "cannot identify superseded split children"; exit 4; }
+         keep_identity=$(jq -r --arg p "$parent" '.map_prepasses[$p].approved_contract.digest // "unapproved"' "$ST")
+         archive_superseded_contract "$parent" "$keep_oldids" "$keep_identity" || exit 4
+          sts --arg p "$parent" --arg f "$MAP_DECISION_FILE" --arg identity "$keep_identity" --arg archive "${SUPERSEDED_ARCHIVE:-}" --argjson i "$idx" --argjson o "$original" \
+           '(.config.tasks|map(select(.map_parent==$p)|.id)) as $oldids
+             | ([.results[]? as $r | select(($oldids|index($r.task))!=null) | $r]) as $superseded
+             | if ($superseded|length)>0 then .result_history=((.result_history // [])+[{reason:"split_invalid resolved by keeping parent",contract_identity:$identity,approved_contract:.map_prepasses[$p].approved_contract,baseline_identities:(.map_prepasses[$p].approved_contract.identity_file // null),archive:$archive,results:$superseded,archived_at:(now|floor)}]) else . end
+            | .config.tasks=(.config.tasks[:$i]+[$o]+[.config.tasks[$i:][]|select(.id!=$p and .map_parent!=$p)]) | .task_idx=$i | .task_id=$p
+            | .results=[.results[]? as $r|select(($oldids|index($r.task))==null)|$r]
+             | .map_prepasses[$p].execution_started={}
+             | .map_prepasses[$p].reviewed=true | .map_prepasses[$p].decision={action:"keep",file:$f} | .pending_questions=null | .codemap_pending=null | .status="running" | .phase="plan" | .round=1 | .candidate=null | .voted_candidate=null | .fixes=[] | .last_votes=[] | .reuse_posts=false | .members=(.members // [] | map(.inflight=null))' || { log "could not commit keep resolution; archive is preserved and checkpoint remains"; exit 4; }
+      else
+         sts --arg p "$parent" --arg f "$MAP_DECISION_FILE" '.map_prepasses[$p].reviewed=true | .map_prepasses[$p].decision={action:"keep",file:$f} | .pending_questions=null | .status="running" | .phase="plan" | .last_votes=[] | .reuse_posts=false' || { log "could not persist map keep decision; review checkpoint is retained"; exit 4; }
+      fi
+      ;;
+    split)
+      local contract; contract=$(jq -r '.contract_file // empty' <<<"$decision")
+      [ -n "$contract" ] || { log "split decision requires contract_file"; exit 4; }
+      case "$contract" in /*) ;; *) contract="$(cd "$(dirname "$MAP_DECISION_FILE")" && pwd)/$contract" ;; esac
+      [ -f "$contract" ] || { log "contract file not found: $contract"; exit 4; }
+        local key cdir seed oldids; key=$(map_key "$parent"); cdir="$RUN/map/$key"; seed=$(jq -r '.map_seed_id // .snapshot_id // .mapping_input_digest // "unknown"' "$cdir/coverage.json" 2>/dev/null)
+       mkdir -p "$cdir" || { log "cannot create split archive"; exit 4; }
+       # Copy the submitted bytes once to a private candidate. All validation, digesting,
+       # child expansion, and eventual approval use this same immutable artifact.
+        local candidate candidate_digest identities identity_digest collision_rc submission_key old_identity
+       candidate=$(mktemp "$cdir/submitted-contract.XXXXXX") || { log "cannot allocate submitted-contract archive"; exit 4; }
+       submission_key=${candidate##*/}
+       cp "$contract" "$candidate" || { log "cannot archive submitted contract"; exit 4; }
+       candidate_digest=$(shasum -a 256 <"$candidate" | cut -d' ' -f1)
+       identities="$cdir/baseline-identities-$submission_key.json"
+       oldids=$(jq -c --arg p "$parent" '[.config.tasks[]|select(.map_parent==$p)|.id]' "$ST") || { log "cannot identify prior split children"; exit 4; }
+       python3 "$HERE/council_splitcheck.py" --root "$DIR" --contract "$candidate" --parent-id "$parent" --map-seed-id "$seed" --identity-output "$identities.tmp" >"$cdir/splitcheck-$candidate_digest.out" 2>"$cdir/splitcheck-$candidate_digest.err"
+       if [ $? -ne 0 ]; then
+         cat "$cdir/splitcheck-$candidate_digest.err" >&2
+         [ "$phase" = split_invalid ] || sts '.status="questions" | .phase="map_review"'
+         jq '.pending_questions' "$ST" >"$RUN/questions.json"
+         exit 4
+       fi
+       if jq -e --arg p "$parent" --slurpfile st "$ST" '[ $st[0].config.tasks[]|select(.id!=$p and .map_parent!=$p)|.id ] as $existing | any(.subtasks[];.id as $id|($existing|index($id))!=null)' "$candidate" >/dev/null 2>&1; then
+         log "split child id collides with an existing task id"; [ "$phase" = split_invalid ] || sts '.status="questions" | .phase="map_review"'; exit 4
+       else collision_rc=$?; [ "$collision_rc" -eq 1 ] || { log "could not validate split task-id collisions"; exit 4; }
+       fi
+       if jq -e --argjson oldids "$oldids" --slurpfile st "$ST" '[.subtasks[].id] as $ids | [$st[0].results[]? as $r | select(($oldids|index($r.task))==null) | $r.task] as $done | any($ids[]; . as $id | ($done|index($id))!=null)' "$candidate" >/dev/null 2>&1; then
+         log "split child id collides with an existing result"; [ "$phase" = split_invalid ] || sts '.status="questions" | .phase="map_review"'; exit 4
+       else collision_rc=$?; [ "$collision_rc" -eq 1 ] || { log "could not validate split result-id collisions"; exit 4; }
+       fi
+       local build_rc
+       jq -e 'any(.subtasks[];.execute==true)' "$candidate" >/dev/null 2>&1; build_rc=$?
+       if [ "$build_rc" -eq 0 ] && [ -z "$EXEC" ]; then
+         log "split contains execute:true children but no executor is configured"; [ "$phase" = split_invalid ] || sts '.status="questions" | .phase="map_review"'; exit 4
+       elif [ "$build_rc" -ne 0 ] && [ "$build_rc" -ne 1 ]; then
+         log "could not validate split execution requirements"; exit 4
+       fi
+       if ! jq -e . "$candidate" >/dev/null 2>&1; then log "could not parse archived split contract"; exit 4; fi
+        local children; children=$(jq -c --arg p "$parent" --arg d "$candidate_digest" --slurpfile state "$ST" '[.subtasks[] | . + {map_parent:$p,map_contract_id:.id,contract_identity:$d,inherited_answers:([$state[0].answers[]? | select(.task==$p)])}]' "$candidate") || { log "cannot expand archived split subtasks"; exit 4; }
+       [ "$(jq 'length' <<<"$children")" -gt 0 ] || { log "split contract has no subtasks"; exit 4; }
+       [ -s "$identities.tmp" ] || { log "split checker did not produce baseline identities"; exit 4; }
+        mv "$identities.tmp" "$identities" || { log "cannot finalize baseline identity archive"; exit 4; }
+        identity_digest=$(shasum -a 256 <"$identities" | cut -d' ' -f1)
+         old_identity=$(jq -r --arg p "$parent" '.map_prepasses[$p].approved_contract.digest // "unapproved"' "$ST")
+         if [ "$(jq 'length' <<<"$oldids")" -gt 0 ]; then archive_superseded_contract "$parent" "$oldids" "$old_identity" || exit 4; fi
+         sts --arg p "$parent" --argjson i "$idx" --argjson children "$children" --arg f "$candidate" --arg digest "$candidate_digest" --arg old_identity "$old_identity" --arg archive "${SUPERSEDED_ARCHIVE:-}" --arg seed "$seed" --arg identities "$identities" --arg identity_digest "$identity_digest" --argjson oldids "$oldids" \
+          '([.results[]? as $r | select(($oldids|index($r.task))!=null) | $r]) as $superseded
+           | if ($superseded|length)>0 then .result_history=((.result_history // [])+[{reason:"split contract replaced",contract_identity:$old_identity,approved_contract:.map_prepasses[$p].approved_contract,baseline_identities:(.map_prepasses[$p].approved_contract.identity_file // null),archive:$archive,results:$superseded,archived_at:(now|floor)}]) else . end
+          | .config.tasks = (.config.tasks[:$i] + $children + [.config.tasks[$i:][]|select(.id!=$p and .map_parent!=$p)]) | .task_idx=$i | .task_id=$p
+          | .results=[.results[]? as $r|select(($oldids|index($r.task))==null)|$r]
+           | .map_prepasses[$p].execution_started={}
+           | .map_prepasses[$p].approved_contract={digest:$digest,seed_id:$seed,parent_id:$p,contract_file:$f,identity_file:$identities,identity_digest:$identity_digest}
+           | .map_prepasses[$p].reviewed=true | .map_prepasses[$p].decision={action:"split",contract:$f,children:$children}
+           | .pending_questions=null | .codemap_pending=null | .status="running" | .phase="plan" | .round=1 | .candidate=null | .voted_candidate=null | .fixes=[] | .last_votes=[] | .reuse_posts=false | .members=(.members // [] | map(.inflight=null))' || { log "could not commit validated split contract; archive is preserved and checkpoint remains"; exit 4; }
+      ;;
+    *) die "map decision action must be keep or split" ;;
+  esac
+  if jq -e --arg p "$parent" '.map_prepasses[$p].review_started_at != null' "$ST" >/dev/null 2>&1; then
+    sts --arg p "$parent" '.map_prepasses[$p].review_finished_at=(now|floor) | .map_prepasses[$p].review_seconds=(.map_prepasses[$p].review_finished_at-.map_prepasses[$p].review_started_at)' || { log "could not persist map review completion"; exit 4; }
+  fi
+  rm -f "$RUN/questions.json"
+  render_transcript
 }
 codemap_append_locator() {  # prompt-file tid tag site -> append the locator AND record its span
   # The orchestrator writes these bytes itself, so it knows their exact offset and length without
@@ -374,6 +863,7 @@ validate_config() {  # $1 = config file -> prints normalised config json
           + [ .members[]? | select(.id!=$ex and .mode=="edit") | "member \(.id) has mode edit but is not the executor" ] end)
     + [ .tasks[]? | select(type=="object" and .execute==true and $ex==null) | "task \(.id // .text[0:40]) has execute:true but no executor is configured" ]
     | .[]' "$1" 2>/dev/null | sed 's/^/  /'; jq -r '
+    (.map_prepass | if type=="object" then . else {} end) as $mp |
     def need(f; msg): if (has(f) | not) then "missing field: " + f + " (" + msg + ")" else empty end;
     [ need("dir"; "absolute project directory"), need("tasks"; "array of tasks"), need("members"; "array of {id,kind,model,effort,mode}"),
       need("executor"; "member id allowed to edit files, or null"), need("max_rounds"; "e.g. 4"), need("timeout_s"; "e.g. 600"),
@@ -390,6 +880,13 @@ validate_config() {  # $1 = config file -> prints normalised config json
     + (if (.max_rounds|type)=="number" and .max_rounds>=2 and .max_rounds<=10 then [] else ["max_rounds must be 2..10 (round 1 = proposals, consensus needs at least one voting round)"] end)
     + (if (.timeout_s|type)=="number" and .timeout_s>=30 then [] else ["timeout_s must be >= 30"] end)
     + (if (.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))) then [] else ["handover_at must be a fraction in (0,1] of the model context window, or an absolute token count >= 1000 (e.g. 150000)"] end)
+    + (if has("map_code") and (.map_code|type)!="boolean" then ["map_code must be a boolean"] else [] end)
+    + (if has("map_prepass") and (.map_prepass|type)!="object" then ["map_prepass must be an object containing mapper settings"] else [] end)
+    + (if ($mp|has("kind")) and (($mp.kind|type)!="string" or $mp.kind!="opencode") then ["map_prepass.kind must be opencode"] else [] end)
+    + (if ($mp|has("model")) and (($mp.model|type)!="string" or ($mp.model|contains("/")|not)) then ["map_prepass.model must be provider/id"] else [] end)
+    + (if ($mp|has("effort")) and ($mp.effort|type)!="string" then ["map_prepass.effort must be a string"] else [] end)
+    + (if ($mp|has("timeout_s")) then (if ($mp.timeout_s|type)=="number" and $mp.timeout_s>0 and ($mp.timeout_s|floor)==$mp.timeout_s then [] else ["map_prepass.timeout_s must be a positive integer"] end) else [] end)
+    + (if ($mp|has("max_output_bytes")) then (if ($mp.max_output_bytes|type)=="number" and $mp.max_output_bytes>0 and ($mp.max_output_bytes|floor)==$mp.max_output_bytes then [] else ["map_prepass.max_output_bytes must be a positive integer"] end) else [] end)
     + [ .tasks[]? | select((type=="string" and length>0) or (type=="object" and (.text|type)=="string") | not) | "each task must be a string or {id,text,execute}" ]
     | .[]' "$1" | sed 's/^/  /')
   [ -z "$err" ] || { echo "council: invalid config $1:" >&2; echo "$err" >&2; exit 1; }
@@ -405,8 +902,11 @@ validate_config() {  # $1 = config file -> prints normalised config json
                (.members[] | select((.style // "normal")|IN("normal","lite","caveman","ultra")|not) | "  member \(.id): style must be normal|lite|caveman|ultra")' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
   # normalise: tasks -> {id,text,execute}; members -> +agent/permission_mode
-  jq '.tasks |= [to_entries[] | (if (.value|type)=="string" then {id:("t"+((.key+1)|tostring)), text:.value, execute:false}
-                                  else {id:(.value.id // ("t"+((.key+1)|tostring))), text:.value.text, execute:(.value.execute==true)} end)]
+  jq '.map_code = (.map_code // false)
+      | .map_prepass = (.map_prepass // {})
+      | .tasks |= [to_entries[] | (if (.value|type)=="string" then {id:("t"+((.key+1)|tostring)), text:.value, execute:false}
+                                  else ({id:(.value.id // ("t"+((.key+1)|tostring))), text:.value.text, execute:(.value.execute==true)} +
+                                        (.value | with_entries(select(.key|IN("acceptance","map_parent","map_contract_id","contract_identity","parent_id","map_seed_id","inherited_answers"))))) end)]
       | .max_turns = (.max_turns // 30)
       | .style = (.style // "normal")
       | .members |= [ .[] | {style: $s, handover_at: $h} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
@@ -441,8 +941,49 @@ print_roster() {  # $1 = normalised config json, $2 = ctx-limit tsv (id<TAB>limi
   done
   echo "  executor (only member allowed to edit files): $(jq -r '.executor // "none — read-only council"' <<<"$cfg")"
   echo "  dir: $(jq -r .dir <<<"$cfg")"
+  if [ "$(jq -r '.map_code' <<<"$cfg")" = true ]; then
+    echo "  map_code: true (one run-wide mapping choice)"
+    echo "  mapper: $(jq -r '"opencode / " + (.map_prepass.model // "google/gemini-3.8-flash") + " / " + (.map_prepass.effort // "medium") + (if (.map_prepass.model and .map_prepass.effort) then " (configured)" else " (proposal; explicit confirmation required)" end)' <<<"$cfg")"
+    echo "  mapper limits: $(jq -r '.map_prepass.timeout_s // 120' <<<"$cfg")s, $(jq -r '.map_prepass.max_output_bytes // 65536' <<<"$cfg") response bytes"
+  fi
   echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at as $h | if $h > 1 then ($h|tostring)+" tokens" else (($h*100|floor)|tostring)+"% of context" end' <<<"$cfg") (council default; per-member values in the table) · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
   echo "  tasks:"; jq -r '.tasks[] | "    \(.id)\(if .execute then " [build]" else "" end): \(.text|gsub("\n";" ")|.[0:110])"' <<<"$cfg"
+}
+
+mapper_tuple() {  # config JSON -> proposed/configured tuple JSON
+  jq -c '{kind:(.map_prepass.kind // "opencode"),model:(.map_prepass.model // "google/gemini-3.8-flash"),effort:(.map_prepass.effort // "medium"),timeout_s:(.map_prepass.timeout_s // 120),max_output_bytes:(.map_prepass.max_output_bytes // 65536)}' <<<"$1"
+}
+ensure_mapper_authorized() {  # recover a crash after enabled state creation, before any inference
+  [ "$MAP_PREPASS" = 1 ] || return 0
+  local auth cfg model effort tuple
+  auth=$(stj '.map_prepass_authorized // null')
+  cfg=$(stj '.config')
+  model=$(jq -r '.config.map_prepass.model // empty' "$ST")
+  effort=$(jq -r '.config.map_prepass.effort // empty' "$ST")
+  if [ "$(jq -r '.phase' "$ST")" = mapper_confirm ] && [ "$(jq -r '.map_prepass_pending // null' "$ST")" != null ]; then return 0; fi
+  if [ "$auth" != null ] && jq -e --argjson a "$auth" '.config as $c | $a.kind==($c.map_prepass.kind // "opencode") and $a.model==($c.map_prepass.model // "google/gemini-3.8-flash") and $a.effort==($c.map_prepass.effort // "medium") and ($a.source=="config" or $a.source=="user-confirmed")' "$ST" >/dev/null 2>&1; then return 0; fi
+  if [ -n "$model" ] && [ -n "$effort" ]; then
+    check_mapper_available "$cfg"
+    sts '.map_prepass_authorized={kind:(.config.map_prepass.kind // "opencode"),model:.config.map_prepass.model,effort:.config.map_prepass.effort,source:"config"} | .map_prepass_pending=null' || { log "could not persist configured mapper authorization; refusing inference"; exit 4; }
+    return 0
+  fi
+  tuple=$(mapper_tuple "$cfg")
+  sts --argjson p "$tuple" '.map_prepass_pending=$p | .status="questions" | .phase="mapper_confirm" | .pending_questions=[{id:"mapper-confirmation",task:null,member:"orchestrator",question:("Explicitly confirm mapper "+$p.kind+" "+$p.model+" ["+$p.effort+"] by resuming with --confirm-mapper FILE containing the exact {kind,model,effort} tuple.")}]' || { log "could not persist mapper proposal; refusing inference"; exit 4; }
+  jq '.pending_questions' "$ST" >"$RUN/questions.json" || { log "could not persist mapper confirmation question"; exit 4; }
+  render_transcript
+  log "enabled code-map run has no durable mapper authorization; confirmation is required before inference (proposed $model $effort)"
+  exit 4
+}
+check_mapper_available() {  # config JSON -> validates configured/recommended model metadata without inference
+  local cfg=$1 tuple model effort models m variants
+  [ "$(jq -r '.map_code' <<<"$cfg")" = true ] || return 0
+  tuple=$(mapper_tuple "$cfg"); model=$(jq -r .model <<<"$tuple"); effort=$(jq -r .effort <<<"$tuple")
+  models=$("$OC" api GET "/api/model?location%5Bdirectory%5D=$(jq -rn --arg d "$(jq -r .dir <<<"$cfg")" '$d|@uri')") || die "cannot list models to validate mapper"
+  m=$(jq -c --arg m "$model" '.data[] | select(.enabled and (.providerID+"/"+.id)==$m)' <<<"$models")
+  [ -n "$m" ] || die "mapper model not enabled: $model (configure map_prepass.model explicitly; no substitution)"
+  variants=$(jq -r '[.variants[]?.id]|join("|")' <<<"$m")
+  if [ -n "$variants" ]; then jq -e --arg e "$effort" '[.variants[].id]|index($e)' <<<"$m" >/dev/null || die "mapper effort '$effort' is not a variant of $model (valid: $variants)"
+  else [ "$effort" = default ] || die "mapper model $model has no variants; use effort default"; fi
 }
 
 cost_note() {  # config only; measured comparisons, never a dollar forecast or a gate
@@ -471,6 +1012,7 @@ cl_new_session() { uuidgen | tr 'A-Z' 'a-z'; }
 
 launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inflight
   local i=$1 pf=$2 tag=$3 kind sid
+  validate_child_launch || { [ "$(st .phase)" = split_invalid ] && exit 4; return 1; }
   kind=$(mget $i kind); sid=$(mget $i session)
   if [ "$kind" = opencode ]; then
     if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(oc_new_session $i) || return 1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s'; fi
@@ -585,8 +1127,12 @@ TXT
 }
 task_header() { local t=$1 r=$2; echo "=== TASK $(jq -r .id <<<"$t") — round $r of $MAXR ==="; }
 task_text()   { jq -r '.text' <<<"$1"; }
+task_inherited_answers() { jq -r '(.inherited_answers // []) | map("- Q: \(.question)\n  A: \(.answer)") | if length==0 then "" else "Original parent-task user answers (verbatim):\n" + join("\n") + "\n" end' <<<"$1"; }
 task_intro()  { local t=$1; task_text "$t"; jq -e '.execute' <<<"$t" >/dev/null && echo "
-(This is a BUILD task: the council first agrees on a PLAN — concrete files, changes, verification commands. Then executor $EXEC implements the plan, and the council ratifies the actual result.)"; }
+(This is a BUILD task: the council first agrees on a PLAN — concrete files, changes, verification commands. Then executor $EXEC implements the plan, and the council ratifies the actual result.)"
+  local inherited; inherited=$(task_inherited_answers "$t"); [ -z "$inherited" ] || printf '\n%s' "$inherited"
+  jq -e '(.map_parent != null) and ((.acceptance // [])|length>0)' <<<"$t" >/dev/null 2>&1 && { echo; echo "Approved acceptance specifications:"; jq '.acceptance' <<<"$t"; }
+}
 
 prompt_round1() {  # idx task
   local tid; tid=$(jq -r .id <<<"$2")
@@ -774,6 +1320,12 @@ The council reached consensus on this plan:
 <<<PLAN
 $(st '.results[-1].text')
 >>>
+TXT
+  local inherited; inherited=$(task_inherited_answers "$2"); [ -z "$inherited" ] || { echo; printf '%s\n' "$inherited"; }  # keep the last answer off the next line
+  if jq -e '(.map_parent != null) and ((.acceptance // [])|length>0)' <<<"$2" >/dev/null 2>&1; then
+    echo; echo "Approved child acceptance specifications:"; jq '.acceptance' <<<"$2"
+  fi
+  cat <<TXT
 You are the executor. Implement EXACTLY this plan in $DIR now — nothing more, nothing less. Run the verification the plan specifies. Do not ask the council; if you are blocked by missing information, stop and vote "question".
 Then report: files changed (paths), commands run, verification evidence (actual output), and anything that deviated from the plan and why.
 JSON tail — exactly one of:
@@ -853,6 +1405,7 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
   local i=$1 id; id=$(mid $i)
   log "member $id: context $(st ".members[$i].ctx_used // 0") tokens ($(ctx_pct $i)%) reached its $(st ".members[$i] | (.handover_at // $HANDOVER) as \$h | if \$h > 1 then (\$h|tostring)+\" tokens\" else ((\$h*100|floor)|tostring)+\"%\" end") handover threshold — new session"
   local pf="$RUN/prompts/handover-$id-g$(mget $i gen).md"; prompt_handover $i >"$pf"
+  append_historical_map_locator "$pf" "$(st .task_id)"
   launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
   local old; old=$(mget $i session)
@@ -867,6 +1420,7 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
 run_step() {
   local tag=$1 gen=$2 t=$3 tid i pf r=${4:-1} only=${5:-}
   tid=$(jq -r .id <<<"$t"); mkdir -p "$RUN/prompts" "$RUN/posts" "$RUN/raw"
+  validate_child_launch || { [ "$(st .phase)" = split_invalid ] && exit 4; return 1; }
   local idxs; if [ -n "$only" ]; then idxs=$only; else idxs=$(seq 0 $((N-1))); fi
   local -a launch_gen=()   # generation recorded at launch time, for attribution (see codemap_stage_accepted)
   local -a launch_id=()    # the orchestration-owned identity of the launch that produced the reply
@@ -898,6 +1452,7 @@ run_step() {
     fi
     notices_block >>"$pf"
     codemap_append_locator "$pf" "$tid" "$tag" prompt
+    case "$gen" in prompt_round1|prompt_roundN) ;; *) append_historical_map_locator "$pf" "$tid" ;; esac
     $gen $i "$t" "$r" >>"$pf"
     launch $i "$pf" "$tid-$tag" || { log "member $(mid $i): launch failed"; return 1; }
     codemap_record_launched "$pf" "$tid" "$tag"
@@ -1034,7 +1589,16 @@ cap_diff() (  # consume the stream, preserve head's byte cap, make truncation ex
 execute_and_ratify() {  # task json; assumes .results[-1] is the consensus plan; returns 0 ratified / 1 unresolved
   local t=$1 tid ei r; tid=$(jq -r .id <<<"$t"); ei=$(executor_idx)
   r=$(st .round)
-  if [ "$(st .phase)" = "plan" ]; then sts '.phase="exec"'; fi
+  if [ "$(st .phase)" = "plan" ]; then
+    validate_child_launch || { [ "$(st .phase)" = split_invalid ] && exit 4; return 1; }
+    if [ -n "$(jq -r '.map_parent // empty' <<<"$t")" ]; then
+      local child_parent contract_digest
+      child_parent=$(jq -r .map_parent <<<"$t")
+      contract_digest=$(jq -r --arg p "$child_parent" '.map_prepasses[$p].approved_contract.digest // empty' "$ST")
+      [ -n "$contract_digest" ] || { log "cannot bind execution entry to an approved contract"; exit 4; }
+      sts --arg p "$child_parent" --arg c "$tid" --arg d "$contract_digest" '.map_prepasses[$p].execution_started[$c]={contract_digest:$d,started_at:(now|floor)} | .phase="exec"' || { log "could not persist authorized execution entry"; exit 4; }
+    else sts '.phase="exec"'; fi
+  fi
   while [ "$r" -le "$MAXR" ]; do
     sts --argjson r $r '.round=$r'
     if [ "$(st .phase)" = "exec" ]; then
@@ -1059,14 +1623,50 @@ execute_and_ratify() {  # task json; assumes .results[-1] is the consensus plan;
 run_tasks() {  # from state.task_idx onward
   local nt ti unresolved=0; nt=$(st '.config.tasks|length'); ti=$(st .task_idx)
   while [ "$ti" -lt "$nt" ]; do
-    local t; t=$(stj ".config.tasks[$ti]"); local tid; tid=$(jq -r .id <<<"$t")
+    nt=$(st '.config.tasks|length')
+    local t; t=$(stj ".config.tasks[$ti]"); local tid parent; tid=$(jq -r .id <<<"$t"); parent=$(jq -r '.map_parent // .id' <<<"$t")
     sts --argjson ti $ti --arg tid "$tid" '.task_idx=$ti | .task_id=$tid | .status="running"'
     log "==== task $tid ($((ti+1))/$nt) phase $(st .phase) round $(st .round) ===="
-    if [ "$(st .phase)" = "plan" ]; then
-      if deliberate "$t"; then
-        if jq -e '.execute' <<<"$t" >/dev/null; then execute_and_ratify "$t" || unresolved=1; fi
-      else unresolved=1; fi
-    else execute_and_ratify "$t" || unresolved=1; fi
+    if map_prepass_enabled; then
+      if [ "$parent" = "$tid" ]; then
+        local reviewed mapstatus; reviewed=$(jq -r --arg p "$parent" '.map_prepasses[$p].reviewed // false' "$ST")
+        mapstatus=$(jq -r --arg p "$parent" '.map_prepasses[$p].status // "new"' "$ST")
+        if [ "$reviewed" != true ]; then
+          if [ "$mapstatus" = new ] || [ "$mapstatus" = preparing ] || [ "$mapstatus" = created ] || [ "$mapstatus" = dispatching ] || [ "$mapstatus" = dispatched ]; then
+            sts '.phase="map"'
+            map_prepass_run "$t" || { sts '.status="failed"'; log "map pre-pass failed operationally; checkpointed"; exit 2; }
+          fi
+          sts '.phase="map_review"'
+          map_prepass_review "$t"
+        fi
+      else
+        # Contract-validated children share the original task's complete map and never launch a mapper.
+        local reviewed; reviewed=$(jq -r --arg p "$parent" '.map_prepasses[$p].reviewed // false' "$ST")
+        [ "$reviewed" = true ] || { log "child $tid has no approved parent map review"; exit 2; }
+      fi
+      if [ "$parent" != "$tid" ]; then
+        validate_child_launch || { [ "$(st .phase)" = split_invalid ] && exit 4; exit 2; }
+      fi
+    fi
+    case "$(st .phase)" in
+      plan)
+        if deliberate "$t"; then
+          if [ "$(jq -r '.execute // false' <<<"$t")" = true ]; then execute_and_ratify "$t" || unresolved=1; fi
+        else unresolved=1; fi
+        ;;
+      exec|ratify)
+        if [ "$(jq -r '.execute // false' <<<"$t")" = true ]; then execute_and_ratify "$t" || unresolved=1
+        else
+          log "task $tid is execute:false; refusing to enter execution/ratification phase"
+          sts '.status="questions" | .phase="plan" | .pending_questions=[{id:"invalid-execution-phase",task:.task_id,member:"orchestrator",question:"This task is execute:false but state requests execution. Resolve the checkpoint before continuing."}]'
+          jq '.pending_questions' "$ST" >"$RUN/questions.json"; render_transcript; exit 4
+        fi
+        ;;
+      *)
+        log "unsupported task phase $(st .phase); refusing inference"
+        exit 4
+        ;;
+    esac
     ti=$((ti+1)); sts --argjson ti $ti '.task_idx=$ti | .round=1 | .phase="plan" | .candidate=null | .last_votes=[] | .fixes=null'
   done
   sts '.status="done"'; render_transcript
@@ -1091,6 +1691,11 @@ token_report() {  # prints the report; returns non-zero only if both tools fail
     python3 "$PTOOLS/codemap_report.py" "$RUN" 2>&1 || echo "(the code map report is unavailable: see above)"
     echo '```'
   fi
+  if [ "$(st '.map_prepass_version // empty')" = "1" ]; then
+    echo; echo "### Map pre-pass"; echo; echo '```'
+    python3 "$PTOOLS/codemap_report.py" "$RUN" --prepass 2>&1 || echo "(map pre-pass accounting is unavailable)"
+    echo '```'
+  fi
   return $rc
 }
 
@@ -1102,8 +1707,23 @@ usage_totals() {  # latest generation plus ALL retired generations; no API calls
       retired_cost:([.retired[]? | .cost // 0]|add // 0)}
       | . + {tokens:(.final_tokens+.retired_tokens), cost:(.final_cost+.retired_cost)}] as $m |
     ($m[] | "  member \(.id): final-generation \(.final_tokens) tokens / $\(.final_cost) + retired \(.retired_tokens) tokens / $\(.retired_cost) = subtotal \(.tokens) tokens / $\(.cost)"),
-    "RUN TOTAL: \($m|map(.tokens)|add // 0) tokens / $\($m|map(.cost)|add // 0) (all members, all generations)"
+    (if .map_prepass_version==1 then "MEMBER SUBTOTAL: \($m|map(.tokens)|add // 0) tokens / $\($m|map(.cost)|add // 0) (all members, all generations)"
+     else "RUN TOTAL: \($m|map(.tokens)|add // 0) tokens / $\($m|map(.cost)|add // 0) (all members, all generations)" end)
   '
+  if [ "$(st '.map_prepass_version // empty')" = "1" ]; then
+    st '
+      . as $state |
+      ([.map_prepasses|to_entries[] | {session:(.value.session // ("task:"+.key)),usage:(.value.usage // {})}] | unique_by(.session)) as $m |
+      [$m[].usage | [.input,.cache_read,.cache_write,.output,.reasoning][] | select(type=="number" and (isinfinite|not) and (isnan|not))] as $tokens |
+      [$m[].usage.cost | select(type=="number" and (isinfinite|not) and (isnan|not))] as $costs |
+      [$m[] | select((.usage.input|type)!="number" or (.usage.cache_read|type)!="number" or (.usage.cache_write|type)!="number" or (.usage.output|type)!="number" or (.usage.reasoning|type)!="number") | .session] as $unknown |
+      [$m[] | select((.usage.cost|type)!="number") | .session] as $unknown_cost |
+      [ $state.members[] | (.session_tokens // 0) + ([.retired[]? | .tokens // 0]|add // 0)] as $member_tokens |
+      [ $state.members[] | (.session_cost // 0) + ([.retired[]? | .cost // 0]|add // 0)] as $member_costs |
+      "MAP PRE-PASS SUBTOTAL: \($tokens|add // 0) known tokens / \(if ($costs|length)>0 then "$\($costs|add)" else "UNKNOWN" end) known cost across \($m|length) unique sessions; token components unknown for: \(if ($unknown|length)>0 then ($unknown|join(",")) else "none" end); cost unknown for: \(if ($unknown_cost|length)>0 then ($unknown_cost|join(",")) else "none" end)",
+      "RUN TOTAL (known components): \(($member_tokens|add // 0)+($tokens|add // 0)) tokens / $\(($member_costs|add // 0)+($costs|add // 0)); mapper telemetry unknowns retained, no estimates"
+    '
+  fi
 }
 render_transcript() {
   {
@@ -1147,6 +1767,7 @@ case "$CMD" in
     cfg=$(validate_config "$CONFIG") || exit 1
     "$OC" ensure >/dev/null || exit 1
     lim=$(check_opencode_models "$cfg") || exit 1
+    check_mapper_available "$cfg"
     print_roster "$cfg" "$lim"; cost_note "$cfg"; echo "config OK: $CONFIG" ;;
 
   start)
@@ -1155,13 +1776,34 @@ case "$CMD" in
     cfg=$(validate_config "$CONFIG") || exit 1
     "$OC" ensure >/dev/null || exit 1
     lim=$(check_opencode_models "$cfg") || exit 1
+    check_mapper_available "$cfg"
+    # Ownership: the leaf is created here (mkdir without -p fails if it appeared meanwhile), so a
+    # failed initial state write may remove it and the identical start can simply be rerun.
+    mkdir -p "$(dirname "$RUN")" && mkdir "$RUN" 2>/dev/null || die "cannot create run dir (it must not exist): $RUN"
     mkdir -p "$RUN/prompts" "$RUN/posts" "$RUN/raw"; cp "$CONFIG" "$RUN/config.json"
-    jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" '
+    if ! jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" '
       ($lim | split("\n") | map(select(length>0) | split("\t") | {key:.[0], value:(.[1]|tonumber)}) | from_entries) as $L |
-      {config:$cfg, run_dir:$run, started:$ts, status:"created", cl_cumulative:$cum, task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
-       codemap_version:1, codemap_pending:null,
-       answers:[], pending_questions:null, notices:[], reuse_posts:false, results:[], log:[],
-       members:[ $cfg.members[] | . + {session:null, gen:1, fresh:true, handover_note:null, ctx_used:0, ctx_limit:($L[.id] // null), session_tokens:0, session_cost:0, calls:0, session_calls:0, retired:[], inflight:null} ]}' >"$RUN/state.json"
+      ({config:$cfg, run_dir:$run, started:$ts, status:"created", cl_cumulative:$cum, task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
+        codemap_version:1, codemap_pending:null,
+        answers:[], pending_questions:null, notices:[], reuse_posts:false, results:[], log:[],
+        members:[ $cfg.members[] | . + {session:null, gen:1, fresh:true, handover_note:null, ctx_used:0, ctx_limit:($L[.id] // null), session_tokens:0, session_cost:0, calls:0, session_calls:0, retired:[], inflight:null} ]}
+        + (if $cfg.map_code then {map_prepass_version:1,map_prepasses:{}} else {} end))' >"$RUN/state.json.tmp" || ! mv "$RUN/state.json.tmp" "$RUN/state.json"; then
+      rm -rf -- "$RUN"; log "could not persist initial run state; no model call made"; exit 1
+    fi
+    load_state
+    if [ "$(jq -r '.map_code' <<<"$cfg")" = true ]; then
+       sts '.map_prepass_version=1 | .map_prepasses={}' || { log "could not persist map-prepass version marker"; exit 1; }
+      if [ -z "$(jq -r '.config.map_prepass.model // empty' "$ST")" ] || [ -z "$(jq -r '.config.map_prepass.effort // empty' "$ST")" ]; then
+        proposed=$(mapper_tuple "$cfg")
+         sts --argjson p "$proposed" '.map_prepass_pending=$p | .status="questions" | .phase="mapper_confirm" | .pending_questions=[{id:"mapper-confirmation",task:null,member:"orchestrator",question:("Explicitly confirm mapper "+$p.kind+" "+$p.model+" ["+$p.effort+"] by resuming with --confirm-mapper FILE containing the exact {kind,model,effort} tuple.")}]' || { log "could not persist mapper proposal; no model call made"; exit 1; }
+         jq '.pending_questions' "$ST" >"$RUN/questions.json" || { log "could not persist mapper confirmation question"; exit 1; }
+        render_transcript
+        echo "council: mapper confirmation required before any model call; proposed $(jq -r '.kind+" "+.model+" ["+.effort+"]' <<<"$proposed")" >&2
+        exit 4
+      else
+         sts '.map_prepass_authorized={kind:(.config.map_prepass.kind // "opencode"),model:.config.map_prepass.model,effort:.config.map_prepass.effort,source:"config"}' || { log "could not persist configured mapper authorization; no model call made"; exit 1; }
+      fi
+    fi
     load_state
     print_roster "$cfg" "$lim" >&2; log "run dir: $RUN"
     run_tasks ;;
@@ -1182,27 +1824,59 @@ case "$CMD" in
   resume)
     [ -n "$RUN" ] || die "resume needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     "$OC" ensure >/dev/null || exit 1
+    ensure_mapper_authorized
     status=$(st .status)
     case "$status" in
       questions)
+        if [ "$(st .phase)" = mapper_confirm ]; then
+          [ -z "$ANSWERS_FILE$ANSWER_TEXT$MAP_DECISION_FILE" ] || { log "mapper consent must use --confirm-mapper FILE, not --answer/--answers"; exit 4; }
+          [ -n "$CONFIRM_MAPPER_FILE" ] || { log "mapper confirmation needs --confirm-mapper FILE"; exit 4; }
+          apply_mapper_confirmation
+        elif [ "$(st .phase)" = map_review ]; then
+          [ -z "$ANSWERS_FILE$ANSWER_TEXT$CONFIRM_MAPPER_FILE" ] || { log "map review requires --map-decision FILE"; exit 4; }
+          [ -n "$MAP_DECISION_FILE" ] || { log "map review requires --map-decision FILE"; exit 4; }
+          apply_map_decision
+        elif [ "$(st .phase)" = split_invalid ]; then
+          [ -z "$ANSWERS_FILE$ANSWER_TEXT$CONFIRM_MAPPER_FILE" ] || { log "split resolution requires --map-decision FILE"; exit 4; }
+          [ -n "$MAP_DECISION_FILE" ] || { log "split resolution requires --map-decision FILE (choose keep or a replacement split contract)"; exit 4; }
+          apply_map_decision
+        else
         pend=$(stj '.pending_questions')
+        answer_mode="text"; ans='{}'
         if [ -n "$ANSWERS_FILE" ]; then
           [ -f "$ANSWERS_FILE" ] || die "answers file not found: $ANSWERS_FILE"
           # accepted: {"<qid>":"answer",...}  or  [{"id":"<qid>","answer":"..."}]
           ans=$(jq -c 'if type=="array" then map({key:.id, value:.answer}) | from_entries else . end' "$ANSWERS_FILE") || die "answers must be JSON: {qid: answer} or [{id, answer}]"
           missing=$(jq -r --argjson a "$ans" '.[] | select($a[.id]==null) | .id' <<<"$pend")
           [ -z "$missing" ] || die "no answer for: $(echo $missing) — every pending question needs an answer (or use --answer TEXT for one answer to all)"
-          sts --argjson a "$ans" '.answers += [ .pending_questions[] | . + {answer:$a[.id]} ]'
+          answer_mode="object"
         elif [ -n "$ANSWER_TEXT" ]; then
-          sts --arg a "$ANSWER_TEXT" '.answers += [ .pending_questions[] | . + {answer:$a} ]'
+          answer_mode="text"
         else die "pending questions — pass --answers answers.json ({qid: answer}) or --answer TEXT (same answer to all). See $RUN/questions.json"; fi
-        sts '.pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; rm -f "$RUN/questions.json"
-        # a run without a supported codemap_version gains no map-related state mutation at all
-        [ "$CODEMAP" = 1 ] && sts '.codemap_pending=null'
+        answer_parents=$(jq -c '[.pending_questions[]?.task as $t | .config.tasks[] | select(.id==$t) | (.map_parent // .id)] | unique' "$ST") || { log "could not identify tasks associated with pending answers"; exit 4; }
+        # Commit answers, scope invalidation, and checkpoint clearing atomically. In particular,
+        # do not remove the durable question file or purge reusable posts if this write fails.
+        if [ "$CODEMAP" = 1 ]; then
+          if ! sts --arg mode "$answer_mode" --argjson a "$ans" --arg text "$ANSWER_TEXT" --argjson ps "$answer_parents" \
+            'if $mode=="object" then .answers += [.pending_questions[] | . + {answer:$a[.id]}] else .answers += [.pending_questions[] | . + {answer:$text}] end
+             | (if .map_prepass_version==1 then .map_prepasses |= with_entries(. as $entry | if ($ps|index($entry.key))!=null then .value.scope_applicability="unknown after scope-changing answers" else . end) else . end)
+             | .codemap_pending=null | .pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; then
+            log "could not persist answers; pending checkpoint and posts are preserved"; exit 4
+          fi
+        else
+          if ! sts --arg mode "$answer_mode" --argjson a "$ans" --arg text "$ANSWER_TEXT" \
+            'if $mode=="object" then .answers += [.pending_questions[] | . + {answer:$a[.id]}] else .answers += [.pending_questions[] | . + {answer:$text}] end
+             | .pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; then
+            log "could not persist answers; pending checkpoint and posts are preserved"; exit 4
+          fi
+        fi
+        rm -f "$RUN/questions.json"
         # the round is redone with the answers: discard the posts of that step so nobody's earlier post is reused
         case "$(st .phase)" in exec) stag="exec$(st .round)" ;; ratify) stag="x$(st .round)" ;; *) stag="r$(st .round)" ;; esac
         rm -f "$RUN"/posts/"$(st .task_id)-$stag-"*
-        log "answers recorded — re-running task $(st .task_id) phase $(st .phase) round $(st .round) with the answers (round budget not consumed)$( [ "$CODEMAP" = 1 ] && echo "; a new code map attempt begins for this step" )" ;;
+        log "answers recorded — re-running task $(st .task_id) phase $(st .phase) round $(st .round) with the answers (round budget not consumed)$( [ "$CODEMAP" = 1 ] && echo "; a new code map attempt begins for this step" )"
+        fi
+        ;;
       failed|running|created)
         codemap_resume_check
         log "resuming task $(st '.task_id // "-"') phase $(st .phase) round $(st .round) — members with a valid post in that round are not re-run"
@@ -1210,7 +1884,9 @@ case "$CMD" in
       done) die "this run is finished (see $RUN/transcript.md)" ;;
       *) die "unknown status: $status" ;;
     esac
+    [ -z "$CONFIRM_MAPPER_FILE$MAP_DECISION_FILE" ] || [ "$status" = questions ] || { log "confirmation/decision file supplied without a pending checkpoint"; exit 4; }
     for spec in "${REPLACE[@]:-}"; do [ -n "$spec" ] && replace_member "$spec"; done
+    load_state
     render_transcript
     run_tasks ;;
 

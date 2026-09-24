@@ -24,6 +24,7 @@ figures, and avoided tool calls are never estimated.
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 STATUSES = ("current", "changed", "missing", "unreadable", "unstable")
@@ -32,6 +33,7 @@ STATUSES = ("current", "changed", "missing", "unreadable", "unstable")
 def load_run(parser):
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--trace", type=Path, default=None)
+    parser.add_argument("--prepass", action="store_true", help="report mapper pre-pass lifecycle and telemetry")
     args = parser.parse_args()
     try:
         run = args.run_dir
@@ -390,9 +392,115 @@ def report_trace(trace):
     return lines
 
 
+def report_prepass(run):
+    """Report only recorded mapper data; absent telemetry is explicitly unknown."""
+    state = _load_json(run / "state.json") or {}
+    if state.get("map_prepass_version") != 1:
+        return ["Map pre-pass: not enabled for this run."]
+    records = state.get("map_prepasses") or {}
+    if not records:
+        return ["Map pre-pass: enabled; no task records yet (usage and coverage unknown)."]
+    lines = ["Map pre-pass records: {} (every coverage claim remains unknown)".format(len(records))]
+    tasks = {t.get("id"): t for t in (state.get("config", {}).get("tasks") or []) if isinstance(t, dict)}
+    unique_sessions = {}
+    for parent, record in sorted(records.items()):
+        usage = record.get("usage") or {}
+        session = record.get("session") or "task:" + str(parent)
+        if session not in unique_sessions:
+            unique_sessions[session] = dict(usage)
+        else:
+            for field, value in usage.items():
+                if field not in unique_sessions[session] and value is not None:
+                    unique_sessions[session][field] = value
+        known = [k for k in ("input", "cache_read", "cache_write", "output", "reasoning", "cost")
+                 if isinstance(usage.get(k), (int, float)) and not isinstance(usage.get(k), bool)]
+        missing = [k for k in ("input", "cache_read", "cache_write", "output", "reasoning", "cost")
+                   if k not in known]
+        lines.append("  {}: status={}, elapsed={}s, usage_fields_known={}, usage_fields_unknown={}".format(
+            parent, record.get("status", "unknown"),
+            max(0, record.get("finished_at", 0) - record.get("started_at", 0))
+            if isinstance(record.get("finished_at"), int) and isinstance(record.get("started_at"), int) else "unknown",
+            ",".join(known) or "none", ",".join(missing) or "none"))
+        lines.append("    user review time: {}s".format(record.get("review_seconds", "unknown")))
+        lines.append("    scope applicability: {}".format(record.get("scope_applicability", "unchanged/unknown")))
+        lines.append("    dispatch/recovery/reuse: status={} session={} failure={}".format(
+            record.get("status", "unknown"), session, record.get("failure", "none")))
+        lines.append("    tool records complete: {}; usage complete: {}".format(
+            (record.get("tool_records_complete", "unknown")),
+            (record.get("telemetry_complete", "unknown"))))
+        lines.append("    coverage=unknown unless independently established from raw evidence")
+        lines.append("    usage values: " + (json.dumps({k: usage[k] for k in known}, sort_keys=True) if known else "UNKNOWN"))
+        coverage = _load_json(Path((record.get("artifacts") or {}).get("coverage", "")))
+        if coverage:
+            lines.append("    coverage status: {} (coverage={})".format(record.get("status", "unknown"),
+                          coverage.get("coverage", "unknown")))
+            statuses = ["{}={}".format(x.get("path", "?"), x.get("status", "unknown"))
+                        for x in coverage.get("capture_statuses", []) if isinstance(x, dict)]
+            lines.append("    capture statuses: {}".format(", ".join(statuses) if statuses else "none recorded"))
+            failed = [x.get("path", "?") for x in coverage.get("capture_statuses", [])
+                      if isinstance(x, dict) and x.get("status") != "ok"]
+            if failed:
+                lines.append("    inadequate capture selectors: {}".format(", ".join(sorted(set(failed)))))
+            failures = coverage.get("resource_schema_failures") or []
+            if failures:
+                lines.append("    mapper schema/resource failures: {}".format("; ".join(str(x) for x in failures)))
+        task = tasks.get(parent, {})
+        if not task:
+            artifact_dir = (record.get("artifacts") or {}).get("directory")
+            input_record = _load_json(Path(artifact_dir) / "input.json") if artifact_dir else None
+            task = (input_record or {}).get("original_task", {})
+        task_text = task.get("text", "")
+        named = set(re.findall(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|sh|js|jsx|ts|tsx|go|rs|java|md|json|ya?ml|toml|ini|cfg|html|css)", task_text))
+        selector_path = Path((record.get("artifacts") or {}).get("selectors", ""))
+        selectors = _load_json(selector_path) or []
+        selected_paths = {x.get("path") for x in selectors if isinstance(x, dict)}
+        missing_named = sorted(p for p in named if p not in selected_paths)
+        if missing_named:
+            lines.append("    inadequate seed: explicitly named task locations not selected: {}".format(", ".join(missing_named)))
+        lines.append("    omitted relevant dependencies: UNKNOWN unless independently verified; an outside read alone is not proof")
+        lines.append("    retries/escalations: none by policy; completion telemetry is not a recall measure")
+    token_fields = ("input", "cache_read", "cache_write", "output", "reasoning")
+    mapper_components = [value for usage in unique_sessions.values() for field in token_fields
+                         for value in [usage.get(field)]
+                         if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    mapper_costs = [usage.get("cost") for usage in unique_sessions.values()
+                    if isinstance(usage.get("cost"), (int, float)) and not isinstance(usage.get("cost"), bool)]
+    missing_mapper_tokens = [session for session, usage in unique_sessions.items()
+                             if any(not isinstance(usage.get(field), (int, float)) or isinstance(usage.get(field), bool)
+                                    for field in token_fields)]
+    missing_mapper_costs = [session for session, usage in unique_sessions.items()
+                            if not isinstance(usage.get("cost"), (int, float)) or isinstance(usage.get("cost"), bool)]
+    member_token_values, member_cost_values = [], []
+    for member in state.get("members", []):
+        if not isinstance(member, dict):
+            continue
+        tokens = [member.get("session_tokens")] + [x.get("tokens") for x in member.get("retired", []) if isinstance(x, dict)]
+        costs = [member.get("session_cost")] + [x.get("cost") for x in member.get("retired", []) if isinstance(x, dict)]
+        member_token_values.extend(x for x in tokens if isinstance(x, (int, float)) and not isinstance(x, bool))
+        member_cost_values.extend(x for x in costs if isinstance(x, (int, float)) and not isinstance(x, bool))
+    member_tokens = sum(member_token_values)
+    member_cost = sum(member_cost_values)
+    mapper_tokens = sum(mapper_components)
+    mapper_cost = sum(mapper_costs)
+    lines.append("Member subtotal: {} known tokens; cost_usd={} known components".format(
+        member_tokens, member_cost if member_cost_values else "UNKNOWN"))
+    lines.append("Map pre-pass subtotal: {} known tokens across {} unique session(s); cost_usd={} known components; token usage unknown for {}; cost unknown for {}".format(
+        mapper_tokens, len(unique_sessions), mapper_cost if mapper_costs else "UNKNOWN",
+        ",".join(missing_mapper_tokens) or "none", ",".join(missing_mapper_costs) or "none"))
+    lines.append("RUN TOTAL (known components): {} known tokens; cost_usd={} known components".format(
+        member_tokens + mapper_tokens,
+        (member_cost + mapper_cost) if member_cost_values or mapper_costs else "UNKNOWN"))
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0], usage="%(prog)s <run-dir> [--trace FILE]")
     run, index, trace = load_run(parser)
+    if parser.parse_args().prepass:
+        print("### Map pre-pass accounting")
+        for line in report_prepass(run):
+            print(line)
+        return
     print("### Code map (source-attributed evidence coverage)")
     for line in report_index(index, run):
         print(line)

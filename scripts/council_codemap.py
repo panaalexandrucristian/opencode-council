@@ -379,7 +379,7 @@ def _capture_once_inner(root, rel_path, counters):
 
 class CaptureResult:
     def __init__(self, status, resolved_path=None, data=None, sha256=None, size=None,
-                 bytes_read=0, bytes_hashed=0, reason=None, attempts=0):
+                 bytes_read=0, bytes_hashed=0, reason=None, attempts=0, identity=None):
         self.status = status  # "ok" | "unstable" | "error"
         self.resolved_path = resolved_path
         self.data = data
@@ -389,6 +389,7 @@ class CaptureResult:
         self.bytes_hashed = bytes_hashed  # only the bytes actually fed to sha256
         self.reason = reason
         self.attempts = attempts
+        self.file_identity = identity
 
 
 # Definite, deterministic outcomes: retrying cannot change the verdict, so they short-circuit
@@ -436,7 +437,8 @@ def bounded_capture(root, rel_path):
                 and first.identity() == second.identity():
             return CaptureResult("ok", resolved_path=first.resolved, data=first.data,
                                  sha256=first.sha256, size=len(first.data),
-                                 bytes_read=bytes_read, bytes_hashed=bytes_hashed, attempts=used)
+                                 bytes_read=bytes_read, bytes_hashed=bytes_hashed, attempts=used,
+                                 identity=first.identity())
         last_reason = "inconsistent"
     return CaptureResult("unstable", reason=last_reason or "unstable", bytes_read=bytes_read,
                          bytes_hashed=bytes_hashed, attempts=used)
@@ -1661,8 +1663,17 @@ LOCATOR_INSTRUCTION = (
     "missing text from a hash."
 )
 
+PREPASS_INSTRUCTION = (
+    "This is a shared, incomplete navigation aid, not an exhaustive scope boundary or verified interpretation. "
+    "You can access the entire map, including other subtasks' regions. Inspect raw evidence for each directory "
+    "fact you rely on. Independently check the task's named locations and acceptance surfaces, and follow relevant "
+    "dependencies beyond suggested ranges. Missing, stale, unclear, or disputed evidence requires source inspection. "
+    "A reader name, inspection label, hash, or another agent's conclusion is not your verification. Absence means "
+    "UNKNOWN COVERAGE. Reporting additional reads in code_reads is optional. Produce your own complete first-round proposal."
+)
 
-def render_locator(view_path, snapshot_id, num_sources, run_dir_arg):
+
+def render_locator(view_path, snapshot_id, num_sources, run_dir_arg, prepass=False, coverage_path=None):
     example = {"paths": ["example/path.py"], "include_evidence": True}
     example_json = json.dumps(example)
     self_path = str(Path(__file__).resolve())
@@ -1676,6 +1687,8 @@ def render_locator(view_path, snapshot_id, num_sources, run_dir_arg):
         "indexed source versions: {}".format(num_sources),
         "example lookup: {}".format(cmd),
         LOCATOR_INSTRUCTION,
+        *(["Map pre-pass coverage (coverage remains unknown; artifact is informational): {}".format(coverage_path),
+           PREPASS_INSTRUCTION] if prepass else []),
         "Current-source use is limited to entries marked current_at_snapshot in this step's view; "
         "other evidence is historical or unavailable.",
         "=== END CODE MAP ===",
@@ -1846,11 +1859,37 @@ def cmd_ingest(args):
                 results.append({"path": display_path, "status": cap.status, "reason": cap.reason})
                 continue
             byte_range = item.get("byte_range")
+            line_range = item.get("lines")
+            if args.capture_lines and line_range is not None and byte_range is not None:
+                index_obj["diagnostics"].append({"code": "conflicting_capture_ranges", "path": display_path,
+                                                  "reason": "lines and byte_range cannot both be supplied"})
+                results.append({"path": display_path, "status": "error", "reason": "conflicting_ranges"})
+                continue
+            if line_range is not None and not args.capture_lines:
+                index_obj["diagnostics"].append({"code": "line_capture_disabled", "path": display_path,
+                                                  "reason": "line selectors require --capture-lines"})
+                results.append({"path": display_path, "status": "error", "reason": "line_capture_disabled"})
+                continue
+            if args.capture_lines and line_range is not None:
+                try:
+                    if not (isinstance(line_range, list) and len(line_range) == 2):
+                        raise ValueError("lines must be a two-item inclusive [first,last] pair")
+                    byte_range = list(line_range_to_bytes(cap.data, line_range[0], line_range[1]))
+                except (ValueError, TypeError) as exc:
+                    index_obj["diagnostics"].append({"code": "invalid_capture_lines", "path": display_path,
+                                                      "reason": str(exc)})
+                    results.append({"path": display_path, "status": "error", "reason": str(exc)})
+                    continue
             if byte_range is None:
                 byte_range = [0, len(cap.data)]
             if not (isinstance(byte_range, list) and len(byte_range) == 2
                     and all(isinstance(x, int) and not isinstance(x, bool) for x in byte_range)
                     and 0 <= byte_range[0] <= byte_range[1] <= len(cap.data)):
+                if args.capture_lines:
+                    index_obj["diagnostics"].append({"code": "invalid_capture_range", "path": display_path,
+                                                      "reason": "invalid byte_range"})
+                    results.append({"path": display_path, "status": "error", "reason": "invalid_byte_range"})
+                    continue
                 raise RequestError("invalid byte_range for {}".format(display_path))
             entry_id = compute_entry_id(root, display_path, cap.resolved_path, cap.sha256, byte_range)
             excerpt = cap.data[byte_range[0]:byte_range[1]]
@@ -1985,6 +2024,29 @@ def cmd_lookup(args):
         # One authoritative frozen view. Naming another snapshot, or another task/step, cannot
         # widen what this step may read — in particular it cannot escape round 1's raw-only view.
         if wanted_snapshot and wanted_snapshot != act_meta["view_snapshot_id"]:
+            historical = False
+            try:
+                state = json.loads((Path(args.run_dir) / "state.json").read_text(encoding="utf-8"))
+                task = next((t for t in state.get("config", {}).get("tasks", []) if t.get("id") == act_meta["task"]), {})
+                parent = task.get("map_parent", act_meta["task"])
+                record = state.get("map_prepasses", {}).get(parent, {})
+                historical = (state.get("phase") in ("exec", "ratify")
+                              and wanted_snapshot in (record.get("seed_snapshot_id"),
+                                                      record.get("historical_snapshot_id")))
+            except (OSError, ValueError, TypeError):
+                pass
+            if historical:
+                seed_path = store.base / "seed-views" / (wanted_snapshot + ".json")
+                try:
+                    view = json.loads(seed_path.read_bytes())
+                except (OSError, ValueError):
+                    print(json.dumps(unavailable(wanted_snapshot, "unavailable_snapshot")))
+                    return 0
+                if sha256_hex(canonical_json(view)) != wanted_snapshot or view.get("raw_only") is not True:
+                    print(json.dumps(unavailable(wanted_snapshot, "unavailable_snapshot")))
+                    return 0
+                print(json.dumps(do_lookup(store, view, wanted_snapshot, request)))
+                return 0
             print(json.dumps(unavailable(act_meta["view_snapshot_id"], "unavailable_for_this_step")))
             return 0
         if (args.task or args.step) and (args.task != act_meta["task"] or args.step != act_meta["step"]):
@@ -2000,7 +2062,17 @@ def cmd_lookup(args):
         # own advertised command.
         attempt_id, meta = find_attempt_by_view_snapshot(store, wanted_snapshot)
         if attempt_id is None:
-            print(json.dumps(unavailable(wanted_snapshot, "unavailable_snapshot")))
+            seed_path = store.base / "seed-views" / (wanted_snapshot + ".json")
+            try:
+                raw = seed_path.read_bytes()
+                view = json.loads(raw)
+            except (OSError, ValueError):
+                print(json.dumps(unavailable(wanted_snapshot, "unavailable_snapshot")))
+                return 0
+            if sha256_hex(canonical_json(view)) != wanted_snapshot or view.get("raw_only") is not True:
+                print(json.dumps(unavailable(wanted_snapshot, "unavailable_snapshot")))
+                return 0
+            print(json.dumps(do_lookup(store, view, wanted_snapshot, request)))
             return 0
         view = load_view_verified(store, attempt_id, meta)
         print(json.dumps(do_lookup(store, view, meta["view_snapshot_id"], request)))
@@ -2021,7 +2093,33 @@ def cmd_locator(args):
     meta = load_meta(store, attempt_id)
     view_path = store.attempt_dir(attempt_id) / "view.json"
     view = load_view_verified(store, attempt_id, meta)
-    print(render_locator(str(view_path), meta["view_snapshot_id"], len(view["sources"]), args.run_dir))
+    prepass = False
+    coverage_path = None
+    try:
+        state = json.loads((Path(args.run_dir) / "state.json").read_text(encoding="utf-8"))
+        prepass = state.get("map_prepass_version") == 1 and state.get("config", {}).get("map_code") is True
+        task = next((t for t in state.get("config", {}).get("tasks", []) if t.get("id") == args.task), {})
+        parent = task.get("map_parent", args.task)
+        record = state.get("map_prepasses", {}).get(parent, {})
+        coverage_path = (record.get("artifacts") or {}).get("coverage")
+    except (OSError, ValueError, TypeError):
+        pass
+    print(render_locator(str(view_path), meta["view_snapshot_id"], len(view["sources"]), args.run_dir,
+                         prepass=prepass, coverage_path=coverage_path or "unavailable"))
+    return 0
+
+
+def cmd_seed_locator(args):
+    """Create a durable, raw-only locator over the complete pre-pass seed map."""
+    store = Store(args.run_dir)
+    store.ensure_dirs()
+    view = raw_projection(store.load_index())
+    sid = sha256_hex(canonical_json(view))
+    d = store.base / "seed-views"
+    d.mkdir(parents=True, exist_ok=True)
+    write_content_addressed(d / (sid + ".json"), canonical_json(view))
+    print(render_locator(str(d / (sid + ".json")), sid, len(view["sources"]), args.run_dir,
+                         prepass=True, coverage_path=args.coverage or "unavailable"))
     return 0
 
 
@@ -2033,6 +2131,8 @@ def build_parser():
     i.add_argument("--run-dir", required=True)
     i.add_argument("--dir", help="config.dir (real project root); required unless staging only")
     i.add_argument("--capture-json")
+    i.add_argument("--capture-lines", action="store_true",
+                   help="interpret per-item lines selectors against the exact captured bytes")
     i.add_argument("--task")
     i.add_argument("--step")
     i.add_argument("--mode", choices=["stage", "publish"])
@@ -2059,6 +2159,10 @@ def build_parser():
     lc.add_argument("--run-dir", required=True)
     lc.add_argument("--task", required=True)
     lc.add_argument("--step", required=True)
+
+    seedloc = sub.add_parser("seed-locator")
+    seedloc.add_argument("--run-dir", required=True)
+    seedloc.add_argument("--coverage")
 
     return p
 
@@ -2093,6 +2197,8 @@ def main(argv=None):
             return cmd_lookup(args)
         if args.command == "locator":
             return cmd_locator(args)
+        if args.command == "seed-locator":
+            return cmd_seed_locator(args)
         raise RequestError("unknown command")
     except RequestError as exc:
         print("council_codemap: {}".format(exc), file=sys.stderr)
