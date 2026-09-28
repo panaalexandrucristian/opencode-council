@@ -3,3 +3,4 @@
 /council-run*/
 /run*/
 /answers*.json
+__pycache__/
