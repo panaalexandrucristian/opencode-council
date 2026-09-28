@@ -43,6 +43,7 @@ codemap_report = load("codemap_report")
 cm = load_scripts("council_codemap")
 map_prepass = load_scripts("council_map_prepass")
 splitcheck = load_scripts("council_splitcheck")
+handoff = load("handoff_test")
 
 EM = "—"  # the em dash council.sh puts in every task header
 TAIL_RULE = "Nothing may follow the JSON tail.\n"
@@ -2932,6 +2933,272 @@ class PrepassOmissionReportTests(unittest.TestCase):
             self.assertIn("omitted relevant dependencies: UNKNOWN unless independently verified; an outside read alone is not proof",text)
             self.assertIn("coverage=unknown unless independently established from raw evidence",text)
             self.assertNotIn("src/a.py not selected",text)
+
+
+FAKE_RULES = {
+    "gap_spans": None,  # set below: the kit's checklist rule, reproduced for offline tests
+    "SHA": __import__("re").compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,40}(?![0-9A-Za-z])"),
+    "BANNER": "> BANNER",
+    "GAP_HEAD": "## ⚠️ Gaps flagged by the self-test",
+}
+GAP_TITLE = FAKE_RULES["GAP_HEAD"] + " (not auto-fixable)"
+GAP_INTRO = "No answer was found."
+
+
+def _gap_spans(s):
+    spans, start, pos = [], None, 0
+    for line in s.splitlines(True):
+        body = line.rstrip("\r\n")
+        if start is not None and not (body == GAP_INTRO or body.startswith("- [ ] ") or not body):
+            spans.append((start, pos))
+            start = None
+        if start is None and body in (FAKE_RULES["GAP_HEAD"], GAP_TITLE):
+            start = pos
+        pos += len(line)
+    if start is not None:
+        spans.append((start, len(s)))
+    return spans
+
+
+FAKE_RULES["gap_spans"] = _gap_spans
+S4 = "a runnable verification block (python3 - <<'PY' ... PY)"
+
+
+def checklist(items, nl="\n"):
+    return nl + GAP_TITLE + nl + nl + GAP_INTRO + nl + nl + "".join("- [ ] %s%s" % (i, nl) for i in items)
+
+
+def kit_output(entries, rc=None):
+    """entries: {section: [(kind, msg)]} -> text in the kit's format and its exit code."""
+    lines, n = [], {"ok": 0, "FAIL": 0, "GAP": 0, "skip": 0}
+    for sec in "12345":
+        lines.append("== %s. section ==" % sec)
+        for k, m in entries.get(sec, []):
+            lines.append("  %-5s %s" % (k, m))
+            n[k] += k in n
+    lines += ["", "result: %d ok · %d fact failures · %d coverage gaps · %d skipped" % (n["ok"], n["FAIL"], n["GAP"], n["skip"])]
+    want = 1 if n["FAIL"] else 2 if n["GAP"] else 0
+    return "\n".join(lines) + "\n", want if rc is None else rc
+
+
+class HandoffBlocksTests(unittest.TestCase):
+    NOTE = ("# Note\r\nintro é\r\npython3 - <<'PY'\r\nprint(1)\r\nPY\r\nbetween\r\n"
+            "run: python3 - <<'PY'\r\nprint('ü')\r\nPY\r\ntail\r\n")
+
+    def test_strip_removes_every_block_and_keeps_offsets(self):
+        stripped, keep = handoff.strip_blocks(self.NOTE)
+        self.assertNotIn("python3 - <<'PY'", stripped)
+        self.assertEqual("".join(self.NOTE[k] for k in keep), stripped)
+        self.assertEqual(len(handoff.removed_spans(len(self.NOTE), keep)), 2)
+
+    def test_map_back_restores_blocks_byte_for_byte_with_an_appended_checklist(self):
+        stripped, keep = handoff.strip_blocks(self.NOTE)
+        fixed = stripped + checklist(["the deliverable"], "\r\n")
+        out = handoff.map_back(self.NOTE, stripped, keep, fixed)
+        self.assertEqual(out, self.NOTE + checklist(["the deliverable"], "\r\n"))
+
+    def test_map_back_applies_an_in_line_edit_away_from_blocks(self):
+        stripped, keep = handoff.strip_blocks(self.NOTE)
+        out = handoff.map_back(self.NOTE, stripped, keep, stripped.replace("intro é", "intro è"))
+        self.assertEqual(out, self.NOTE.replace("intro é", "intro è"))
+
+    def test_map_back_refuses_an_edit_on_a_line_holding_a_block(self):
+        stripped, keep = handoff.strip_blocks(self.NOTE)
+        with self.assertRaises(handoff.Failure):
+            handoff.map_back(self.NOTE, stripped, keep, stripped.replace("run: \r\n", "RUN: \r\n"))
+
+    def test_no_block_means_the_fixed_text_is_delivered_as_is(self):
+        stripped, keep = handoff.strip_blocks("plain\n")
+        self.assertEqual(handoff.map_back("plain\n", stripped, keep, "plain\nmore\n"), "plain\nmore\n")
+
+
+class HandoffSpanTests(unittest.TestCase):
+    FACTS = "# N\n\nBranch b at abc1234.\ntool v1.2.3 installed\nother 1.2.3, blob deadbeef, 1234567 rows.\n"
+
+    def auth(self, text, edits=(), banner=False):
+        """The authorization for a kit plan naming these (old, new) tokens by their first offset."""
+        stripped, keep = handoff.strip_blocks(text)
+        plan = {"edits": [[stripped.index(o), stripped.index(o) + len(o), n, "probe"] for o, n in edits], "banner": banner}
+        return handoff.authorize(text, stripped, keep, plan, FAKE_RULES)
+
+    def test_planned_sha_and_version_spans_and_the_checklist_are_authorized(self):
+        after = self.FACTS.replace("abc1234", "def5678").replace("v1.2.3", "v1.3.0") + checklist(["x"])
+        ok, edits = handoff.preserved(self.FACTS, after, FAKE_RULES, self.auth(self.FACTS, [("abc1234", "def5678"), ("v1.2.3", "v1.3.0")]))
+        self.assertTrue(ok)
+        self.assertEqual(edits, ["abc1234 -> def5678 at original 17..24 (probe)", "v1.2.3 -> v1.3.0 at original 31..37 (probe)"])
+
+    def test_checklist_only_needs_no_authorization(self):
+        self.assertEqual(handoff.preserved(self.FACTS, self.FACTS + checklist(["x"]), FAKE_RULES), (True, []))
+
+    def test_unselected_version_change_is_refused(self):
+        self.assertFalse(handoff.preserved(self.FACTS, self.FACTS.replace("other 1.2.3", "other 9.9.9"), FAKE_RULES)[0])
+
+    def test_unrelated_hex_identifier_change_is_refused(self):
+        self.assertFalse(handoff.preserved(self.FACTS, self.FACTS.replace("deadbeef", "abcdefab"), FAKE_RULES)[0])
+
+    def test_numeric_claim_change_is_refused(self):
+        self.assertFalse(handoff.preserved(self.FACTS, self.FACTS.replace("1234567", "7654321"), FAKE_RULES)[0])
+
+    def test_an_authorized_span_does_not_authorize_a_same_shaped_token_elsewhere(self):
+        auth = self.auth(self.FACTS, [("v1.2.3", "v1.3.0")])
+        after = self.FACTS.replace("v1.2.3", "v1.3.0").replace("other 1.2.3", "other 1.3.0")
+        self.assertFalse(handoff.preserved(self.FACTS, after, FAKE_RULES, auth)[0])
+        wrong = self.FACTS.replace("v1.2.3", "v9.9.9")  # the right span, a value the kit did not plan
+        self.assertFalse(handoff.preserved(self.FACTS, wrong, FAKE_RULES, auth)[0])
+
+    def test_the_banner_needs_its_precondition(self):
+        after = self.FACTS.replace("# N\n\n", "# N\n\n> BANNER\n\n")
+        self.assertFalse(handoff.preserved(self.FACTS, after, FAKE_RULES)[0])
+        ok, edits = handoff.preserved(self.FACTS, after, FAKE_RULES, self.auth(self.FACTS, banner=True))
+        self.assertEqual((ok, edits), (True, ["banner inserted at original 5"]))
+
+    def test_authorized_spans_are_mapped_back_across_removed_blocks(self):
+        text = "# N\r\n\r\npython3 - <<'PY'\r\nprint('abc1234')\r\nPY\r\nBranch b at abc1234.\r\n"
+        auth = self.auth(text, [("abc1234", "def5678")], banner=True)
+        e = auth["edits"][0]
+        self.assertEqual(text[e["original"][0]:e["original"][1]], "abc1234")
+        self.assertGreater(e["original"][0], text.index("PY\r\nBranch"))  # the real line, not the block
+        self.assertEqual(auth["banner"]["text"], "> BANNER\r\n\r\n")
+        after = handoff.apply(text, auth, "original")
+        self.assertEqual(after, "# N\r\n\r\n> BANNER\r\n\r\npython3 - <<'PY'\r\nprint('abc1234')\r\nPY\r\nBranch b at def5678.\r\n")
+        self.assertTrue(handoff.preserved(text, after, FAKE_RULES, auth)[0])
+
+    def test_any_prose_byte_outside_the_spans_is_refused(self):
+        self.assertFalse(handoff.preserved("hello\n", "Hello\n" + checklist(["x"]), FAKE_RULES)[0])
+        self.assertFalse(handoff.preserved("a\r\nb\r\n", "a\nb\r\n", FAKE_RULES)[0])
+
+    def test_section4_entry_dropped_and_an_empty_checklist_removed(self):
+        s = "body\n" + checklist(["the deliverable", S4])
+        out, n = handoff.drop_items(s, {S4}, FAKE_RULES)
+        self.assertEqual((out, n), ("body\n" + checklist(["the deliverable"]), 1))
+        out, n = handoff.drop_items("body\n" + checklist([S4]), {S4}, FAKE_RULES)
+        self.assertEqual((out, n), ("body\n", 1))
+
+
+class HandoffParseTests(unittest.TestCase):
+    def test_section4_gap_does_not_count(self):
+        text, rc = kit_output({"1": [("ok", "a.md")], "4": [("GAP", S4)]})
+        r = handoff.parse(text, rc)
+        self.assertEqual((r["raw_rc"], r["effective_rc"], r["section4_gaps"]), (2, 0, [S4]))
+
+    def test_failures_and_gaps_are_kept(self):
+        text, rc = kit_output({"1": [("FAIL", "unresolvable: x.md")], "4": [("GAP", S4)], "5": [("GAP", "the deliverable")]})
+        r = handoff.parse(text, rc)
+        self.assertEqual((r["effective_rc"], r["gaps"], r["failures"]), (1, ["the deliverable"], ["unresolvable: x.md"]))
+
+    def test_contract_violations_are_operational_failures(self):
+        good, rc = kit_output({"1": [("ok", "a")]})
+        bad = [
+            (good.replace("== 3. section ==\n", ""), rc),                      # missing section
+            (good.replace("result:", "summary:"), rc),                          # no result line
+            (good.replace("1 ok", "2 ok"), rc),                                 # counts disagree
+            (good, 1),                                                          # exit disagrees
+            (good, 5),                                                          # exit outside 0..3
+            ("nothing like the kit\n", 0),
+        ]
+        for text, code in bad:
+            with self.assertRaises(handoff.Failure, msg=text[:40]):
+                handoff.parse(text, code)
+
+    def test_probable_false_positives_are_classified(self):
+        fps = handoff.false_positives(["unresolvable: PYTHONDONTWRITEBYTECODE=1 python3 scripts/x.py",
+                                       "unresolvable:  M SKILL.md", "unresolvable: ?? new.md",
+                                       "unresolvable: docs/real.md", "branch head drifted"])
+        self.assertEqual([f["kind"] for f in fps], ["environment assignment + command", "git-status prefix", "git-status prefix"])
+
+
+class HandoffLocateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.kit = os.path.join(self.tmp, "kit")
+        os.mkdir(self.kit)
+        for f in ("handoff-test.sh", "handoff-fix.py"):
+            Path(self.kit, f).write_text("")
+
+    def test_precedence_field_env_default(self):
+        self.assertEqual(handoff.locate(None, self.kit, {"HANDOFF_TEST_KIT": "/x"}, "/y")[:2], (self.kit, "council.json handoff_kit"))
+        self.assertEqual(handoff.locate(None, None, {"HANDOFF_TEST_KIT": self.kit}, "/y")[:2], (self.kit, "HANDOFF_TEST_KIT"))
+        self.assertEqual(handoff.locate(None, None, {}, self.kit)[:2], (self.kit, "default"))
+        self.assertEqual(handoff.locate(self.kit, "/x", {}, "/y")[:2], (self.kit, "--kit"))
+
+    def test_an_invalid_explicit_source_never_falls_back(self):
+        kit, _, why = handoff.locate(None, "/nope", {"HANDOFF_TEST_KIT": self.kit}, self.kit)
+        self.assertIsNone(kit)
+        self.assertIn("council.json handoff_kit=/nope is not a directory (no fallback)", why)
+        kit, _, why = handoff.locate(None, None, {"HANDOFF_TEST_KIT": ""}, self.kit)
+        self.assertIn("HANDOFF_TEST_KIT is set but empty", why)
+
+    def test_missing_sibling_and_missing_default_are_named(self):
+        os.remove(os.path.join(self.kit, "handoff-fix.py"))
+        self.assertIn("lacks handoff-fix.py", handoff.locate(None, self.kit, {}, "/y")[2])
+        self.assertTrue(handoff.locate(None, None, {}, os.path.join(self.tmp, "none"))[2].startswith("kit not found:"))
+
+    def test_replay_without_a_kit_is_a_named_error(self):
+        corpus = os.path.join(self.tmp, "corpus")
+        os.mkdir(corpus)
+        Path(corpus, "index.json").write_text("[]")
+        r = subprocess.run([sys.executable, str(HERE / "handoff_replay.py"), corpus, "--kit", os.path.join(self.tmp, "none")],
+                           capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("kit not found", r.stderr)
+
+
+REAL_KIT, _, REAL_KIT_WHY = handoff.locate()
+
+
+@unittest.skipUnless(REAL_KIT, "real-kit contract tests skipped: %s" % REAL_KIT_WHY)
+class HandoffRealKitContractTests(unittest.TestCase):
+    """Run only when the real handoff-test-kit is found; otherwise skipped with the named reason."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        Path(self.tmp, "proj").mkdir()
+        Path(self.tmp, "proj", "a.md").write_text("x\n")
+
+    def member(self, text, user_config=None):
+        note = Path(self.tmp, "raw", "handover-g1-A.md")
+        note.parent.mkdir(exist_ok=True)
+        note.write_bytes(text.encode())
+        return handoff.check_member(str(note), str(Path(self.tmp, "proj")), self.tmp, str(Path(self.tmp, "handoff")),
+                                    kit_arg=REAL_KIT, user_config=user_config,
+                                    deadline=__import__("time").time() + 60), note
+
+    def test_the_real_kit_plans_only_the_selected_version_and_it_is_delivered(self):
+        for v in ("1.2.3", "1.3.0"):
+            Path(self.tmp, "proj", "tool", v).mkdir(parents=True)
+        Path(self.tmp, "proj", "hc.json").write_text(json.dumps(
+            {"version_probes": [{"name": "tool", "dir": "tool", "handoff_pattern": r"tool version (\S+)"}]}))
+        text = "# N\n\nSee `a.md`. tool version 1.2.3 is installed; the other lib is 1.2.3, blob deadbeef.\n"
+        res, _ = self.member(text, "hc.json")
+        self.assertEqual(res["status"], "fixed", res.get("reason"))
+        auth = res["fix"]["authorization"]
+        self.assertEqual([(e["old"], e["new"]) for e in auth["edits"]], [("1.2.3", "1.3.0")])
+        self.assertIsNone(auth["banner"])
+        out = Path(res["delivered"]).read_text()
+        self.assertTrue(out.startswith(text.replace("tool version 1.2.3", "tool version 1.3.0")), out)
+        self.assertIn("the other lib is 1.2.3, blob deadbeef.", out)
+
+    def test_the_real_output_matches_the_contract_and_section4_is_not_applicable(self):
+        res, _ = self.member("See `a.md`. The deliverable is X. Never do Y. Next step: Z.\n")
+        self.assertIn(res["status"], ("passed", "fixed", "failed"), res.get("reason"))
+        self.assertEqual(res["before"]["section4_entries"], ["GAP"])
+        self.assertNotIn(S4, res["before"]["gaps"])
+
+    def test_the_real_fix_is_mapped_back_without_a_verification_entry(self):
+        text = "# N\n\nSee `a.md`.\npython3 - <<'PY'\nraise SystemExit(7)\nPY\nend\n"
+        res, note = self.member(text)
+        self.assertEqual(res["status"], "fixed", res.get("reason"))
+        self.assertEqual(res["before"]["section4_entries"], ["GAP"])  # the block (exit 7) was never run
+        out = Path(res["delivered"]).read_text()
+        self.assertTrue(out.startswith(text))
+        self.assertNotIn("runnable verification block", out)
+        self.assertTrue(res["fix"]["outside_preserved"])
+        self.assertEqual(note.read_text(), text)
+        self.assertEqual(res["fix"]["authorization"], {"edits": [], "banner": None})  # generated config: no fact probes
+        rules = handoff.kit_rules(REAL_KIT)
+        self.assertTrue(handoff.preserved(text, out, rules, res["fix"]["authorization"])[0])
 
 
 if __name__ == "__main__":

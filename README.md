@@ -9,7 +9,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | `SKILL.md` | the skill Claude Code loads (`/opencode …`): workflow, permissions, the council checklist |
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
-| `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit |
+| `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit; `handoff_test.py` (the adapter to the external handoff-test-kit) and `handoff_replay.py` (its replay over a corpus of real handovers) |
 | `reference.md` | OpenCode HTTP endpoint notes |
 | `.claude-plugin/` | plugin + marketplace manifests, so the repo installs with `/plugin install` |
 | `examples/` | a real end-to-end run (config, answers, console output, transcript) |
@@ -171,11 +171,106 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `bash scripts/test-completion.sh` — 1280 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (192 Python standard-library unittest cases for the analysis tools).
+- **Tests.** `bash scripts/test-completion.sh` — 1369 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (218 Python standard-library unittest cases for the analysis tools and the handoff-test adapter).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
+
+## Handoff tests (external handoff-test-kit)
+
+Handover documents are tested with the external [handoff-test-kit](https://github.com/panaalexandrucristian/handoff-test-kit).
+The kit is a dependency, not part of this repository: it is never copied, vendored or added as a submodule, and
+its code is never changed from here. Any revision is accepted; its output is checked against the kit's contract
+(`== 1.` … `== 5.` section headers, one `result:` line whose counts match the entries, exit 0..3) and anything
+else is an operational error, never a pass. The kit revision (`git rev-parse HEAD`, if available) is recorded
+with every result.
+
+**Where the kit is looked for.** `council.json` field `handoff_kit` (a kit directory; relative = relative to
+`dir`) > environment variable `HANDOFF_TEST_KIT` (directory) > `/Users/apana/dev/handoff-test-kit`, used only
+if it exists. A directory is a kit only if it holds both `handoff-test.sh` and `handoff-fix.py`. An explicitly
+set field or variable that is invalid gives a named skip (`kit not found: …`) and never falls back to a later
+source. No kit found is a named skip, never a pass.
+
+**Member handover notes (automatic).** After `do_handover` writes `D/raw/handover-g<N>-<ID>.md` and before the
+successor sees it, the orchestrator runs `scripts/ptools/handoff_test.py`:
+
+- The raw note stays byte-identical. The kit runs on a copy, `D/handoff/handover-g<N>-<ID>.stage.md`, with a
+  generated config (`D/handoff/…config.json`): `repo_root` = `dir`, `path_bases` = [`D`], the kit's generic
+  topics, no assertions/external/version probes. Optional `handoff_config` (a path to your own kit config,
+  relative = relative to `dir`) **replaces** the generated config; if it has no `repo_root`, `dir` is used, and
+  a relative `repo_root` is resolved from that config file's directory, as the kit does. `HANDOFF_TEST_CONFIG`
+  is not passed to the kit: the config is always named explicitly.
+- **Section 4 is not applicable to member notes.** Section 4 *executes* the first `python3 - <<'PY' … PY` block of
+  a document. Every such block is removed from the copy (the copy is re-checked with the kit's own regex before
+  the kit runs), so nothing from a member's note is ever executed. The section-4 gap does not count toward the
+  note's verdict: the result records the kit's raw exit and an *effective* exit without it.
+- If the effective verdict is 1 (facts drifted) or 2 (coverage gap), the kit runs with `--fix` on the copy.
+  The section-4 entry is removed from the generated `## ⚠️ Gaps flagged by the self-test` checklist (a checklist
+  left empty is removed), the repair is mapped back onto the ORIGINAL bytes — python blocks restored
+  byte-for-byte where they were — and the result must equal the original with exactly the repair the kit
+  authorizes, outside its checklist. Before `--fix` runs, the adapter asks the kit's own fixer
+  (`handoff-fix.py`: `load_config`, `validate`, `facts`, `plan_edits`, with the same config and copy, inside the
+  budget) which spans it may rewrite and with which values (a SHA token on a line naming the configured
+  branch/MR that is a real commit, a version captured by a selected probe), and whether its banner precondition
+  holds (branch merged, no banner yet). Those spans, mapped to original offsets, and the banner are recorded in
+  `result.json` (`fix.authorization`); any other change, including a same-shaped SHA, version or number
+  anywhere else, is refused. With the generated config nothing is authorized but the checklist. The successor then receives
+  `D/handoff/handover-g<N>-<ID>.fixed.md`, even when findings remain after the repair (they need a human; the
+  checklist says so). A repair that cannot be mapped back exactly, or that touches any other byte, is refused and
+  the original is delivered.
+- `D/handoff/` keeps, per note, the kit's stdout/stderr for the check and the fix, the unified diff of the
+  delivered repair and `<stem>.result.json`. The kit's `.bak-*` file (a copy of the staged copy) is deleted.
+- One budget, `handoff_timeout_s` (default 60 s), covers check + `--fix` + recheck, enforced with the same
+  deadline-and-kill loop the orchestrator uses for a Claude member call; the kit runs in its own process group,
+  killed as a whole.
+- **It never blocks the council.** No kit, an invalid setting, kit exit 3, unrecognised output, a refused
+  repair, a timeout or a crash of the adapter: the reason is logged and the original note is delivered.
+- Every result goes to `state.json` (`handoff_tests[]`, with task, member and generation), to the run log and to
+  a **Handoff tests** table in `D/transcript.md` and in `council.sh report`. Paths the kit could not resolve that
+  look like a command with an environment assignment (`NAME=value cmd …`) or a git-status line (`M `, `A `,
+  `??` …) are listed there as **probable kit false positives**; the verdict is not changed.
+- Replacement notes (`D/raw/replace-<ID>-g<N>.md`, from `resume --replace`) are tested check-only: never
+  repaired, never altered; the result is logged so their gaps are visible.
+
+The handover prompt now also asks for (6) the deliverable, (7) what is half-finished or left running and
+(8) mistakes not to repeat. In the replay corpus (29 member notes from this machine) those were the most
+often missing topics (baseline: 25, 26 and 26 notes). The kit's coverage check is a regex: it proves a topic is
+mentioned, not that it is answered.
+
+**Session handovers (on request).**
+
+```bash
+scripts/council.sh handoff-test [--fix] [--config c.json] [--kit DIR] [--timeout S] HANDOVER.md
+```
+
+runs the kit unchanged — section 4 included, so only on a document you trust — and passes its exit code
+through: 0 clean · 1 facts drifted · 2 coverage gap · 3 usage/config/operational error (also a `--timeout`
+expiry). `--fix` is passed only when you give it. Without `--config` the kit's own config discovery applies.
+No kit found: the reason on stderr and exit **4**, never 0. No timeout unless `--timeout S`.
+
+**Replay over real handovers.**
+
+```bash
+python3 scripts/ptools/handoff_replay.py <corpus-dir> [--kit DIR] [--evidence DIR]
+```
+
+runs the integration on every file listed in `<corpus-dir>/index.json` (`file`, `source`, `project_dir`,
+`has_python_block`), each on its own copy; the corpus is never modified (checked by digest). Member notes go
+through the council path (`repo_root` = the note's `project_dir`, `path_bases` = its original run directory if
+it still exists, section 4 disabled, `--fix`). Session handovers (`project_dir` null) go through the
+`handoff-test` path — kit unchanged, no `--fix` — on a disposable copy placed in the original source directory
+(so the kit's config discovery and relative paths are the original ones) and removed afterwards. A document with
+a python block is reported, never run. It prints a per-file table and member/session aggregates next to the
+corpus's `baseline-noconfig.tsv`, and exits 0 only when every member note was tested, no block was executed and
+every delivered note is the original plus exactly its recorded authorized repair; 2 when no kit is found.
+
+## Release notes
+
+- **0.10.0** — handover notes are tested with the external handoff-test-kit before the successor reads them
+  (section 4 disabled for member notes, failing notes repaired with the kit's `--fix` and mapped back onto the
+  original bytes, never blocking the council); `council.sh handoff-test` for session handovers; a corpus replay;
+  the handover prompt asks for the deliverable, half-finished work and mistakes not to repeat.
 
 ## Known gaps / future tests
 
@@ -186,6 +281,20 @@ Tracked limitations of the map pre-pass and the tests not yet written:
 - **Directory aliases are blocked as a whole.** An in-project directory symlink whose target contains an escaping link is denied entirely, so its other in-project content is reachable only through the real path.
 - **Case-folded denies over-match.** On a filesystem that ignores letter case, OpenCode's case-sensitive matcher would let a case variant of an escaping link (`ESCAPE.PY` for `escape.py`) through, so the per-link denies are case-folded (`?` per ASCII letter, `*` per non-ASCII character). They can also block unrelated in-project names of the same shape, which the mapper then cannot read.
 - **Hard links** cannot be told apart from ordinary files by path, so a hard link to an outside file is neither blocked nor detected.
+- **Handoff tests — coverage is a regex.** The kit's section 5 proves that a topic is mentioned, not that it is
+  answered; the appended checklist only says what is missing.
+- **Handoff tests — kit false positives.** The kit reads some inline code as paths (commands with an environment
+  assignment, git-status lines). They are listed as probable false positives and not filtered; an upstream issue
+  for the kit is drafted, not filed.
+- **Handoff tests — what `--fix` can repair.** With the generated config there are no fact probes, so `--fix`
+  only adds the gap checklist; SHA/version repairs need a `handoff_config` with `external`/`version_probes`. A
+  git fetch the kit starts for such a config runs in its own session and is bounded by the kit (15 s), not by
+  `handoff_timeout_s`'s process-group kill; it can run twice (once when the authorized spans are planned, once
+  in `--fix`). If the facts change between the two (the branch moves), the repair no longer matches the plan and
+  is refused (original delivered).
+- **Handoff tests — contract drift.** A future kit revision that changes its output format or fixer interface
+  is detected by the contract checks and reported as an operational error (original note delivered), not
+  adapted to.
 - **Future tests:** the exhaustive alias/hard-link permutation matrix; fault injection at every persistence boundary not yet covered (the initial state write, the version marker, the authorization and the mapper checkpoints are covered); byte-level parity of the reports.
 
 ## Example

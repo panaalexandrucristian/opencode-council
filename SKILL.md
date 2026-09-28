@@ -101,6 +101,7 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |
 | prose style (optional) | `style` (top level and/or per member) | `normal` (default), `lite`, `caveman`, `ultra` — compresses only the prose a member writes for the others, modelled on the [caveman skill](https://github.com/juliusbrussee/caveman). The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
 | context handover threshold | `handover_at` (0..1], council-wide **and/or per member** | a fraction in (0,1] of the model's context window, **or an absolute token count** (≥ 1000, e.g. `150000`). At the threshold the session writes a handover note and is replaced by a fresh session (same member id, next generation). Set it per member to make one hand over earlier than the rest (`{"id":"A", …, "handover_at":0.3}`); a member without its own value uses the council-wide one. The roster prints the effective threshold per member, and `status` shows each member's context as a percentage of its own threshold |
+| handoff tests of member notes (optional) | `handoff_kit`, `handoff_config`, `handoff_timeout_s` | the external [handoff-test-kit](https://github.com/panaalexandrucristian/handoff-test-kit) directory (else `$HANDOFF_TEST_KIT`, else `/Users/apana/dev/handoff-test-kit` if it exists; an invalid explicit value is a named skip, never a fallback); your own kit config replacing the generated one (`repo_root` defaults to `dir`); one budget in seconds for check + `--fix` + recheck (default 60). All three may be omitted |
 | whether to seed the code map | `map_code` (one run-wide boolean) | **Ask the user once before writing the config:** “Map the code for this council?” Record true/false. It applies to every task. Hand-written configs that omit it are accepted as false; there is no prompt or pause. |
 
 Then: `council.sh show --config council.json` → paste the roster to the user and get a yes before `start`.
@@ -124,7 +125,14 @@ council.sh status --run-dir D                                                   
 council.sh report --run-dir D                                                     # token report: prompt bytes by section, de-duplication replay, duplication left
 council.sh resume --run-dir D --answers answers.json | --answer "text"            # after exit 4 (questions) or exit 2 (failure)
 council.sh resume --run-dir D --replace C=claude:sonnet:xhigh                     # swap a member's model/session (repeatable)
+council.sh handoff-test [--fix] [--config c.json] [--kit DIR] [--timeout S] FILE  # test a SESSION handover with the external kit
 ```
+
+`handoff-test` runs the external handoff-test-kit on a session handover document (e.g. `HANDOVER-3.md`)
+**unchanged** — section 4 executes the document's first `python3 - <<'PY'` block, so use it only on documents
+you trust — and passes the kit's exit through: 0 clean · 1 facts drifted · 2 coverage gap · 3 usage/config/
+operational error or `--timeout` expiry · **4 no kit found** (reason on stderr; never reported as passed).
+Pass `--fix` only when the user asks for a repair. Without `--config` the kit's own config discovery applies.
 
 `resume` re-runs only what is missing: a member that already has a valid post for the current
 round is reused, not called again. `--replace ID=kind:model:effort` (`kind` = `opencode` \| `claude`)
@@ -155,6 +163,21 @@ writes a handover note, a fresh session is created for the same member id (gener
 note + council rules are prepended to its first prompt. `status` and the transcript show per member:
 generation, context %, session tokens, cost, calls, retired sessions. Both include each
 member's final-generation + retired subtotal and a **RUN TOTAL** across all generations.
+
+**Handoff tests.** Before a successor reads a handover note, `scripts/ptools/handoff_test.py` runs the
+external handoff-test-kit on a copy in `D/handoff/` (config: `repo_root` = `dir`, `path_bases` = [`D`], or
+`handoff_config`). Section 4 is not applicable to member notes: every `python3 - <<'PY'` block is removed from
+the copy (never executed) and the section-4 gap does not count. A failing note is repaired with the kit's
+`--fix`; the section-4 checklist entry is dropped, python blocks are restored byte-for-byte, and only the gap
+checklist and the exact spans/values/banner the kit's own fixer plans for this config (`plan_edits`, recorded as
+`fix.authorization`) may differ from the original — then the successor receives
+`D/handoff/handover-g<N>-<ID>.fixed.md`. No kit, kit exit 3, unrecognised output, a refused repair or the
+`handoff_timeout_s` budget (default 60 s) never block the council: logged, original note delivered. Results:
+`state.json` `handoff_tests[]`, the log, and a **Handoff tests** table in the transcript and `council.sh report`
+(probable kit false positives listed, verdict unchanged). Replacement notes are checked, never altered. The
+handover prompt also asks for the deliverable, half-finished work and mistakes not to repeat.
+`python3 scripts/ptools/handoff_replay.py <corpus-dir> [--kit DIR]` replays the integration over a corpus of
+real handovers (README: Handoff tests).
 
 **Lossless prompt de-duplication.** In voting rounds, an exactly matching candidate or a
 byte-identical proposal token can refer to a uniquely anchored peer post in the same prompt.
@@ -295,7 +318,7 @@ and stale/missing-lookup counts are unknown unless an explicit `--trace FILE` is
 only as far as that trace claims completeness); trace repetition uses lookup's own request
 normalisation and stale/missing counts come from the real response contract. Byte counts are never
 converted into token or dollar figures and savings are never estimated.
-`scripts/ptools/test_ptools.py` is their unittest suite (156 cases), run automatically by
+`scripts/ptools/test_ptools.py` is their unittest suite (218 cases, including the handoff-test adapter), run automatically by
 `scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
