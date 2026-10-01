@@ -318,7 +318,7 @@ and stale/missing-lookup counts are unknown unless an explicit `--trace FILE` is
 only as far as that trace claims completeness); trace repetition uses lookup's own request
 normalisation and stale/missing counts come from the real response contract. Byte counts are never
 converted into token or dollar figures and savings are never estimated.
-`scripts/ptools/test_ptools.py` is their unittest suite (218 cases, including the handoff-test adapter), run automatically by
+`scripts/ptools/test_ptools.py` is their unittest suite (746 cases, including the handoff-test adapter), run automatically by
 `scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
@@ -365,6 +365,74 @@ keeps working with them absent, and on a supported-version run a helper that can
 before any exposure disables map delivery for that whole attempt with a diagnostic — while an
 attempt that has ALREADY exposed map-backed evidence checkpoints instead of silently dropping its
 freshness obligation.
+
+Per-session token report (`session_report.py`, same constraints: Python 3 standard library, read-only, `-h`):
+
+```bash
+python3 scripts/ptools/session_report.py --run-dir D [--projects DIR]                       # every member session of a run
+python3 scripts/ptools/session_report.py --run-dir D --fetch-opencode [--oc scripts/oc.sh]  # + OpenCode messages via oc.sh
+python3 scripts/ptools/session_report.py --session FILE.jsonl [FILE.jsonl ...]              # any Claude Code transcript(s)
+```
+
+Defaults: `--projects` `~/.claude/projects`, `--oc` `<script dir>/../oc.sh` (it only selects the adapter), `--chars-per-token` 3.2
+(finite, > 0), `--top` 15 (>= 1); `--fetch-opencode` is off. It is **local by default**: without `--fetch-opencode` no subprocess is started at all (`--oc` only selects the adapter), and OpenCode
+generations show the totals recorded in `state.json` with the per-call breakdown `unknown (not fetched; use --fetch-opencode)`.
+`--fetch-opencode` (needs `--run-dir`) runs `oc.sh status`, then pages `GET /api/session/<id>/message` (first request
+`order=asc&limit=200`, then cursor-only requests; at most 1000 pages per session; each `oc.sh` call and its `curl`/`jq` children are
+killed after 120 s), so it also needs bash, curl and jq. The connection is pinned so `oc.sh` can never auto-start the service: a preset
+non-empty `OPENCODE_URL` is used as is (with `OPENCODE_PASSWORD`/`OPENCODE_USERNAME` unchanged); otherwise `url` and `password` come from
+`${XDG_STATE_HOME:-~/.local/state}/opencode/service.json`, and an empty, `null` or absent password removes any inherited
+`OPENCODE_PASSWORD`. A missing or invalid state file (also a url or password with a lone surrogate) makes the OpenCode sessions `unavailable` with nothing spawned; credentials are never
+printed. A session id or a next cursor that cannot be written as UTF-8 (a lone surrogate) is never requested or replaced: that generation is `unavailable (session id is not valid UTF-8 ...; not requested)` with its recorded totals kept, or that session's pagination stops `PARTIAL` with everything already read kept. The report opens with a Coverage section (per session: `complete` | `PARTIAL` | `unavailable` | `ambiguous` | `conflict` |
+`unknown (not fetched)`, and the kind/model/effort of each generation with the source of that identity: `state.json` and its log, and
+the one exception that an ambiguous generation with exactly one `<projects>/*/<sid>.jsonl` is read as Claude, its model shown only when
+every `message.model` in it is equal; `PARTIAL` when a line of it cannot be parsed; the lookup is literal, so `*`, `?` and `[` in the session id or in `--projects` are plain characters and an id with a `/` names no transcript of that shape). A transcript that cannot be read is `unavailable (transcript unreadable: ...)` and the run still
+reports. Exit 0 whenever a report is printed, also a PARTIAL one; exit 2 for a usage error (also a `state.json` with a member id, a member session id or a retired-entry
+session id that is not a string or `null`, or a `retired` that is not a list or `null`) or when no session can be used. Missing values are
+`unknown`, never 0, and a total with unknown components reads `<sum> (known components: k; unknown components: u; conflicting components: c)`
+(the conflicting part is omitted when c is 0; a conflicting component is not counted as unknown). OpenCode includes its reported reasoning
+once, and OpenCode calls that precede the first user message form their own segment, attributed `unknown`. A session id recorded by several
+generations or by a member and the map pre-pass is counted once: identical records count once, differing known records are an excluded
+`conflict`, and a component (tokens or cost) that is unknown for the member is filled from the mapper record, labelled `from mapper record`
+(a mapper field that is unknown stays an unknown component); call numbers start at 0 (large cache writes, context drops); costs are only the recorded ones (a recorded 0 is labelled, since the orchestrator also writes 0
+when no cost was reported); the split over items is a `heuristic estimate (character-based)`; task/round/phase are attributed only from a
+byte-for-byte match with one of the member's own prompt files, otherwise `unknown`; a member with no id (absent or `null`) is attributed
+`unknown` (provenance `no member id in state.json`), since its own prompt files cannot be identified. A `state.json` entry (a member, or a `retired` entry) that is not an object is listed in Coverage as `state.json: members[i] is not an object (ignored; ...)`, counted in the `PARTIAL:` line (`N state entries unusable`) and as two unknown components of the run totals, never silently dropped. The report is UTF-8 whatever the locale or `PYTHONIOENCODING` (a lone surrogate is written as `\udXXX`), and text from a transcript, `state.json` or an adapter (ids, model, effort, tool names and targets, message ids, an adapter's error line) is shown escaped (C0/C1 controls, U+2028/2029, lone surrogates as `\xNN`/`\uNNNN`, a backslash doubled, a pipe as `\|`), so it cannot forge a report line or end a table cell; the escaping happens only where text is printed, so ids from `state.json` are looked up, compared and requested exactly as recorded (a transcript file, an OpenCode request, a prompt file, a log line), and a first prompt with a lone surrogate is attributed `unknown` with that reason instead of being compared.
+
+Build/test runner with a capped summary (`run_check.py`, Python 3 standard library, POSIX only, `-h`; it **executes** the command and **writes**
+files, so unlike the other tools it is not read-only; use a `--log-dir` outside the project, `.gitignore` covers `*.log` only and
+`scripts/council.sh:1655-1657` puts `git status --short` into the ratification diff):
+
+```bash
+python3 scripts/ptools/run_check.py --log-dir D [--fallback-dir F] [--reports GLOB]... [--max-bytes N] [--timeout SECONDS] -- COMMAND [ARG...]
+python3 scripts/ptools/run_check.py --log-dir /tmp/checks -- sh -c 'pytest --junitxml="$RUN_CHECK_REPORT_DIR/r.xml"'
+```
+
+`--log-dir` is required (no default; relative paths are taken against the cwd). `--max-bytes` defaults to 4000; the WHOLE stdout, final newline
+included, stays within it, `omitted:` is always the last line and counts what is missing, and a value below the computed minimum (it grows with the
+length of the log directory path; printed on refusal) is refused with exit 2 before anything is created; below 512 is a usage error.
+`--timeout` (finite, > 0) stops the command's process group (SIGTERM, 5 s, SIGKILL). The command runs as argv without a shell, with the caller's
+cwd and environment plus `RUN_CHECK_REPORT_DIR`, stdin `/dev/null`. Exit codes: the command's own (`COMMAND_EXIT rc`), 128+n for `SIGNAL n`, 124
+`TIMEOUT (TIMED OUT ...)`, 130/143/129 when the wrapper itself got SIGINT/SIGTERM/SIGHUP, 125/126/127 `WRAPPER_ERROR` (log not creatable, not
+executable, not found; the command did not run), 2 usage. The log is the raw OS-merged byte stream, lossless or explicitly `capture: INCOMPLETE`
+(lines end only at LF: `sed -n 'A,Bp' LOG` agrees with the numbers, total = `wc -l`, or +1 without a final LF; `log continued:` lines name the
+continuation files to read in order (a continuation on an unknown filesystem is still used); storage errors block the command instead of dropping output, `storage: STALLED_ON_STORAGE`). Failing tests
+come from JUnit XML (`$RUN_CHECK_REPORT_DIR` = produced by this invocation, `--reports` globs are expanded by a lazy walker (entry by entry, in file system order, a capped source reads no further) that reports every failing listing or inspection, streams each one to the index and lets `omitted:` count the warning lines that do not fit, and are snapshotted before launch: `changed during this
+run; concurrent writers not excluded`, `stale, ignored`, `removed` (only when the absence is established; a snapshot error stays a `PROVENANCE_ERROR` even if the file vanishes); `PROVENANCE_ERROR`/`REPORT_ERROR` lines and `reports not examined: N+` (N is a
+lower bound of candidate occurrences; caps `MAX_REPORT_PATHS` 10000, `MAX_UNEXAMINED_COUNT` 1000000, `MAX_MARKUP_TOKEN_BYTES` 8388608 per markup
+token, `DEDUP_CAP` 200000 are module constants; `dedup capped: ...` when later duplicates may be listed twice; a partial XML result says `(partial: n
+failures kept)`; an unreadable entry of the private report directory is a `REPORT_ERROR` and the entries after it are still read), identified by `(classname, name, file)`, and from strict whole-line unittest/pytest text patterns labelled `text-heuristic` (a copy of each line has one trailing CR and every SGR colour sequence (at most 256 parameter characters) removed before it is matched;
+the raw log, the bodies and the excerpts keep the bytes; OSC/hyperlink, cursor-movement and CR-only progress lines are not interpreted and stay declared; the unittest `subTest`
+suffix ` (i=0)`, ` [why]`, ` [why] (s='a (b) c')` or ` (<subtest>)` is kept verbatim in `subtest` and every subTest failure is an occurrence of its own, numbered in a table of at most `DEDUP_CAP` identities: a later one has `occurrence` null and an `occurrences_capped` record and `WARNING` say so); a text
+hit merges into a JUnit failure only when classname and name are exactly equal (file too when both carry one) and exactly one matches (and never after the
+dedup cap), otherwise it stays a separate failing test (also when its identity equals a JUnit one); `FAILED (failures=..)`, `FAILED build`, `FAIL <message>`, indented lines and pytest `ERROR` lines are not recognised (the runner-count `WARNING` counts pytest `N failed` and `N error(s)`, and says when JUnit failures that the log does not corroborate hide a shortfall). Every
+identity is in `<stem>.failures.jsonl` (complete message and streamed body records; for a text failure the index also holds its block: `body` records keyed by `block`, a `text_block` record with the log lines and the byte range, the message as `message`, `message_chars` and `message_more` continuation `message` records, the same fields on its `observation` and `duplicate` records; a unittest block runs from the FAIL/ERROR header to the next `=====` line, the `-----` line before `Ran N tests in`, another header or the end of the log, and its message is the last exception report; a pytest block is a `___ name ___` block of the FAILURES section, matched to a FAILED line only after the whole log was seen and only when the name is unique in both directions, otherwise recorded `unmatched` with a `coverage` record and a counted `WARNING` (the pending blocks and FAILED lines are fixed-size records up to `DEDUP_CAP`, then `text_block_association_capped`, and a name that recurs beyond the cap is kept in a fixed-size filter so that no block is attached to a name that is not unique); the detail lines of a text block carry their log line number; a `testsuite` that declares more failures or errors than it lists gives `WARNING: REPORT_MISMATCH`; text of the command or of a report is shown escaped with every literal backslash doubled (also the numbered excerpt lines, whose cuts count bytes); if stdout cannot take the summary the exit code stays the command's own and stderr gets one line saying so followed by the status, `log:`, `capture:`, `CAPTURE_PENDING:` and `failures index:` lines of the summary, claiming nothing that was not checked; a log segment that is shorter than its recorded length when the analysis reads it is never taken for a complete log (`CAPTURE_INCOMPLETE`, a `coverage` record `analysis_read_failed`, the summary-error form, `complete` false in a worker's `complete.json`); the file always ends on a complete record, a missing `end` record proves it incomplete, and a write error reads `failures index: INCOMPLETE (<ERRNO>; N records written, M not written)`; the worker removes a `final-summary.txt` or `complete.json` it could not write completely, and its final index replays the pre-launch discovery records from the foreground index by byte range, complete records only, with a `records_not_copied` record when it could not read them all or the foreground index never wrote them). The identities are listed while they fit in `--max-bytes` (only the first 200 failing tests get a detail block) and `omitted:` counts every warning not shown. If a
+`setsid` descendant still holds the pipe 2 s after the command group ended the summary says `CAPTURE_PENDING` (prefix counts only; it names the fallback directory when there is one) and a
+background worker writes `<stem>.final-failures.jsonl`, `<stem>.final-summary.txt` and, last, `<stem>.complete.json` at EOF: the final summary is the
+authoritative one and a missing `complete.json` never means success. If summary production itself fails the exit code is kept and the output is
+line 1, `log:`, `SUMMARY ERROR: ...` and `omitted: summary not produced; ...` (`unknown` for totals not established). Limits: FIFO stdout, `setsid`
+descendants escape the group cleanup (the worker lives until EOF), bytes buffered in a killed process may be lost, a SIGKILLed wrapper leaves a
+partial log, under a finite hard `RLIMIT_FSIZE` the index itself can be `INCOMPLETE`, a same-volume fallback cannot help when the volume is full.
 
 ## Targeting another server
 
