@@ -267,6 +267,17 @@ every delivered note is the original plus exactly its recorded authorized repair
 
 ## Release notes
 
+- **0.11.2** — the map pre-pass no longer loses the whole map when the mapper's reply is almost-JSON. The mapper
+  prompt now asks for exactly one JSON object with a literal example (the old wording described the reply in
+  unquoted pseudo-notation, which openai/gpt-6-luna copied in 2 of 2 measured calls) and says `stopped_reason`
+  is `"done"` when the search finished. When strict parsing fails, a narrow syntax repair runs outside string
+  literals only: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the
+  three known top-level fields, and adds missing outer braces. It never changes a value; anything ambiguous
+  (`[,]`, single quotes, comments, bare-word values, truncation, trailing text, raw control characters) stays
+  unavailable, and duplicate keys and NaN/Infinity are now rejected on every path. Each repair is listed in
+  `result.repairs`, `validation.err` and the map review; status is computed as before. Both real Luna replies now
+  recover (24 + 4 and 25 + 3 selectors); the three real Sol replies give identical results. test-completion.sh:
+  1420 checks; test_ptools.py: 751 cases.
 - **0.11.1** — a Claude member call that hits `timeout_s` no longer keeps running orphaned. Each `claude -p` call
   runs as the leader of its own process group (a `python3` `os.setsid` exec wrapper), and one helper stops the
   whole group: SIGTERM, up to 10 s, SIGKILL, then up to 10 s until no live process is left. It runs on timeout,
