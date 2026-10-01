@@ -171,7 +171,7 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `bash scripts/test-completion.sh` — 1369 offline checks (no network, no model calls), including
+- **Tests.** `bash scripts/test-completion.sh` — 1395 offline checks (no network, no model calls), including
   `scripts/ptools/test_ptools.py` (746 Python standard-library unittest cases for the analysis tools and the handoff-test adapter).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
@@ -267,6 +267,18 @@ every delivered note is the original plus exactly its recorded authorized repair
 
 ## Release notes
 
+- **0.11.1** — a Claude member call that hits `timeout_s` no longer keeps running orphaned. Each `claude -p` call
+  runs as the leader of its own process group (a `python3` `os.setsid` exec wrapper), and one helper stops the
+  whole group: SIGTERM, up to 10 s, SIGKILL, then up to 10 s until no live process is left. It runs on timeout,
+  after a call that exited but left processes in its group, on SIGTERM/SIGINT/SIGHUP to `start`/`resume`, on a
+  failed launch or handover, and on `resume` for calls a previous orchestrator left in flight. Every attempt
+  writes its own `raw/<tag>-<id>-a<N>.json`, so a retry can no longer share a file with the call it replaces. If
+  a group survives SIGKILL, the step is not retried and the run stops with the failed checkpoint (exit 2).
+  Limit: Claude Code's Bash tool starts its commands in their own session. Measured with Claude Code 2.1.286,
+  claude stops them itself within 1 s of SIGTERM (foreground and `run_in_background`), but if claude ignores
+  SIGTERM for 10 s and is killed, those commands survive; check `ps -A -o pid,ppid,command` for leftovers. A
+  0.11.0 in-flight record (pid only) cannot be verified on resume and is only reported. New `orphan_tests`
+  suite (26 checks); test-completion.sh: 1395 checks.
 - **0.11.0** — two new analysis tools: `scripts/ptools/session_report.py` (where a council run's tokens and cost
   go, per member session and per task/phase; local by default, `--fetch-opencode` for OpenCode sessions;
   unknown and conflicting values are counted, never guessed) and `scripts/ptools/run_check.py` (runs a command,

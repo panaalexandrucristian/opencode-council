@@ -1016,6 +1016,70 @@ oc_new_session() {  # idx -> prints ses_...
   printf '%s' "$sid"
 }
 cl_new_session() { uuidgen | tr 'A-Z' 'a-z'; }
+# A claude attempt runs as the leader of its own session, so of its own process group (launch). One helper stops a
+# group: SIGTERM, up to 10 s for a clean exit, SIGKILL, then up to 10 s until no live (non-zombie) member is left.
+# Processes that moved themselves into another session are not covered (Claude Code's Bash tool starts its commands
+# detached; they stop only if claude stops them).
+CALL_LEFT_RUNNING=0   # 1 after collect when a claude attempt's group survived SIGKILL: no retry, the step fails
+CL_LAUNCHING=         # "pending" from just before a claude attempt is forked, then its pid, until its inflight record is written
+CL_PREV=              # $! before that fork: while CL_LAUNCHING is pending, a different $! is the unrecorded attempt
+group_left() {  # pgid -> space-separated pids of the group's live (non-zombie) members; empty once it is gone; '?' if ps fails
+  local t; t=$(ps -A -o pid= -o pgid= -o stat= 2>/dev/null) || { printf '? '; return; }
+  awk -v g="$1" '$2 == g && $3 !~ /^Z/ { printf "%s ", $1 }' <<<"$t"
+}
+kill_group() {  # pgid -> 0 once no live member is left; 1 (pids logged) if any survived SIGKILL for 10 s
+  local pg=$1 n left
+  if ! [[ "$pg" =~ ^[0-9]+$ ]] || [ "$pg" -le 1 ] || [ "$pg" = "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then log "refusing to signal process group '$pg'"; return 1; fi
+  kill -TERM -- "-$pg" 2>/dev/null
+  for n in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(group_left "$pg")" ] && return 0; sleep 1; done
+  kill -KILL -- "-$pg" 2>/dev/null
+  for n in 1 2 3 4 5 6 7 8 9 10; do left=$(group_left "$pg"); [ -z "$left" ] && return 0; sleep 1; done
+  log "process group $pg still has live processes after SIGKILL: $left(? = ps failed, so this could not be verified)"; return 1
+}
+inflight_group() {  # idx -> prints the pgid of the member's in-flight attempt if live processes may still belong to it
+  local i=$1 pg started now
+  pg=$(st ".members[$i].inflight.pgid // empty"); [ -n "$pg" ] || return 1
+  started=$(st ".members[$i].inflight.started // empty"); now=$(LC_ALL=C ps -o lstart= -p "$pg" 2>/dev/null)
+  [ -n "$started" ] && [ -n "$now" ] && [ "$now" != "$started" ] && return 1   # that number now belongs to another process: our group is gone
+  [ -n "$(group_left "$pg")" ] || return 1
+  printf '%s' "$pg"
+}
+stop_inflight() {  # stop every claude attempt still in flight; returns 1 if a group survived SIGKILL (its record is kept)
+  local i pg left=0
+  if [ "$CL_LAUNCHING" = pending ]; then   # interrupted around the fork: a new $! is the attempt, an unchanged one means not forked yet
+    if [ -n "$!" ] && [ "$!" != "$CL_PREV" ]; then CL_LAUNCHING=$!; else CL_LAUNCHING=; fi
+  fi
+  if [ -n "$CL_LAUNCHING" ]; then   # launched but not yet recorded; before its setsid it is still in our group, so signal it directly too
+    kill -TERM "$CL_LAUNCHING" 2>/dev/null
+    kill_group "$CL_LAUNCHING" || { left=1; log "the call being launched (pid $CL_LAUNCHING) still runs: pids above"; }; CL_LAUNCHING=
+  fi
+  [ -n "$ST" ] && [ -f "$ST" ] || return $left
+  for i in $(jq -r '.members | to_entries[] | select(.value.inflight.pgid != null) | .key' "$ST" 2>/dev/null); do
+    if pg=$(inflight_group $i); then log "member $(mid $i): stopping its in-flight call (process group $pg)"; kill_group "$pg" || { left=1; continue; }; fi
+    sts --argjson i $i '.members[$i].inflight=null'
+  done
+  return $left
+}
+trap_failed() {  # signal cleanup left a group alive: the existing failed checkpoint (exit 2), as for a collect timeout
+  log "a call's process group survived SIGKILL (pids above) — stopping with the failed checkpoint; resume once those processes are gone"
+  [ "$(st .status 2>/dev/null)" = running ] && sts '.status="failed"'
+  exit 2
+}
+trap_calls() {  # attempts no longer share the orchestrator's group: a TERM/INT/HUP stops them before the orchestrator exits
+  # Only start and resume install it: status/report load the same state and must never stop a live run's calls. A signal
+  # ignored when council.sh started stays ignored (bash cannot trap it), and it cannot end the orchestrator either.
+  trap 'trap "" TERM INT HUP; stop_inflight && exit 143; trap_failed' TERM
+  trap 'trap "" TERM INT HUP; stop_inflight && exit 130; trap_failed' INT
+  trap 'trap "" TERM INT HUP; stop_inflight && exit 129; trap_failed' HUP
+}
+reap_stale_calls() {  # resume: before anything is relaunched, stop calls a previous orchestrator left in flight
+  local i
+  for i in $(jq -r '.members | to_entries[] | select(.value.inflight.pid != null and .value.inflight.pgid == null) | .key' "$ST"); do
+    log "member $(mid $i): its in-flight call was recorded by council 0.11.0 or older (pid $(st ".members[$i].inflight.pid") only) and cannot be verified — look for a leftover claude -p whose parent is pid 1: ps -A -o pid,ppid,command | grep -- '-p --output-format json'"
+    sts --argjson i $i '.members[$i].inflight=null'
+  done
+  stop_inflight || { log "resume refused: a call left in flight still runs (pids above); resume again once it is gone"; exit 2; }
+}
 
 launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inflight
   local i=$1 pf=$2 tag=$3 kind sid
@@ -1031,14 +1095,21 @@ launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inf
     else args+=(--resume "$sid"); fi
     if [ "$(mget $i mode)" = read ]; then args+=(--disallowedTools "Edit Write MultiEdit NotebookEdit")
     else args+=(--allowedTools "Bash Edit Write MultiEdit NotebookEdit"); fi   # headless: nobody can answer a permission prompt
-    local out="$RUN/raw/$tag-$(mid $i).json"
-    ( cd "$DIR" && env -u CLAUDE_EFFORT claude "${args[@]}" <"$pf" >"$out" 2>"$out.err" ) &
-    sts --argjson i $i --arg t "$tag" --argjson p $! '.members[$i].inflight={tag:$t,pid:$p}'
+    # every attempt (first, automatic retry, each resume) has its own raw file: <tag>-<id>-a<N>.json, N = first free number
+    local n=1 out; while [ -e "$RUN/raw/$tag-$(mid $i)-a$n.json" ]; do n=$((n+1)); done; out="$RUN/raw/$tag-$(mid $i)-a$n.json"
+    # own session, so its own process group (pgid = $! = claude itself after the execs); no controlling terminal
+    CL_PREV=$!; CL_LAUNCHING=pending   # until its record is written, the signal trap stops this call through CL_LAUNCHING
+    ( cd "$DIR" && exec python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' env -u CLAUDE_EFFORT claude "${args[@]}" <"$pf" >"$out" 2>"$out.err" ) &
+    CL_LAUNCHING=$!
+    sts --argjson i $i --arg t "$tag" --argjson p $CL_LAUNCHING --arg s "$(LC_ALL=C ps -o lstart= -p $CL_LAUNCHING 2>/dev/null)" --arg o "$out" \
+      '.members[$i].inflight={tag:$t,pid:$p,pgid:$p,started:$s,raw:$o}'
+    CL_LAUNCHING=
   fi
 }
 
 collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 failed
   local i=$1 kind sid tag id out rc=0
+  CALL_LEFT_RUNNING=0
   kind=$(mget $i kind); sid=$(mget $i session); id=$(mid $i); tag=$(st ".members[$i].inflight.tag")
   out="$RUN/raw/$tag-$id.md"
   if [ "$kind" = opencode ]; then
@@ -1058,16 +1129,23 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
     [ -n "$ctx" ] && [ "$ctx" != null ] && sts --argjson i $i --argjson c "$ctx" --argjson t "$tot" \
       '.members[$i] |= (.ctx_used=$c | .session_tokens=$t.t | .session_cost=$t.c | .calls+=1 | .session_calls+=1)'
   else
-    local pid; pid=$(st ".members[$i].inflight.pid"); local j="$RUN/raw/$tag-$id.json"
+    local pid pg j; pid=$(st ".members[$i].inflight.pid"); pg=$(st ".members[$i].inflight.pgid"); j=$(st ".members[$i].inflight.raw")
     local deadline=$(( $(date +%s) + TIMEOUT ))
     while kill -0 "$pid" 2>/dev/null; do
-      if [ "$(date +%s)" -ge "$deadline" ]; then kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null; log "member $id: timeout after ${TIMEOUT}s (killed)"; rc=1; break; fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        if kill_group "$pg"; then log "member $id: timeout after ${TIMEOUT}s (killed)"
+        else CALL_LEFT_RUNNING=1; log "member $id: timeout after ${TIMEOUT}s; its process group survived SIGKILL — not retried; resume once those processes are gone"; fi
+        rc=1; break; fi
       sleep 2
     done
-    wait "$pid" 2>/dev/null; local prc=$?
+    if [ $rc -eq 0 ] && [ -n "$(group_left "$pg")" ]; then   # the call exited but left processes in its group: stop them before its reply is used
+      log "member $id: its call exited but left processes in process group $pg: $(group_left "$pg")— stopping them"
+      kill_group "$pg" || { CALL_LEFT_RUNNING=1; rc=1; log "member $id: processes its call left survived SIGKILL — not retried; resume once those processes are gone"; }
+    fi
+    local prc=1; [ "$CALL_LEFT_RUNNING" = 1 ] || { wait "$pid" 2>/dev/null; prc=$?; }   # never block on a child that survived SIGKILL
     if ! jq -e '.type=="result"' "$j" >/dev/null 2>&1; then log "member $id: claude exit $prc: $(head -c 300 "$j.err" "$j" 2>/dev/null | tr '\n' ' ')"; rc=1
     elif jq -e '.is_error==true' "$j" >/dev/null; then log "member $id: claude error: $(jq -r '.result' "$j" | head -c 300)"; rc=1; fi
-    jq -r '.result // ""' "$j" >"$out" 2>/dev/null
+    jq -r '.result // ""' "$j" >"${j%.json}.md" 2>/dev/null; cp "${j%.json}.md" "$out"   # the attempt's own text; the canonical name holds the latest attempt
     sts --argjson i $i '.members[$i].cl_started=true'
     local u; u=$(jq -c '{ctx:((.usage.iterations // [.usage] | last) | (.input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens + .output_tokens)),
                         tot:(.usage | .input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens + .output_tokens),
@@ -1079,7 +1157,7 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
         | (if $cum then .session_tokens=$u.cum | .session_cost=$u.cost          # >= 2.1.277: result already carries the whole session
            else .session_tokens+=$u.tot | .session_cost+=$u.cost end))'
   fi
-  sts --argjson i $i '.members[$i].inflight=null'
+  [ "$CALL_LEFT_RUNNING" = 1 ] || sts --argjson i $i '.members[$i].inflight=null'   # a surviving group stays recorded for resume
   return $rc
 }
 
@@ -1484,7 +1562,8 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
   log "member $id: context $(st ".members[$i].ctx_used // 0") tokens ($(ctx_pct $i)%) reached its $(st ".members[$i] | (.handover_at // $HANDOVER) as \$h | if \$h > 1 then (\$h|tostring)+\" tokens\" else ((\$h*100|floor)|tostring)+\"%\" end") handover threshold — new session"
   local pf="$RUN/prompts/handover-$id-g$(mget $i gen).md"; prompt_handover $i >"$pf"
   append_historical_map_locator "$pf" "$(st .task_id)"
-  launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
+  CALL_LEFT_RUNNING=0; launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
+  [ "$CALL_LEFT_RUNNING" = 1 ] && return 1   # never open a new session beside a handover call that survived SIGKILL
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
   handoff_check $i "$note" handover; note=$HANDOFF_DELIVER
   local old; old=$(mget $i session)
@@ -1508,7 +1587,7 @@ run_step() {
     codemap_prepare "$tid" "$tag" "$( [ "$gen" = prompt_round1 ] && echo 1 || echo 0 )"
   fi
   for i in $idxs; do
-    needs_handover $i && do_handover $i
+    if needs_handover $i; then do_handover $i; [ "$CALL_LEFT_RUNNING" = 1 ] && { stop_inflight; return 1; }; fi
     pf="$RUN/prompts/$tid-$tag-$(mid $i).md"
     if [ "$(st '.reuse_posts // false')" = true ] && post_valid "$RUN/posts/$tid-$tag-$(mid $i).json" && [ -s "$RUN/posts/$tid-$tag-$(mid $i).md" ]; then
       log "member $(mid $i): reusing its $tag post from the checkpoint (not re-run)"; sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'; continue
@@ -1533,7 +1612,7 @@ run_step() {
     codemap_append_locator "$pf" "$tid" "$tag" prompt
     case "$gen" in prompt_round1|prompt_roundN) ;; *) append_historical_map_locator "$pf" "$tid" ;; esac
     $gen $i "$t" "$r" >>"$pf"
-    launch $i "$pf" "$tid-$tag" || { log "member $(mid $i): launch failed"; return 1; }
+    launch $i "$pf" "$tid-$tag" || { log "member $(mid $i): launch failed"; stop_inflight; return 1; }   # members launched before it are not left running unwatched
     codemap_record_launched "$pf" "$tid" "$tag"
   done
   local fail=0
@@ -1547,6 +1626,7 @@ run_step() {
                   elif .vote=="question" then ((.questions|type)=="array" and (.questions|length)>0) else true end)' "$RUN/posts/$tid-$tag-$id.json" >/dev/null; then ok=1; break; fi
       # A re-dispatched retry is a genuinely new launch: it gets its own immutable record, so the
       # reply it produces is bound to it and not to the launch whose reply was unusable.
+      [ $attempt -eq 1 ] && [ "$CALL_LEFT_RUNNING" = 1 ] && break   # never retry beside a group that is still running
       [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch_gen[$i]=$(mget $i gen); codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || break; }
     done
     sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null'
@@ -1852,6 +1932,7 @@ case "$CMD" in
     print_roster "$cfg" "$lim"; cost_note "$cfg"; echo "config OK: $CONFIG" ;;
 
   start)
+    trap_calls
     [ -n "$CONFIG" ] && [ -n "$RUN" ] || die "start needs --config F --run-dir D"
     RUN=$(abs "$RUN"); [ -e "$RUN" ] && die "run dir exists: $RUN (use resume, or a new dir)"
     cfg=$(validate_config "$CONFIG") || exit 1
@@ -1905,7 +1986,7 @@ case "$CMD" in
     exit $rc ;;
 
   resume)
-    [ -n "$RUN" ] || die "resume needs --run-dir D"; RUN=$(abs "$RUN"); load_state
+    [ -n "$RUN" ] || die "resume needs --run-dir D"; RUN=$(abs "$RUN"); load_state; trap_calls; reap_stale_calls
     "$OC" ensure >/dev/null || exit 1
     ensure_mapper_authorized
     status=$(st .status)

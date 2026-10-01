@@ -92,6 +92,93 @@ council_tests() (
   check 0 'council accepted the successful vote' '' jq -e '.last_votes[0].vote=="agree"' "$ST"
   result_rc=1; for wait_rc in 2 3; do sts '.members[0].inflight={tag:"wait"}'; check "$wait_rc" "council preserves wait=$wait_rc" '' collect 0; done
 )
+orphan_tests() (
+  load council.sh; RUN="$scratch/orphan"; ST="$RUN/state.json"; N=1; DIR=$scratch; MAXT=3; TIMEOUT=2; MAP_PREPASS=0
+  F="$scratch/fakeclaude"; mkdir -p "$RUN/raw" "$RUN/prompts" "$F"
+  # a failing check exits this subshell: never leave a fake call running, whatever the outcome
+  trap 'for p in $(cat "$F"/pids* 2>/dev/null); do kill -9 "$p" 2>/dev/null; done' EXIT
+  export PATH="$F:$PATH" FAKE_CLAUDE_PIDS="$F/pids" FAKE_CLAUDE_OK="$F/ok" FAKE_CLAUDE_LEAVE="$F/leave"
+  jq -n '{members:[{id:"A",kind:"claude",model:"fake",effort:"high",permission_mode:"plan",mode:"read",session:null,fresh:false,calls:0,session_calls:0}],last_votes:[]}' >"$ST"
+  # Fake claude: a child and a grandchild in its process group, then a late write to its stdout, which is what the
+  # orphaned call did to the shared raw file. With $FAKE_CLAUDE_OK present it answers at once; with $FAKE_CLAUDE_LEAVE
+  # present it answers at once but leaves a background child in its group.
+  cat >"$F/claude" <<'SH'
+#!/bin/sh
+ok='{"type":"result","is_error":false,"result":"retry reply","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+if [ -e "$FAKE_CLAUDE_LEAVE" ]; then sleep 30 & echo $! >>"$FAKE_CLAUDE_PIDS"; printf '%s\n' "$ok"; exit 0; fi
+if [ -e "$FAKE_CLAUDE_OK" ]; then printf '%s\n' "$ok"; exit 0; fi
+echo $$ >>"$FAKE_CLAUDE_PIDS"
+sleep 30 & echo $! >>"$FAKE_CLAUDE_PIDS"
+sh -c 'sleep 31 & echo $! >>"$FAKE_CLAUDE_PIDS"; wait' &
+sleep 6; echo ORPHAN
+SH
+  chmod +x "$F/claude"; printf 'prompt\n' >"$RUN/prompts/t-r1-A.md"
+  alive() { local p s; for p in $(cat "$1"); do s=$(ps -o stat= -p "$p" 2>/dev/null); case $s in ''|Z*) ;; *) ps -o pid,ppid,pgid,command -p "$p"; return 0 ;; esac; done; return 1; }
+  call() { launch 0 "$RUN/prompts/t-r1-A.md" "$1" && collect 0; }
+  check 1 'claude timeout: the timed-out call fails' '' call t-r1
+  check 0 'claude timeout: the fake started itself, a child and a grandchild' 3 sh -c 'wc -l <"$1" | tr -d " "' _ "$F/pids"
+  check 1 'claude timeout: no process of the call survives, grandchild included' '' alive "$F/pids"
+  check 0 'claude timeout: the first attempt wrote its own raw file' '' test -e "$RUN/raw/t-r1-A-a1.json"
+  cksum <"$RUN/raw/t-r1-A-a1.json" >"$F/first.sum"; : >"$FAKE_CLAUDE_OK"
+  check 0 'claude timeout: the retry succeeds' '' call t-r1
+  check 0 'claude timeout: the retry wrote a distinct raw file' 'retry reply' jq -r .result "$RUN/raw/t-r1-A-a2.json"
+  check 0 'claude timeout: collect took the reply from the retry file' 'retry reply' cat "$RUN/raw/t-r1-A.md"
+  check 0 'claude timeout: each attempt keeps its own extracted text' 'retry reply' cat "$RUN/raw/t-r1-A-a2.md"
+  sleep 6   # past the moment the first call, had it survived, writes ORPHAN to its stdout
+  check 0 "claude timeout: the first attempt's raw file is untouched by the retry and by the timed-out call" '' sh -c 'cksum <"$1" | cmp -s - "$2" && ! grep -q ORPHAN "$1"' _ "$RUN/raw/t-r1-A-a1.json" "$F/first.sum"
+  rm -f "$FAKE_CLAUDE_OK"
+  # A separate orchestrator collects a call and gets SIG. It is started through python with TERM/INT/HUP at their
+  # defaults (a background job of this non-interactive shell would start with SIGINT ignored); "ignored INT" starts it
+  # with SIGINT ignored instead, as a background run does, which must not stop it from launching a call.
+  signal_case() {  # SIG [IGNORE] -> exit status of the signalled orchestrator
+    FAKE_CLAUDE_PIDS="$F/pids-$1" python3 - "$HERE/test-completion.sh" "$1" "$RUN" "$scratch" "${2:-}" >"$F/sig-$1.log" 2>&1 <<'PY'
+import signal, subprocess, sys, time
+here, sig, run, scratch, ignore = sys.argv[1:6]
+driver = '''sig=$1 r=$2 d=$3; HERE=$(cd "$(dirname "$0")" && pwd)
+load() { eval "$(sed "/^# .* commands /,\\$d" "$HERE/$1")"; }; load council.sh
+RUN=$r; ST="$RUN/state.json"; DIR=$d; N=1; MAXT=3; TIMEOUT=60; MAP_PREPASS=0
+trap_calls; launch 0 "$RUN/prompts/t-r1-A.md" "t-$sig" && collect 0'''
+def child():
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(s, signal.SIG_DFL)
+    if ignore: signal.signal(getattr(signal, "SIG" + ignore), signal.SIG_IGN)
+p = subprocess.Popen(["/bin/bash", "-c", driver, here, sig, run, scratch], preexec_fn=child)
+if ignore: sys.exit(p.wait())
+time.sleep(3); p.send_signal(getattr(signal, "SIG" + sig)); sys.exit(p.wait())
+PY
+  }
+  check 143 'orchestrator SIGTERM: exits 143 after stopping the in-flight call' '' signal_case TERM
+  check 1 'orchestrator SIGTERM: no process of the call survives' '' alive "$F/pids-TERM"
+  check 130 'orchestrator SIGINT: exits 130 after stopping the in-flight call' '' signal_case INT
+  check 1 'orchestrator SIGINT: no process of the call survives' '' alive "$F/pids-INT"
+  check 129 'orchestrator SIGHUP: exits 129 after stopping the in-flight call' '' signal_case HUP
+  check 1 'orchestrator SIGHUP: no process of the call survives' '' alive "$F/pids-HUP"
+  : >"$FAKE_CLAUDE_OK"
+  check 0 'orchestrator started with SIGINT ignored (a background run) still launches and collects a call' '' signal_case ignored INT
+  rm -f "$FAKE_CLAUDE_OK"
+  # the launch window: a signal handled after the fork but before the attempt is recorded still stops it
+  window() {
+    sleep 0 & CL_PREV=$!; CL_LAUNCHING=pending
+    ( exec python3 -c 'import os,sys; os.setsid(); os.execvp("sleep",["sleep","33"])' ) & echo $! >"$F/pids-window"
+    sleep 1; stop_inflight
+  }
+  check 0 'launch window: a call forked but not yet recorded is stopped' '' window
+  check 1 'launch window: the unrecorded call does not survive' '' alive "$F/pids-window"
+  before_fork() { sleep 0 & CL_PREV=$!; CL_LAUNCHING=pending; stop_inflight; }
+  check 0 'launch window: before the fork nothing is signalled' '' before_fork
+  : >"$FAKE_CLAUDE_LEAVE"
+  left_call() { FAKE_CLAUDE_PIDS="$F/pids-left"; call t-left; }
+  check 0 'claude exit: a call that exits normally is accepted' '' left_call
+  check 1 'claude exit: a process the call left in its group is stopped' '' alive "$F/pids-left"
+  rm -f "$FAKE_CLAUDE_LEAVE"
+  stale_call() { FAKE_CLAUDE_PIDS="$F/pids-stale"; launch 0 "$RUN/prompts/t-r1-A.md" t-stale && sleep 1 && reap_stale_calls; }
+  check 0 'resume stops a call a previous orchestrator left in flight' '' stale_call
+  check 1 'resume: no process of the stale call survives' '' alive "$F/pids-stale"
+  check 0 'resume clears the stopped in-flight record' true jq -e '.members[0].inflight==null' "$ST"
+  sts '.members[0].inflight={tag:"old",pid:99999}'
+  legacy() { reap_stale_calls 2>&1; }
+  check 0 'resume warns that a 0.11.0 pid-only record cannot be verified' 'cannot be verified' legacy
+  check 0 'resume clears the 0.11.0 record without signalling it' true jq -e '.members[0].inflight==null' "$ST"
+)
 
 dedup_tests() (
   load council.sh; RUN="$scratch/dedup"; ST="$RUN/state.json"; N=3; MAXR=4; DIR=$scratch; EXEC=""
@@ -2702,5 +2789,5 @@ PY2
   check 0 'D2 recovered session: nothing was captured and the mapper was prompted once' 'true 1' sh -c 'printf "%s %s" "$(jq -e ".capture_statuses==[]" "$1")" "$(grep -c "^prompt ses_fake1 " "$2")"' _ "$P/.council-run/map/$mk/coverage.json" "$D/fo-rescan-recovered/calls.log"
   check 0 'D2 recovered session: the task continues to completion after keep' '' keep rescan-recovered "$P"
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests dedup_tests report_tests style_tests handover_tests handoff_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests dedup_tests report_tests style_tests handover_tests handoff_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"
