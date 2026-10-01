@@ -109,7 +109,7 @@ Then: `council.sh show --config council.json` → paste the roster to the user a
 config-only cost note with two measured comparisons and cost-reduction levers. Its warning
 is advisory; the measurements are not dollar predictions.
 
-When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
+When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:342`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:424,483`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
 
 The split contract file path is relative to the directory containing the map-decision JSON. A version-1 contract names `parent_id` and the exact contract `map_seed_id` printed at map review from `coverage.json`; the locator's `snapshot_id` is a distinct lookup identity and must not be substituted. It then supplies non-empty `subtasks`; every child declares unique `id`, complete `text`, boolean `execute`, and arrays `requires`, `modifies`, `deletes`, `creates`, `acceptance`, and `unresolved`. Existing-file declarations bind to `{ "path": "...", "sha256": "<64 lowercase hex>" }`; created paths must be absent. Each acceptance item requires a unique `id`, `description`, non-empty `argv`, integer `expected_exit`, and its own baseline/output paths. Shared reads are valid; sibling-output dependencies and overlapping writes are not. The validator is offline and failure returns to map review (exit 4); correct the contract or explicitly keep the parent task.
 
@@ -120,7 +120,7 @@ Replacing an approved split or keeping its parent after split validation fails a
 ### 2. Run
 
 ```
-council.sh start  --config council.json --run-dir <scratchpad>/council-<name>     # new run dir, must not exist
+council.sh start  --config council.json --run-dir ~/dev/council-runs/<date>/council-<name>     # new run dir, must not exist
 council.sh status --run-dir D                                                     # task/round, per-member context %, tokens, cost, pending questions
 council.sh report --run-dir D                                                     # token report: prompt bytes by section, de-duplication replay, duplication left
 council.sh resume --run-dir D --answers answers.json | --answer "text"            # after exit 4 (questions) or exit 2 (failure)
@@ -141,10 +141,46 @@ quota. The new session keeps the member's id and mode, and its first prompt carr
 built from that member's own earlier posts, so it continues from its positions. The replaced
 session is retired (visible in `status`/transcript as an earlier generation).
 
-Runs take minutes (rounds × slowest member): start it in the background and read the log; keep
-`--run-dir` in the scratchpad. Exit codes: **0** all tasks reached consensus · **1** config error ·
+Runs take minutes (rounds × slowest member): start it detached (below) and read the log; keep
+`--run-dir` under `~/dev/council-runs/<date>/`, not in the scratchpad: the Claude Code scratchpad
+lives under `/private/tmp`, which macOS clears on reboot (a reboot mid-run on 2026-09-23 lost a
+run's state). Exit codes: **0** all tasks reached consensus · **1** config error ·
 **2** a member failed twice (checkpointed — inspect `D/raw/*.err`, fix, `resume`) · **4** the
 council has questions for the user · **5** finished but a task is `unresolved`/`unratified`.
+
+**Claude member calls.** Each `claude -p` call runs as the leader of its own process group (a
+`python3` `os.setsid` exec wrapper, `scripts/council.sh:1103`), and every attempt writes its own
+`D/raw/<tag>-<id>-a<N>.json` (`:1100`). `kill_group` stops the whole group: SIGTERM, up to 10 s,
+SIGKILL, then up to 10 s until no live process is left (`:1034-1037`). It runs on timeout, after a
+call that exited but left processes in its group, on TERM/INT/HUP to `start`/`resume` (the trap is
+installed only there, `:1069-1074`, `:1957`, `:2011`), on a failed launch or handover (`:1612`,
+`:1637`), and on `resume` for calls left in flight. If a group survives SIGKILL, the step is not
+retried and the run stops with the failed checkpoint, exit 2 (`:1138`, `:1651`, `:1739`;
+`trap_failed` `:1064-1067`). Limit: processes that moved into another session (Claude Code's Bash
+tool starts its commands detached) stop only if claude stops them (`:1022-1023`). Measured with
+Claude Code 2.1.286: claude stops them within 1 s of SIGTERM, but they survive if claude is
+SIGKILLed; check `ps -A -o pid,ppid,command` for leftovers (README 0.11.1).
+
+**Launching a run.** A council started as a background job of the Claude session dies with that
+session. Launch it detached instead: double fork + `os.setsid`, so it ends up with PPID 1 in its own
+session. `nohup` alone only sets SIGHUP to be ignored (`man nohup`). Run it under `caffeinate -i`,
+because Mac idle sleep caused WebSocket timeouts. Keep the run log in the run dir's sibling
+`<run-dir>.out` file. Watch the WHOLE log, not a narrow grep, and relay every event to the user.
+The wrapper below was verified on 5/5 launches (detached, PPID 1, under `caffeinate -i`); for
+resume, use the same wrapper with `resume --run-dir <run-dir> ...` as the arguments.
+
+```
+python3 - <<EOF
+import os,sys
+if os.fork(): sys.exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+out=open("<run-dir>.out","ab")
+os.dup2(out.fileno(),1); os.dup2(out.fileno(),2)
+os.dup2(os.open("/dev/null",os.O_RDONLY),0)
+os.execvp("caffeinate",["caffeinate","-i","<skill-dir>/scripts/council.sh","start","--config","<config>","--run-dir","<run-dir>"])
+EOF
+```
 
 **Exit 4 — no assumptions.** Members must list every choice the task leaves open with what settles
 it (`task` / `dir` / `user` answer / `ask`); anything not settled by the task, the working directory
@@ -163,6 +199,16 @@ writes a handover note, a fresh session is created for the same member id (gener
 note + council rules are prepended to its first prompt. `status` and the transcript show per member:
 generation, context %, session tokens, cost, calls, retired sessions. Both include each
 member's final-generation + retired subtotal and a **RUN TOTAL** across all generations.
+
+**Handover gate (optional).** With `COUNCIL_HANDOVER_GATE=1` in the orchestrator's environment (it works on
+`start` and on `resume` of an existing run), the delivered handover note waits for an outside review before the
+successor reads it: `do_handover` writes `<note>.pending`, logs `handover gate: review <note>; remove
+<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1566-1580`).
+The successor reads the note by path when its prompt is built, so a reviewer may correct the file in place before
+releasing it. Without the gate the successor's prompt is written 0-1 s after the note (measured on 5 handovers), too
+soon for any review. The wait is bounded by `COUNCIL_HANDOVER_GATE_TIMEOUT` seconds (default 3600); an unreleased
+note is never delivered: the calls still in flight are stopped and the run stops with the failed checkpoint
+(exit 2) before the old session is retired, so `resume` redoes the handover.
 
 **Handoff tests.** Before a successor reads a handover note, `scripts/ptools/handoff_test.py` runs the
 external handoff-test-kit on a copy in `D/handoff/` (config: `repo_root` = `dir`, `path_bases` = [`D`], or
@@ -290,7 +336,7 @@ While a step is owed a decision, **every**
 lookup route serves that one frozen view: naming another snapshot or another task/step returns an
 explicit `unavailable_for_this_step` rather than widening what the step may read.
 
-### 3. Tests
+### 3. Token report
 
 `scripts/ptools/` is part of the skill, not an extra: `python3` is required and `council.sh` refuses to
 start without it. Every finished run's transcript ends with a **Token report** — prompt bytes by section,
@@ -318,21 +364,6 @@ and stale/missing-lookup counts are unknown unless an explicit `--trace FILE` is
 only as far as that trace claims completeness); trace repetition uses lookup's own request
 normalisation and stale/missing counts come from the real response contract. Byte counts are never
 converted into token or dollar figures and savings are never estimated.
-`scripts/ptools/test_ptools.py` is their unittest suite (751 cases, including the handoff-test adapter), run automatically by
-`scripts/test-completion.sh`.
-
-`scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
-loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and
-HTTP failures, permission-reply propagation, `wait_idle` completion, `show_result` validation,
-`prompt`/`run` status propagation, failed council turns, exact prompt references/fallbacks,
-post reuse, the question guard, diff truncation, run totals, and the code map's version gating,
-prompt delivery, staging/publish pipeline, freshness-guard replay, resume re-verification,
-handover framing, pre-launch attribution, recorded locator-delivery boundaries, the exit-2
-checkpoint on an unverifiable guard, and the stale archive/replay path. It also pins the COMPLETE
-execution, ratification and fix deliveries — fresh-session rules and predecessor-handover framing
-included — to SHA-256 baselines recovered from the pre-change commit `d62a356`, asserted with the
-map both enabled and disabled, so map content cannot leak into a non-deliberation prompt. Run it plus **separate** `/bin/bash -n` invocations for `oc.sh`, `council.sh`,
-and `test-completion.sh` after changes.
 
 ### 4. Report
 
@@ -401,7 +432,7 @@ byte-for-byte match with one of the member's own prompt files, otherwise `unknow
 
 Build/test runner with a capped summary (`run_check.py`, Python 3 standard library, POSIX only, `-h`; it **executes** the command and **writes**
 files, so unlike the other tools it is not read-only; use a `--log-dir` outside the project, `.gitignore` covers `*.log` only and
-`scripts/council.sh:1655-1657` puts `git status --short` into the ratification diff):
+`diff_text` (`scripts/council.sh:1758-1759`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
 
 ```bash
 python3 scripts/ptools/run_check.py --log-dir D [--fallback-dir F] [--reports GLOB]... [--max-bytes N] [--timeout SECONDS] -- COMMAND [ARG...]
@@ -450,3 +481,21 @@ password at startup (`server password ...`); `--port`/`--hostname`/`--cors` conf
   `opencode auth` manages credentials.
 - Empty `diff`: the session's directory was not recognised as a git repo when the session started;
   the command already falls back to `git` status of that directory.
+
+## Changing the skill
+
+`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (751 cases, including the handoff-test adapter), run automatically by
+`scripts/test-completion.sh`.
+
+`scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
+loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and
+HTTP failures, permission-reply propagation, `wait_idle` completion, `show_result` validation,
+`prompt`/`run` status propagation, failed council turns, exact prompt references/fallbacks,
+post reuse, the question guard, diff truncation, run totals, and the code map's version gating,
+prompt delivery, staging/publish pipeline, freshness-guard replay, resume re-verification,
+handover framing, pre-launch attribution, recorded locator-delivery boundaries, the exit-2
+checkpoint on an unverifiable guard, and the stale archive/replay path. It also pins the COMPLETE
+execution, ratification and fix deliveries — fresh-session rules and predecessor-handover framing
+included — to SHA-256 baselines recovered from the pre-change commit `d62a356`, asserted with the
+map both enabled and disabled, so map content cannot leak into a non-deliberation prompt. Run it plus **separate** `/bin/bash -n` invocations for `oc.sh`, `council.sh`,
+and `test-completion.sh` after changes.

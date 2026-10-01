@@ -3866,7 +3866,7 @@ class SessionReportCliTests(SessionReportCase):
             self.assertNotIn("derived only from", block, name)
             self.assertNotIn("comes only from", block, name)
         self.assertIn("751 Python standard-library unittest cases", (root / "README.md").read_text())
-        self.assertIn("1420 offline checks", (root / "README.md").read_text())
+        self.assertIn("1429 offline checks", (root / "README.md").read_text())
         self.assertIn("751 cases", (root / "SKILL.md").read_text())
 
     def test_the_docs_state_the_fill_rule_the_component_format_the_state_type_rule_and_the_numbering(self):

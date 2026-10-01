@@ -1558,6 +1558,26 @@ handoff_report() {  # the handoff-test table for the transcript and `council.sh 
   return 0
 }
 
+# Optional handover gate (env COUNCIL_HANDOVER_GATE=1): the delivered note waits for an outside review before the
+# successor reads it (by path, at prompt build time), so the reviewer may correct the file in place. Release by
+# removing <note>.pending. Bounded by COUNCIL_HANDOVER_GATE_TIMEOUT seconds (default 3600); an unreleased note is
+# never delivered: the calls still in flight are stopped and the run stops with the failed checkpoint (exit 2),
+# before the old session is retired, so resume redoes the handover.
+handover_gate() {  # note
+  [ "${COUNCIL_HANDOVER_GATE:-0}" = 1 ] || return 0
+  local note=$1 pend="$1.pending" limit=${COUNCIL_HANDOVER_GATE_TIMEOUT:-3600} t0
+  printf '%s\n' "$note" >"$pend" || { log "handover gate: cannot write $pend — stopping with the failed checkpoint"; stop_inflight; sts '.status="failed"'; exit 2; }
+  log "handover gate: review $note; remove $pend to release (timeout ${limit}s)"
+  t0=$(date +%s)
+  while [ -e "$pend" ]; do
+    if [ $(( $(date +%s) - t0 )) -ge "$limit" ]; then
+      log "handover gate: $pend not released within ${limit}s — the note is not delivered; stopping with the failed checkpoint (resume redoes the handover)"
+      stop_inflight; sts '.status="failed"'; exit 2
+    fi
+    sleep 2
+  done
+  log "handover gate: released $note"
+}
 do_handover() {  # idx -> old session writes a note; new session created; note stored for the next prompt
   local i=$1 id; id=$(mid $i)
   log "member $id: context $(st ".members[$i].ctx_used // 0") tokens ($(ctx_pct $i)%) reached its $(st ".members[$i] | (.handover_at // $HANDOVER) as \$h | if \$h > 1 then (\$h|tostring)+\" tokens\" else ((\$h*100|floor)|tostring)+\"%\" end") handover threshold — new session"
@@ -1567,6 +1587,7 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
   [ "$CALL_LEFT_RUNNING" = 1 ] && return 1   # never open a new session beside a handover call that survived SIGKILL
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
   handoff_check $i "$note" handover; note=$HANDOFF_DELIVER
+  handover_gate "$note"
   local old; old=$(mget $i session)
   sts --argjson i $i --arg note "$note" --arg old "$old" \
     '.members[$i] |= (.retired += [{session:.session, gen:.gen, tokens:.session_tokens, cost:.session_cost}] | .gen+=1 | .session=null | .fresh=true | .handover_note=$note | .ctx_used=0 | .session_tokens=0 | .session_cost=0 | .session_calls=0)

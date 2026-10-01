@@ -171,7 +171,7 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `bash scripts/test-completion.sh` — 1420 offline checks (no network, no model calls), including
+- **Tests.** `bash scripts/test-completion.sh` — 1429 offline checks (no network, no model calls), including
   `scripts/ptools/test_ptools.py` (751 Python standard-library unittest cases for the analysis tools and the handoff-test adapter).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
@@ -267,6 +267,14 @@ every delivered note is the original plus exactly its recorded authorized repair
 
 ## Release notes
 
+- **0.11.3** — optional handover gate: with `COUNCIL_HANDOVER_GATE=1` the delivered handover note waits (bounded by
+  `COUNCIL_HANDOVER_GATE_TIMEOUT`, default 3600 s) until `<note>.pending` is removed, so the note can be verified
+  and corrected before the successor reads it; an unreleased note is never delivered (calls stopped, failed
+  checkpoint, exit 2; `resume` redoes the handover). Without it the successor prompt follows the note within 0-1 s.
+  SKILL.md fixes: the run dir goes under `~/dev/council-runs/<date>/` (not the `/private/tmp` scratchpad), a verified
+  detached launch wrapper under `caffeinate -i`, the 0.11.1 timeout/process-group and 0.11.2 mapper-repair
+  behaviour documented, a stale line citation fixed, and the development checks moved to "Changing the skill".
+  test-completion.sh: 1429 checks.
 - **0.11.2** — the map pre-pass no longer loses the whole map when the mapper's reply is almost-JSON. The mapper
   prompt now asks for exactly one JSON object with a literal example (the old wording described the reply in
   unquoted pseudo-notation, which openai/gpt-6-luna copied in 2 of 2 measured calls) and says `stopped_reason`

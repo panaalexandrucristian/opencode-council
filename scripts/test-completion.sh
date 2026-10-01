@@ -92,6 +92,23 @@ council_tests() (
   check 0 'council accepted the successful vote' '' jq -e '.last_votes[0].vote=="agree"' "$ST"
   result_rc=1; for wait_rc in 2 3; do sts '.members[0].inflight={tag:"wait"}'; check "$wait_rc" "council preserves wait=$wait_rc" '' collect 0; done
 )
+gate_tests() (
+  load council.sh; RUN="$scratch/gate"; ST="$RUN/state.json"; mkdir -p "$RUN/handoff"
+  jq -n '{status:"running",members:[]}' >"$ST"; note="$RUN/handoff/handover-g1-A.fixed.md"; printf 'note\n' >"$note"
+  stop_inflight() { echo stopped >>"$RUN/stopped"; }
+  check 0 'handover gate: off by default, returns at once and writes no marker' '' sh -c '! test -e "$1"' _ "$note.pending"
+  off() { unset COUNCIL_HANDOVER_GATE; handover_gate "$note" && ! test -e "$note.pending"; }
+  check 0 'handover gate: disabled gate does not block' '' off
+  released() { ( sleep 3; rm -f "$note.pending" ) & COUNCIL_HANDOVER_GATE=1 handover_gate "$note" 2>"$RUN/gate.log"; }
+  check 0 'handover gate: waits until the marker is removed, then continues' '' released
+  check 0 'handover gate: the marker named the note to review' "review $note" cat "$RUN/gate.log"
+  check 0 'handover gate: logs the release' "released $note" cat "$RUN/gate.log"
+  timed_out() { COUNCIL_HANDOVER_GATE=1 COUNCIL_HANDOVER_GATE_TIMEOUT=2 handover_gate "$note"; }
+  check 2 'handover gate: an unreleased note stops the run with exit 2 after the timeout' '' timed_out
+  check 0 'handover gate: timeout leaves the failed checkpoint' failed jq -r .status "$ST"
+  check 0 'handover gate: timeout stops the calls still in flight before exiting' stopped cat "$RUN/stopped"
+  check 0 'handover gate: do_handover gates the delivered note before retiring the session' '' sh -c 'sed -n "/^do_handover()/,/^}/p" "$1" | grep -A1 "handoff_check \$i" | grep -q "handover_gate \"\$note\""' _ "$HERE/council.sh"
+)
 orphan_tests() (
   load council.sh; RUN="$scratch/orphan"; ST="$RUN/state.json"; N=1; DIR=$scratch; MAXT=3; TIMEOUT=2; MAP_PREPASS=0
   F="$scratch/fakeclaude"; mkdir -p "$RUN/raw" "$RUN/prompts" "$F"
@@ -2794,5 +2811,5 @@ PY2
   check 0 'D2 recovered session: nothing was captured and the mapper was prompted once' 'true 1' sh -c 'printf "%s %s" "$(jq -e ".capture_statuses==[]" "$1")" "$(grep -c "^prompt ses_fake1 " "$2")"' _ "$P/.council-run/map/$mk/coverage.json" "$D/fo-rescan-recovered/calls.log"
   check 0 'D2 recovered session: the task continues to completion after keep' '' keep rescan-recovered "$P"
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests dedup_tests report_tests style_tests handover_tests handoff_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests handoff_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"
