@@ -2364,6 +2364,168 @@ class CaptureSeamTests(unittest.TestCase):
 
 
 class MapPrepassTests(unittest.TestCase):
+    # Byte-exact openai/gpt-6-luna mapper replies from:
+    # ~/dev/council-runs/2026-09-28/council-kit-analysis/map/<key>/response.txt.
+    LUNA_REPLIES = {
+        "f8d369d8a4d84455": ("604a3ac22d918dc3a6de676a5d3d56c9b8baad2e90c8199bb9b5193b2fe52aa7", '''candidates:[
+  {path:".council-kit/plan-diagnoza-si-optimizare.md",lines:[3,39]},
+  {path:".council-kit/plan-diagnoza-si-optimizare.md",lines:[96,105]},
+  {path:".council-kit/plan-diagnoza-si-optimizare.md",lines:[133,140]},
+  {path:".council-kit/tools/session_report.py",lines:[1,17]},
+  {path:".council-kit/tools/session_report.py",lines:[225,225]},
+  {path:".council-kit/tools/session_report.py",lines:[297,316]},
+  {path:"scripts/council.sh",lines:[91,104]},
+  {path:"scripts/council.sh",lines:[237,242]},
+  {path:"scripts/council.sh",lines:[288,321]},
+  {path:"scripts/council.sh",lines:[312,424]},
+  {path:"scripts/council.sh",lines:[873,919]},
+  {path:"scripts/council.sh",lines:[1025,1030]},
+  {path:"scripts/council.sh",lines:[1399,1399]},
+  {path:"scripts/council.sh",lines:[1492,1492]},
+  {path:"scripts/council.sh",lines:[1602,1602]},
+  {path:"scripts/council.sh",lines:[1796,1796]},
+  {path:"scripts/council_codemap.py"},
+  {path:"scripts/council_map_prepass.py"},
+  {path:"scripts/ptools/test_ptools.py",lines:[2358,2446]},
+  {path:"scripts/ptools/test_ptools.py",lines:[2681,2705]},
+  {path:"README.md",lines:[98,157]},
+  {path:"SKILL.md",lines:[101,112]},
+  {path:"examples/council.json",lines:[1,8]},
+  {path:"examples/README.md",lines:[27,27]}
+],
+unresolved:[
+  {target:"Obiectele sursă la 10be83c: `git show 10be83c:<cale>` pentru `scripts/council.sh` și codul map-ului",reason:"Accesul disponibil permite citirea fișierelor proiectului, dar nu consultarea obiectelor Git istorice cerute."},
+  {target:"Căile candidate din `.council-kit/tools/` citate de plan: `repo_map.py`, `run_check.py`, `evidence.py`",reason:"Nu au fost găsite în conținutul vizibil al kitului; planul le menționează, dar fișierele nu sunt prezente în rezultatele căutării."},
+  {target:"Artefactele/transcrierile sesiunilor externe ce susțin 77%, 34%, 38,8M, ~60k și ~16,5k",reason:"Valorile măsurate extern nu pot fi confirmate din codul repo-ului."},
+  {target:"Configurațiile/run-urile concrete folosite pentru a verifica persistența sesiunilor și setările implicite",reason:"Căutarea a identificat implementarea și exemplele de config; nu au fost identificate artefacte de run care să confirme măsurători efective."}
+],
+stopped_reason:"Oprire după localizarea planului, codului curent, testelor și documentației candidate. Verificarea codului istoric solicitat prin `git show` nu este disponibilă prin uneltele active."
+'''),
+        "9b22875bd10d4f63": ("67b3e8a264c5c3950cabe958c38fedc84aaf21dba39fbbb1609af7c923740a84", '''candidates:[
+  {path:".council-kit/plan-diagnoza-si-optimizare.md",lines:[1,177]},
+  {path:".council-kit/tools/session_report.py",lines:[1,374]},
+  {path:".council-kit/tools/repo_map.py",lines:[1,188]},
+  {path:".council-kit/tools/run_check.py",lines:[1,77]},
+  {path:".council-kit/tools/evidence.py",lines:[1,162]},
+  {path:"SKILL.md",lines:[80,229]},
+  {path:"README.md",lines:[5,15]},
+  {path:"scripts/council.sh",lines:[49,59]},
+  {path:"scripts/council.sh",lines:[1013,1035]},
+  {path:"scripts/council.sh",lines:[1411,1477]},
+  {path:"scripts/council.sh",lines:[1546,1621]},
+  {path:"scripts/council.sh",lines:[1652,1670]},
+  {path:"scripts/council.sh",lines:[1763,1776]},
+  {path:"scripts/ptools/prompt_report.py"},
+  {path:"scripts/ptools/dedup_check.py"},
+  {path:"scripts/ptools/codemap_report.py"},
+  {path:"scripts/ptools/handoff_test.py"},
+  {path:"scripts/ptools/handoff_replay.py"},
+  {path:"scripts/ptools/codemap_report.py",lines:[1,7]},
+  {path:"scripts/council_codemap.py"},
+  {path:"scripts/council_map_prepass.py"},
+  {path:"scripts/council_splitcheck.py"},
+  {path:"scripts/test-completion.sh",lines:[1,8]},
+  {path:"scripts/test-completion.sh",lines:[2700,2705]},
+  {path:"scripts/ptools/test_ptools.py",lines:[1,47]}
+]
+unresolved:[
+  {target:"HEAD 10be83c (0.9.0) versus current uncommitted handoff-kit branch changes",reason:"Requested revision/status comparison not established from the candidate files."},
+  {target:"Tests specific to the four .council-kit tools and their callers",reason:"No matching test locations identified in the searched test files."},
+  {target:"Configuration/examples relevant to proposed tool integration",reason:"No specific config or example locations verified for these four tools."}
+]
+stopped_reason:"Candidate-location search only; recommendations and implementation decisions excluded by requested output scope."
+'''),
+    }
+
+    def test_luna_js_object_replies_are_repaired_without_changing_values(self):
+        item = re.compile(r'\{path:"([^"]*)"(?:,lines:\[(\d+),(\d+)\])?\}')
+        unres = re.compile(r'\{target:("(?:[^"\\]|\\.)*"),reason:("(?:[^"\\]|\\.)*")\}')
+        stop = re.compile(r'stopped_reason:("(?:[^"\\]|\\.)*")')
+        for key, n_cand, n_unres, commas in (("f8d369d8a4d84455", 24, 4, 0), ("9b22875bd10d4f63", 25, 3, 2)):
+            digest, text = self.LUNA_REPLIES[key]
+            raw = text.encode("utf-8")
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), digest, key)
+            result, errors = map_prepass.validate_mapper_output(raw)
+            self.assertEqual(errors, [], key)
+            expected = [dict({"path": p}, **({"lines": [int(a), int(b)]} if a else {})) for p, a, b in item.findall(text)]
+            self.assertEqual(len(expected), n_cand, key)
+            self.assertEqual(result["candidates"], expected, key)
+            self.assertEqual(result["unresolved"], [{"target": json.loads(t), "reason": json.loads(r)} for t, r in unres.findall(text)], key)
+            self.assertEqual(len(result["unresolved"]), n_unres, key)
+            self.assertEqual(result["stopped_reason"], json.loads(stop.search(text).group(1)), key)
+            self.assertEqual(result["status"], "partial", "free-text stopped_reason remains partial")
+            self.assertEqual(result["repairs"][-1], "added missing outer braces", key)
+            self.assertEqual([r for r in result["repairs"] if r.startswith("inserted")],
+                             ["inserted missing comma before key unresolved", "inserted missing comma before key stopped_reason"][:commas], key)
+            self.assertTrue(all(r.startswith(("quoted key ", "inserted missing comma before key ", "added missing outer braces")) for r in result["repairs"]), key)
+
+    def test_syntax_repair_never_changes_values_and_leaves_ambiguous_text_malformed(self):
+        raw = b'candidates:[{path:"src/a.py",lines:[1,2]},]\nunresolved:[{target:"x: y, \\"q\\" z:",reason:"r"}]\nstopped_reason:"done"'
+        result, errors = map_prepass.validate_mapper_output(raw)
+        self.assertEqual((result["status"], errors), ("ok", []))
+        self.assertEqual(result["candidates"], [{"path": "src/a.py", "lines": [1, 2]}])
+        self.assertEqual(result["unresolved"], [{"target": 'x: y, "q" z:', "reason": "r"}])
+        self.assertIn("removed trailing comma before ]", result["repairs"])
+        for bad in (b"not json", b"{'candidates':[]}", b"candidates:[{path:'src/a.py'}]\nstopped_reason:done",
+                    b"[1,2,]", b'candidates:[{path:"src/a.py" lines:[1,2]}]\nstopped_reason:"done"',
+                    b'candidates:[{path:"src/a.py"}]\ncandidates:[{path:"src/b.py"}]\nstopped_reason:"done"',
+                    b'candidates:[{path:"src/a.py"}]\nstopped_reason:"do\x01ne"', b'candidates:[{path:"src/a.py"',
+                    b'candidates:[{path:"src/a.py"}] // note\nstopped_reason:"done"',
+                    b'{"candidates":[{"path":"src/a.py"}],"stopped_reason":"done"} thanks'):
+            result, errors = map_prepass.validate_mapper_output(bad)
+            self.assertEqual(result["status"], "unavailable", bad)
+            self.assertNotIn("repairs", result, bad)
+        self.assertEqual(map_prepass.validate_mapper_output(b"not json")[1],
+                         ["malformed mapper JSON: Expecting value: line 1 column 1 (char 0)"])
+        valid = json.dumps({"candidates": [{"path": "src/a.py"}], "unresolved": [], "stopped_reason": "done"}).encode()
+        self.assertNotIn("repairs", map_prepass.validate_mapper_output(valid)[0])
+
+    def test_mapper_repair_rejects_missing_entries_and_duplicates_on_both_paths(self):
+        cases = [
+            '{"candidates":[{"path":"a"}],"candidates":[{"path":"b"}],"stopped_reason":"done"}',
+            '{"candidates":[{"path":"a","path":"b"}],"stopped_reason":"done"}',
+            r'{"candidates":[{"path":"a"}],"cand\u0069dates":[{"path":"b"}],"stopped_reason":"done"}',
+            '{candidates:[{path:"a"}],unresolved:[,],stopped_reason:"done"}',
+            '{candidates:[{path:"a"}],stopped_reason:"done",extra:{,}}',
+            '{candidates:[{path:"a"}],stopped_reason:"done",extra:{"x":,}}',
+            '{candidates:[{path:"a"}],stopped_reason:"done",extra:[1,,]}',
+            '{candidates:[{path:"a"}],stopped_reason:"done",extra:NaN}',
+            '{"candidates":[{"path":"a"}],"stopped_reason":"done","extra":Infinity}',
+            '{candidates:[{path:"a"}],stopped_reason:"do\nne"}',
+            '{candidates:[{path:"a"}],stopped_reason:"do\tne"}',
+            '{candidates:[{path:"a"}],\x00stopped_reason:"done"}',
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                result, errors = map_prepass.validate_mapper_output(raw)
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["candidates"], [])
+                self.assertTrue(errors)
+                self.assertNotIn("repairs", result)
+
+    def test_mapper_fence_removal_is_logged_and_valid_json_stays_unchanged(self):
+        obj = {"candidates": [{"path": "a"}], "unresolved": [], "stopped_reason": "done"}
+        raw = json.dumps(obj)
+        strict, errors = map_prepass.validate_mapper_output(raw)
+        self.assertEqual(errors, [])
+        self.assertNotIn("repairs", strict)
+        fenced, errors = map_prepass.validate_mapper_output("```json\n" + raw + "\n```")
+        self.assertEqual(errors, [])
+        self.assertEqual(fenced, dict(strict, repairs=["removed JSON code fence"]))
+
+    def test_mapper_cli_emits_every_accepted_repair_without_schema_errors(self):
+        for key, (digest, text) in self.LUNA_REPLIES.items():
+            with self.subTest(key=key):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(map_prepass.Path, "read_bytes", return_value=text.encode("utf-8")):
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        rc = map_prepass.main(["response.txt"])
+                data = json.loads(stdout.getvalue())
+                self.assertEqual(rc, 0)
+                self.assertEqual(data["errors"], [])
+                self.assertEqual(stderr.getvalue().splitlines(),
+                                 ["mapper JSON syntax repaired: " + x for x in data["result"]["repairs"]])
+
     def test_mapper_response_valid_partial_malformed_empty_and_oversized(self):
         valid = json.dumps({"candidates":[{"path":"src/a.py","lines":[1,2]}],
                             "unresolved":[{"target":"caller","reason":"not found"}],
@@ -3703,9 +3865,9 @@ class SessionReportCliTests(SessionReportCase):
                 self.assertIn(needle, block, "%s: %s" % (name, needle))
             self.assertNotIn("derived only from", block, name)
             self.assertNotIn("comes only from", block, name)
-        self.assertIn("746 Python standard-library unittest cases", (root / "README.md").read_text())
-        self.assertIn("1395 offline checks", (root / "README.md").read_text())
-        self.assertIn("746 cases", (root / "SKILL.md").read_text())
+        self.assertIn("751 Python standard-library unittest cases", (root / "README.md").read_text())
+        self.assertIn("1420 offline checks", (root / "README.md").read_text())
+        self.assertIn("751 cases", (root / "SKILL.md").read_text())
 
     def test_the_docs_state_the_fill_rule_the_component_format_the_state_type_rule_and_the_numbering(self):
         root = Path(os.environ.get("SESSION_REPORT_DOCS", str(HERE.parent.parent)))

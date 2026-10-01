@@ -171,8 +171,8 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `bash scripts/test-completion.sh` — 1395 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (746 Python standard-library unittest cases for the analysis tools and the handoff-test adapter).
+- **Tests.** `bash scripts/test-completion.sh` — 1420 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (751 Python standard-library unittest cases for the analysis tools and the handoff-test adapter).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.

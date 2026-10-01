@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import sys
 
@@ -12,6 +13,70 @@ def _safe_path(value):
         return False
     p = Path(value)
     return "\\" not in value and not p.is_absolute() and all(part not in ("", ".", "..") for part in value.split("/"))
+
+
+_BARE_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*(?=\s*:)')
+_TOP_KEYS = ("candidates", "unresolved", "stopped_reason")
+
+
+def _repair_json_syntax(text):
+    """Repair punctuation and keys outside strings; accept only after strict validation."""
+    out, repairs, i, n, depth = [], [], 0, len(text), 0
+    top = 1 if text.startswith("{") else 0
+
+    def before_key(name):
+        prev = next((s for s in reversed(out) if not s.isspace()), "")
+        if depth == top and name in _TOP_KEYS and prev[-1:] not in ("", "{", ","):
+            out.append(",")
+            repairs.append("inserted missing comma before key {}".format(name))
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            k = j + 1
+            while k < n and text[k].isspace():
+                k += 1
+            if k < n and text[k] == ":":
+                before_key(text[i + 1:j])
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if c == ",":
+            k = i + 1
+            while k < n and text[k].isspace():
+                k += 1
+            prev = next((s for s in reversed(out) if not s.isspace()), "")
+            if k < n and text[k] in "}]" and prev[-1:] not in ("", "{", "[", ",", ":"):
+                repairs.append("removed trailing comma before {}".format(text[k]))
+                i += 1
+                continue
+        m = _BARE_KEY.match(text, i)
+        if m and not (i and (text[i - 1].isalnum() or text[i - 1] == "_")):
+            before_key(m.group(0))
+            out.append('"{}"'.format(m.group(0)))
+            repairs.append("quoted key {}".format(m.group(0)))
+            i = m.end()
+            continue
+        depth += {"{": 1, "[": 1, "}": -1, "]": -1}.get(c, 0)
+        out.append(c)
+        i += 1
+    fixed = "".join(out).strip()
+    if fixed.startswith('"'):
+        fixed = "{" + fixed + "}"
+        repairs.append("added missing outer braces")
+    return fixed, repairs
+
+
+def _unique_keys(pairs):
+    if len({k for k, _ in pairs}) != len(pairs):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _reject_constant(value):
+    raise ValueError("non-JSON constant: " + value)
 
 
 def validate_mapper_output(raw, max_output_bytes=65536):
@@ -27,10 +92,20 @@ def validate_mapper_output(raw, max_output_bytes=65536):
     try:
         text = raw.decode("utf-8")
         stripped = text.strip()
+        repairs = []
         if stripped.startswith("```json") and stripped.endswith("```"):
             stripped = stripped[len("```json"): -3].strip()
-        obj = json.loads(stripped)
-    except (UnicodeDecodeError, ValueError) as exc:
+            repairs.append("removed JSON code fence")
+        try:
+            obj = json.loads(stripped, object_pairs_hook=_unique_keys, parse_constant=_reject_constant)
+        except json.JSONDecodeError as exc:
+            fixed, syntax_repairs = _repair_json_syntax(stripped)
+            repairs.extend(syntax_repairs)
+            try:
+                obj = json.loads(fixed, object_pairs_hook=_unique_keys, parse_constant=_reject_constant)
+            except ValueError:
+                raise exc
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         return {"status": "unavailable", "candidates": [], "unresolved": [],
                 "stopped_reason": "malformed", "coverage": "unknown"}, ["malformed mapper JSON: {}".format(exc)]
     if not isinstance(obj, dict):
@@ -72,8 +147,11 @@ def validate_mapper_output(raw, max_output_bytes=65536):
     stop_kind = stopped.strip().lower() if isinstance(stopped,str) else ""
     if stop_kind not in ("done", "complete", "completed", "finished"):
         status="partial" if candidates else "unavailable"
-    return {"status": status, "candidates": candidates, "unresolved": unresolved,
-            "stopped_reason": stopped, "coverage": "unknown"}, errors
+    result = {"status": status, "candidates": candidates, "unresolved": unresolved,
+              "stopped_reason": stopped, "coverage": "unknown"}
+    if repairs:
+        result["repairs"] = repairs
+    return result, errors
 
 
 def prepare_captures(result, root, run_dir=None):
@@ -231,6 +309,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     raw = Path(a.raw).read_bytes()
     result, errors = validate_mapper_output(raw, a.max_output_bytes)
+    for note in result.get("repairs", []):
+        print("mapper JSON syntax repaired: {}".format(note), file=sys.stderr)
     if a.root:
         original_count = len(result.get("candidates", []))
         candidates, exclusions, capture_errors = prepare_captures(result, a.root, a.run_dir)

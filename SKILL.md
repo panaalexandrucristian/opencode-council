@@ -318,7 +318,7 @@ and stale/missing-lookup counts are unknown unless an explicit `--trace FILE` is
 only as far as that trace claims completeness); trace repetition uses lookup's own request
 normalisation and stale/missing counts come from the real response contract. Byte counts are never
 converted into token or dollar figures and savings are never estimated.
-`scripts/ptools/test_ptools.py` is their unittest suite (746 cases, including the handoff-test adapter), run automatically by
+`scripts/ptools/test_ptools.py` is their unittest suite (751 cases, including the handoff-test adapter), run automatically by
 `scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it

@@ -2084,20 +2084,25 @@ mapper_response_process_tests() (
   cp -R "$HERE" "$D/impl/" || exit 1; write_fake_oc "$D/impl/scripts/oc.sh"
   printf 'one\ntwo\nthree\n' >"$D/proj/src/a.py"
   valid='{"candidates":[{"path":"src/a.py","lines":[1,2]}],"unresolved":[],"stopped_reason":"done"}'
-  for variant in valid partial empty malformed oversized timeout; do
+  for variant in valid partial empty malformed luna oversized timeout; do
     F="$D/fo-$variant"; R="$D/run-$variant"; mkdir -p "$F"; maxb=65536
     case "$variant" in
       valid) printf '%s\n' "$valid" >"$F/mapper-response" ;;
       partial) printf '%s\n' '{"candidates":[{"path":"src/a.py","lines":[1,2]},{"path":"src/a.py","lines":[50,60]}],"unresolved":[],"stopped_reason":"done"}' >"$F/mapper-response" ;;
       empty) : >"$F/mapper-response" ;;
       malformed) printf 'this is not json\n' >"$F/mapper-response" ;;
+      luna) printf 'candidates:[\n  {path:"src/a.py",lines:[1,2]}\n]\nunresolved:[{target:"caller",reason:"not found: a.py, b:c"}]\nstopped_reason:"done"\n' >"$F/mapper-response" ;;
       oversized) printf '%s\n' "$valid" >"$F/mapper-response"; maxb=16 ;;
       timeout) printf '%s\n' "$valid" >"$F/mapper-response"; touch "$F/mapper-timeout" ;;
     esac
     jq -n --arg d "$D/proj" --argjson mb "$maxb" '{dir:$d,max_rounds:2,timeout_s:30,handover_at:0.5,executor:null,map_code:true,map_prepass:{kind:"opencode",model:"p/m",effort:"medium",max_output_bytes:$mb},members:[{id:"A",kind:"opencode",model:"p/m",effort:"medium",mode:"read"},{id:"B",kind:"opencode",model:"p/m",effort:"medium",mode:"read"}],tasks:[{id:"only",text:"investigate a"}]}' >"$D/cfg-$variant.json"
     step() { local label=$1; shift; ( cd "$D" && FAKE_OC_DIR="$F" bash "$D/impl/scripts/council.sh" "$@" >"$D/$label.out" 2>"$D/$label.err" ); }
     check 4 "T6 $variant mapper response reaches map review" '' step "$variant-start" start --config "$D/cfg-$variant.json" --run-dir "$R"
-    case "$variant" in valid) want=complete;; partial) want=partial;; *) want=unavailable;; esac
+    case "$variant" in valid|luna) want=complete;; partial) want=partial;; *) want=unavailable;; esac
+    check 0 "T6 $variant mapper prompt asks for exactly one JSON object" '' grep -q 'Reply with exactly one JSON object and nothing else' "$R/map/$(printf only | shasum -a 256 | cut -c1-16)/instruction.md"
+    check 0 "T6 $variant mapper prompt explains done" '' grep -q 'stopped_reason is "done" when the search finished' "$R/map/$(printf only | shasum -a 256 | cut -c1-16)/instruction.md"
+    [ "$variant" != luna ] || check 0 'T6 luna-shaped reply: every syntax repair is logged and no value changes' true jq -e '.map_prepasses.only.mapper_result | .repairs==["quoted key candidates","quoted key path","quoted key lines","inserted missing comma before key unresolved","quoted key unresolved","quoted key target","quoted key reason","inserted missing comma before key stopped_reason","quoted key stopped_reason","added missing outer braces"] and .candidates==[{"path":"src/a.py","lines":[1,2]}] and .unresolved==[{"target":"caller","reason":"not found: a.py, b:c"}]' "$R/state.json"
+    [ "$variant" != luna ] || check 0 'T6 luna map review lists the syntax repairs' '' grep -qx '  inserted missing comma before key unresolved' "$D/luna-start.out"
     check 0 "T6 $variant mapper response is classified $want" "$want" jq -r '.map_prepasses.only.status' "$R/state.json"
     check 0 "T6 $variant coverage stays unknown" unknown jq -r '.coverage' "$R/map/$(printf only | shasum -a 256 | cut -c1-16)/coverage.json"
     [ "$variant" = timeout ] || check 0 "T6 $variant raw mapper response bytes are retained" '' cmp "$F/mapper-response" "$R/map/$(printf only | shasum -a 256 | cut -c1-16)/response.txt"
