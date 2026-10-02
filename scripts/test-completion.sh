@@ -5,7 +5,6 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d /tmp/opencode-completion.XXXXXX) || exit 1
 export TMPDIR="$scratch"
 export PYTHONDONTWRITEBYTECODE=1  # every python3 invocation below must not dirty tracked ptools/__pycache__
-export HANDOFF_TEST_KIT="$scratch/no-handoff-kit"  # member handovers never reach a real kit; handoff_tests use a fake one
 : >"$scratch/passed"
 trap '[ "$BASH_SUBSHELL" -ne 0 ] || rm -rf "$scratch"' EXIT
 curl() { echo "unexpected network call" >&2; return 99; }
@@ -93,8 +92,8 @@ council_tests() (
   result_rc=1; for wait_rc in 2 3; do sts '.members[0].inflight={tag:"wait"}'; check "$wait_rc" "council preserves wait=$wait_rc" '' collect 0; done
 )
 gate_tests() (
-  load council.sh; RUN="$scratch/gate"; ST="$RUN/state.json"; mkdir -p "$RUN/handoff"
-  jq -n '{status:"running",members:[]}' >"$ST"; note="$RUN/handoff/handover-g1-A.fixed.md"; printf 'note\n' >"$note"
+  load council.sh; RUN="$scratch/gate"; ST="$RUN/state.json"; mkdir -p "$RUN/raw"
+  jq -n '{status:"running",members:[]}' >"$ST"; note="$RUN/raw/handover-g1-A.md"; printf 'note\n' >"$note"
   stop_inflight() { echo stopped >>"$RUN/stopped"; }
   check 0 'handover gate: off by default, returns at once and writes no marker' '' sh -c '! test -e "$1"' _ "$note.pending"
   off() { unset COUNCIL_HANDOVER_GATE; handover_gate "$note" && ! test -e "$note.pending"; }
@@ -107,7 +106,7 @@ gate_tests() (
   check 2 'handover gate: an unreleased note stops the run with exit 2 after the timeout' '' timed_out
   check 0 'handover gate: timeout leaves the failed checkpoint' failed jq -r .status "$ST"
   check 0 'handover gate: timeout stops the calls still in flight before exiting' stopped cat "$RUN/stopped"
-  check 0 'handover gate: do_handover gates the delivered note before retiring the session' '' sh -c 'sed -n "/^do_handover()/,/^}/p" "$1" | grep -A1 "handoff_check \$i" | grep -q "handover_gate \"\$note\""' _ "$HERE/council.sh"
+  check 0 'handover gate: do_handover gates the delivered note before retiring the session' '' sh -c 'sed -n "/^do_handover()/,/^}/p" "$1" | grep -q "^  handover_gate \"\$note\"$"' _ "$HERE/council.sh"
 )
 orphan_tests() (
   load council.sh; RUN="$scratch/orphan"; ST="$RUN/state.json"; N=1; DIR=$scratch; MAXT=3; TIMEOUT=2; MAP_PREPASS=0
@@ -376,223 +375,6 @@ handover_tests() (
   mk 1000 2000 2;  check 0 'absolute threshold ignores the context window' '' needs_handover 0
   mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
   mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
-)
-# The external handoff-test-kit is replaced by a deterministic fake (the real kit only runs in the
-# ptools real-kit contract tests and in scripts/ptools/handoff_replay.py). The fake prints the kit's
-# output format, logs what it was given, and its paired handoff-fix.py carries the span rules the
-# adapter loads from the kit (gap_spans, SHA, BANNER, GAP_HEAD).
-make_fake_kit() {  # dir
-  mkdir -p "$1"
-  cat >"$1/handoff-test.sh" <<'SH'
-#!/bin/bash
-fix=0; cfg=""; h=""
-while [ $# -gt 0 ]; do case "$1" in --fix) fix=1; shift ;; --config) cfg=$2; shift 2 ;; *) h=$1; shift ;; esac; done
-echo "argv fix=$fix config=$cfg file=$h" >>"$FAKE_KIT_LOG"
-cat "$h" >>"$FAKE_KIT_LOG.input"; [ -z "$cfg" ] || cat "$cfg" >>"$FAKE_KIT_LOG.config"
-mode=${FAKE_KIT_MODE:-clean}
-case $mode in
-  sleep) echo $$ >"$FAKE_KIT_LOG.pid"; sleep 30; exit 0 ;;
-  rc3) echo "handoff-test: boom from the fake kit" >&2; exit 3 ;;
-  garbage) echo "this is not the kit's output"; exit 0 ;;
-esac
-S4="a runnable verification block (python3 - <<'PY' ... PY)"
-report() {
-  local ok=0 fail=0 gap=0 skip=1
-  echo "== 1. every path the handoff names resolves =="
-  if [ "$mode" = drift ]; then
-    echo '  FAIL  unresolvable: PYTHONDONTWRITEBYTECODE=1 python3 scripts/x.py'; echo '  FAIL  unresolvable:  M SKILL.md'; fail=$((fail+2))
-  else echo '  ok    notes.md'; ok=$((ok+1)); fi
-  echo "== 2. numeric claims against their source document =="; echo '  skip  no assertions configured'
-  echo "== 3. external facts (git / versions) =="
-  if [ "$mode" = sha ]; then
-    if grep -q abc1234 "$h"; then echo '  FAIL  branch head: handoff says abc1234, branch is at def5678'; fail=$((fail+1)); else echo '  ok    branch head def5678'; ok=$((ok+1)); fi
-  fi
-  echo "== 4. the verification command the handoff hands over actually runs =="; echo "  GAP   $S4"; gap=$((gap+1))
-  echo "== 5. coverage: does it answer what a cold reader will ask? =="
-  case $mode in gap|drift|sha|prose|blocks|ver|hex|num|shaver|banner|banner0) echo '  GAP   the deliverable'; gap=$((gap+1)) ;; *) echo '  ok    covers: the deliverable'; ok=$((ok+1)) ;; esac
-  echo; echo "result: $ok ok · $fail fact failures · $gap coverage gaps · $skip skipped"
-  [ $fail -ne 0 ] && return 1; [ $gap -ne 0 ] && return 2; return 0
-}
-report; rc=$?
-[ "$fix" = 1 ] || exit $rc
-echo; echo "== repairing derivable facts =="
-cp "$h" "$h.bak-fake"
-case $mode in sha|shaver) sed -i '' 's/abc1234/def5678/' "$h" ;; esac
-case $mode in ver|shaver) sed -i '' 's/1\.2\.3/9.9.9/' "$h" ;; esac
-[ "$mode" = hex ] && sed -i '' 's/deadbeef/abcdefab/' "$h"
-[ "$mode" = num ] && sed -i '' 's/1234567/7654321/' "$h"
-[ "$mode" = prose ] && sed -i '' 's/hello/HELLO/' "$h"
-case $mode in banner|banner0) perl -0pi -e 's/\A(# [^\n]*\n\n)/$1> FAKE BANNER\n\n/' "$h" ;; esac
-items="- [ ] $S4"; case $mode in gap|drift|sha|prose|blocks|ver|hex|num|shaver|banner|banner0) items="- [ ] the deliverable"$'\n'"$items" ;; esac
-printf '\n## ⚠️ Gaps flagged by the self-test (not auto-fixable)\n\nNo answer was found for the following. A human or the outgoing session must write these; the test refuses to invent them.\n\n%s\n' "$items" >>"$h"
-echo "  fixed:"; echo "    - flagged uncovered topic(s)"
-echo; echo "== re-verifying =="
-report; exit $?
-SH
-  cat >"$1/handoff-fix.py" <<'PY'
-import os, re
-# the fixer interface the adapter plans with: only sha/shaver plan an edit (abc1234 -> def5678), only
-# banner meets the banner precondition; every other change a mode makes is unauthorized
-MODE = os.environ.get("FAKE_KIT_MODE", "clean")
-MARK = "FAKE BANNER"
-class Error(Exception):
-    pass
-def load_config(handoff, explicit):
-    return {}, None
-def validate(c, cfgdir, handoff):
-    return None, {}, []
-def facts(root, ext, probes):
-    return {"merged": MODE == "banner"}
-def plan_edits(s, f):
-    i = s.find("abc1234") if MODE in ("sha", "shaver") else -1
-    return ([(i, i + 7, "def5678", "branch head abc1234 -> def5678")] if i >= 0 else []), s
-GAP_HEAD = "## ⚠️ Gaps flagged by the self-test"
-GAP_TITLE = GAP_HEAD + " (not auto-fixable)"
-GAP_INTRO = ("No answer was found for the following. A human or the outgoing session must write these; "
-             "the test refuses to invent them.")
-BANNER = "> FAKE BANNER"
-SHA = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,40}(?![0-9A-Za-z])")
-def gap_spans(s):
-    spans, start, pos = [], None, 0
-    for line in s.splitlines(True):
-        body = line.rstrip("\r\n")
-        if start is not None and not (body == GAP_INTRO or body.startswith("- [ ] ") or not body):
-            spans.append((start, pos)); start = None
-        if start is None and body in (GAP_HEAD, GAP_TITLE):
-            start = pos
-        pos += len(line)
-    if start is not None:
-        spans.append((start, len(s)))
-    return spans
-PY
-}
-handoff_tests() (
-  load council.sh; local H="$scratch/hkit"; RUN="$H/run"; ST="$RUN/state.json"; N=2; MAXR=4; EXEC=""; DIR="$H/proj"; CODEMAP=0
-  mkdir -p "$RUN/raw" "$RUN/posts" "$RUN/prompts" "$DIR"; make_fake_kit "$H/kit"
-  export FAKE_KIT_LOG="$H/kit.log"; unset HANDOFF_TEST_KIT
-  local task='{"id":"t1","text":"Do X","execute":false}' NOTE_TEXT
-  fixture() {  # note-text [extra config jq]
-    rm -rf "$RUN/handoff" "$RUN/raw" "$RUN/prompts" "$RUN/posts"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts"; rm -f "$FAKE_KIT_LOG"*
-    NOTE_TEXT=$1
-    jq -n --arg d "$DIR" --argjson t "$task" --arg k "$H/kit" '{candidate:null,answers:[],notices:[],log:[],results:[],reuse_posts:false,
-       round:1, task_id:"t1", phase:"plan",
-       config:{dir:$d,tasks:[$t],max_rounds:4,handoff_kit:$k},
-       members:[{id:"A",kind:"opencode",model:"m",effort:"h",mode:"read",fresh:false,session:"ses_a",session_calls:3,retired:[],gen:1,ctx_used:900,ctx_limit:1000,session_tokens:5,session_cost:0},
-                {id:"B",kind:"opencode",model:"m",effort:"h",mode:"read",fresh:false,session:"ses_b",session_calls:3,retired:[],gen:1,ctx_used:1,ctx_limit:1000}]}' >"$ST"
-    [ -z "${2:-}" ] || sts "$2"
-  }
-  launch() { :; }; append_historical_map_locator() { :; }; render_transcript() { :; }
-  collect() { printf '%s' "$NOTE_TEXT" >"$RUN/raw/handover-g$(mget "$1" gen)-$(mid "$1").md"; }
-  handover() { FAKE_KIT_MODE=$1 do_handover 0 2>>"$H/council.log"; }
-  delivered() { jq -r '.members[0].handover_note' "$ST"; }
-  raw=$'# Note\n\nhello, this is the note.\nBranch x at abc1234.\n'
-  # U1a: every do_handover note is tested before delivery; the result goes to state and the log
-  fixture "$raw"; handover clean
-  check 0 'U1a do_handover records a handoff test in state' 'passed' jq -r '.handoff_tests[0].status' "$ST"
-  check 0 'U1a the kit ran on a staged copy in RUN/handoff with the generated config' "file=$RUN/handoff/handover-g1-A.stage.md" cat "$FAKE_KIT_LOG"
-  check 0 'U1a generated config: repo_root = config.dir, path_bases = [RUN]' true jq -e --arg d "$DIR" --arg r "$RUN" '.repo_root==$d and .path_bases==[$r]' "$FAKE_KIT_LOG.config"
-  check 0 'U1a the result names section 4 as not applicable to member notes' 'not applicable to member notes' jq -r '.handoff_tests[0].section4' "$ST"
-  check 0 'U1a the run log carries the handoff result' 'handoff test (handover): passed' jq -r '.log[]' "$ST"
-  check 0 'U1a a passing note delivers the original' "$RUN/raw/handover-g1-A.md" delivered
-  check 0 'U1a the result is attributed to task, member and generation' 't1 A 1' jq -r '.handoff_tests[0] | "\(.task) \(.member) \(.gen)"' "$ST"
-  check 0 'U1a the kit revision/source is recorded' 'council.json handoff_kit' jq -r '.handoff_tests[0].kit.source' "$ST"
-  # U3: a failing note is repaired with --fix and the successor receives the fixed note
-  fixture "$raw"; handover gap
-  check 0 'U3 a failing note is fixed' 'fixed' jq -r '.handoff_tests[0].status' "$ST"
-  check 0 'U3 --fix ran after the check' 'argv fix=1' cat "$FAKE_KIT_LOG"
-  check 0 'U3 handover_note points to the fixed note' "$RUN/handoff/handover-g1-A.fixed.md" delivered
-  check 0 'U3 the fixed note carries the gap checklist' '- [ ] the deliverable' cat "$RUN/handoff/handover-g1-A.fixed.md"
-  check 1 'U3/U4 the checklist never asks for a verification block' '' grep -q 'runnable verification block' "$RUN/handoff/handover-g1-A.fixed.md"
-  check 0 'U3 the raw note stays byte-identical' '' test "$(cat "$RUN/raw/handover-g1-A.md")" = "${raw%$'\n'}"
-  check 0 'U3 the kit backup is deleted' '' sh -c '! ls "$1"/*.bak-* >/dev/null 2>&1' _ "$RUN/handoff"
-  check 0 'U3 stdout/stderr/result JSON sit next to the fixed note' '' sh -c 'test -s "$1.check.out" && test -e "$1.fix.err" && test -s "$1.result.json"' _ "$RUN/handoff/handover-g1-A"
-  check 0 'U3 the fixed note starts with the original bytes' '' sh -c 'head -c "$(wc -c <"$1")" "$2" | cmp -s - "$1"' _ "$RUN/raw/handover-g1-A.md" "$RUN/handoff/handover-g1-A.fixed.md"
-  successor_prompt() {
-    collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"propose","proposal":"x","questions":[],"open":[]}' '```' >"$RUN/raw/t1-r1-A.md"; }
-    run_step r1 prompt_round1 "$task" 1 0 >/dev/null 2>&1; cat "$RUN/prompts/t1-r1-A.md"
-  }
-  check 0 'U3 the successor prompt contains the fixed note' '- [ ] the deliverable' successor_prompt
-  fixture "$raw"; handover sha
-  check 0 'U3 a drifted fact is repaired inside its span' 'Branch x at def5678.' cat "$(delivered)"
-  check 0 'U3 the authorized edit is recorded' 'abc1234 -> def5678' jq -r '.handoff_tests[0].fix.authorized_edits[]' "$ST"
-  fixture "$raw"; handover prose
-  check 0 'U3 a repair that touches prose is refused and the original delivered' "$RUN/raw/handover-g1-A.md" delivered
-  check 0 'U3 the refusal is named' 'outside the kit' jq -r '.handoff_tests[0].reason' "$ST"
-  # U3: only the spans the kit's own fact rules plan may change; same-shaped tokens elsewhere may not
-  local facts=$'# Note\n\nhello, this is the note.\nBranch x at abc1234.\nTool 1.2.3, blob deadbeef, 1234567 rows.\n'
-  for mode in 'ver 1.2.3' 'hex deadbeef' 'num 1234567' 'shaver 1.2.3' 'banner0 FAKE BANNER'; do
-    set -- $mode
-    fixture "$facts"; handover $1
-    check 0 "U3 unauthorized $1 change: refused as an operational error" error jq -r '.handoff_tests[0].status' "$ST"
-    check 0 "U3 unauthorized $1 change: the reason names the authorized spans" "outside the kit's authorized repair spans" jq -r '.handoff_tests[0].reason' "$ST"
-    check 0 "U3 unauthorized $1 change: the original note is delivered" "$RUN/raw/handover-g1-A.md" delivered
-    check 0 "U3 unauthorized $1 change: the successor prompt carries the original bytes" 'Tool 1.2.3, blob deadbeef, 1234567 rows.' successor_prompt
-    check 1 "U3 unauthorized $1 change: no fixed note is written" '' test -e "$RUN/handoff/handover-g1-A.fixed.md"
-  done
-  fixture "$facts"; handover sha
-  check 0 'U3 an authorized SHA repair next to same-shaped tokens is delivered' 'Branch x at def5678.' cat "$(delivered)"
-  check 0 'U3 its authorized span is recorded in original coordinates' '[45,52] abc1234 def5678' jq -r '.handoff_tests[0].fix.authorization.edits[0] | "\(.original|tojson) \(.old) \(.new)"' "$ST"
-  fixture "$facts"; handover banner
-  check 0 'U3 the banner is delivered when its precondition holds' $'# Note\n\n> FAKE BANNER\n\nhello' cat "$(delivered)"
-  check 0 'U3 the banner insertion is recorded' 'banner inserted at original 8' jq -r '.handoff_tests[0].fix.authorized_edits[]' "$ST"
-  fixture "$raw"; handover drift
-  check 0 'U3 a repair with residual findings is still delivered' "$RUN/handoff/handover-g1-A.fixed.md" delivered
-  check 0 'U3 probable kit false positives are listed, not filtered' 'environment assignment + command,git-status prefix' jq -r '[.handoff_tests[0].false_positives[].kind]|join(",")' "$ST"
-  check 0 'U3 the verdict stays unfiltered (effective exit 1)' 1 jq -r '.handoff_tests[0].before.effective_rc' "$ST"
-  # U4: python blocks are removed from the kit's copy, never executed, and restored byte-for-byte
-  local blocks=$'# Note\r\nhello\r\npython3 - <<\'PY\'\r\nprint("one")\r\nPY\r\nmiddle\r\nrun: python3 - <<\'PY\'\r\nprint("two é")\r\nPY\r\nend\r\n'
-  fixture "$blocks"; handover blocks
-  check 1 'U4 the kit never received a python block' '' grep -q "python3 - <<'PY'" "$FAKE_KIT_LOG.input"
-  check 0 'U4 two blocks were removed and restored' '2 2' jq -r '.handoff_tests[0] | "\(.blocks_removed) \(.blocks_restored)"' "$ST"
-  check 0 'U4 the delivered note restores both blocks byte-for-byte at their positions' '' sh -c 'head -c "$(wc -c <"$1")" "$2" | cmp -s - "$1"' _ "$RUN/raw/handover-g1-A.md" "$RUN/handoff/handover-g1-A.fixed.md"
-  fixture "$raw"; handover clean
-  check 0 'U4 section-4 gap excluded: kit exit 2, effective 0' '2 0' jq -r '.handoff_tests[0].before | "\(.raw_rc) \(.effective_rc)"' "$ST"
-  # U2 / A6: no kit -> the handover completes with the original note and a named skip, never a pass
-  fixture "$raw" 'del(.config.handoff_kit)'; HANDOFF_TEST_KIT="$H/absent" handover clean
-  check 0 'U2 missing kit: the handover completes (new generation)' 2 jq -r '.members[0].gen' "$ST"
-  check 0 'U2 missing kit: skipped, not passed' 'skipped' jq -r '.handoff_tests[0].status' "$ST"
-  check 0 'U2 missing kit: the reason is named' "kit not found: HANDOFF_TEST_KIT=$H/absent is not a directory" jq -r '.handoff_tests[0].reason' "$ST"
-  check 0 'U2 missing kit: the original note is delivered' "$RUN/raw/handover-g1-A.md" delivered
-  check 0 'U2 missing kit: the report names the skip reason' 'kit not found' handoff_report
-  fixture "$raw" '.config.handoff_kit="/nope"'; HANDOFF_TEST_KIT="$H/kit" handover clean
-  check 0 'U2 an invalid handoff_kit never falls back to HANDOFF_TEST_KIT' 'council.json handoff_kit=/nope is not a directory (no fallback)' jq -r '.handoff_tests[0].reason' "$ST"
-  mkdir -p "$H/half"; cp "$H/kit/handoff-test.sh" "$H/half/"
-  fixture "$raw" ".config.handoff_kit=\"$H/half\""; handover clean
-  check 0 'U2 a kit without handoff-fix.py is not a kit' 'lacks handoff-fix.py' jq -r '.handoff_tests[0].reason' "$ST"
-  # operational failures never block the council and always deliver the original note
-  for mode in rc3 garbage; do
-    fixture "$raw"; handover $mode
-    check 0 "kit $mode: recorded as an operational error" error jq -r '.handoff_tests[0].status' "$ST"
-    check 0 "kit $mode: the original note is delivered" "$RUN/raw/handover-g1-A.md" delivered
-  done
-  check 0 'kit garbage: named as unrecognised output' 'unrecognised kit output' jq -r '.handoff_tests[0].reason' "$ST"
-  fixture "$raw" '.config.handoff_timeout_s=2'; handover sleep
-  check 0 'timeout: recorded, original delivered' "timeout $RUN/raw/handover-g1-A.md" jq -r '"\(.handoff_tests[0].status) \(.members[0].handover_note)"' "$ST"
-  check 1 'timeout: the kit process group is gone' '' kill -0 "$(cat "$FAKE_KIT_LOG.pid")"
-  fixture "$raw" '.config.handoff_timeout_s="soon"'; handover clean
-  check 0 'an invalid handoff_timeout_s is a named error, original delivered' 'handoff_timeout_s invalid' jq -r '.handoff_tests[0].reason' "$ST"
-  fixture "$raw"; printf '{"repo_root":"sub","path_bases":["docs"]}' >"$H/user.json"; sts --arg c "$H/user.json" '.config.handoff_config=$c'; handover clean
-  check 0 'handoff_config replaces the generated config; relative repo_root resolves from the config file' "$H/sub" jq -r '.repo_root' "$FAKE_KIT_LOG.config"
-  # replacement notes: check-only, never altered
-  fixture "$raw"; printf 'post body with hello\n' >"$RUN/posts/t1-r1-A.md"
-  replace_check() { FAKE_KIT_MODE=gap handoff_check 0 "$RUN/raw/replace-A-g1.md" replacement 2>/dev/null; }
-  printf 'replacement note\n' >"$RUN/raw/replace-A-g1.md"; check 0 'replacement: the check runs' '' replace_check
-  check 1 'replacement: --fix is never run' '' grep -q 'fix=1' "$FAKE_KIT_LOG"
-  check 0 'replacement: the note is unchanged and is what is delivered' "replacement note|$RUN/raw/replace-A-g1.md" sh -c 'printf "%s|%s" "$(cat "$1")" "$(jq -r ".handoff_tests[0].delivered" "$2")"' _ "$RUN/raw/replace-A-g1.md" "$ST"
-  check 0 'replacement: the result is logged with its gaps' 'handoff test (replacement): failed' jq -r '.log[]' "$ST"
-  # the approved handover prompt text
-  check 0 'the handover prompt asks for the deliverable, half-finished work and mistakes' '(8) mistakes not to repeat: what you got wrong, had to correct, or learned as a gotcha, explicitly saying none if applicable. Do not invent facts; mark unknowns explicitly.' prompt_handover 0
-  # U1b: the session command runs the kit unchanged and passes its exit code through
-  printf 'hello\n' >"$H/session.md"
-  for spec in 'clean 2' 'gap 2' 'drift 1' 'rc3 3'; do set -- $spec
-    check "$2" "U1b handoff-test passes kit exit $2 through ($1)" '' env FAKE_KIT_MODE=$1 bash "$HERE/council.sh" handoff-test --kit "$H/kit" "$H/session.md"
-  done
-  check 0 'U1b handoff-test forwards --config and --fix, no default config' "argv fix=1 config=$H/user.json file=$H/session.md" sh -c 'rm -f "$1"; FAKE_KIT_MODE=gap bash "$2/council.sh" handoff-test --fix --config "$3" --kit "$4" "$5" >/dev/null 2>&1; cat "$1"' _ "$FAKE_KIT_LOG" "$HERE" "$H/user.json" "$H/kit" "$H/session.md"
-  check 0 'U1b handoff-test without --fix never repairs (section 4 kept: the kit sees the file itself)' "argv fix=0 config= file=$H/session.md" sh -c 'rm -f "$1"; bash "$2/council.sh" handoff-test --kit "$3" "$4" >/dev/null 2>&1; cat "$1"' _ "$FAKE_KIT_LOG" "$HERE" "$H/kit" "$H/session.md"
-  check 4 'U1b handoff-test with no kit exits 4' '' env HANDOFF_TEST_KIT="$H/absent" bash "$HERE/council.sh" handoff-test "$H/session.md"
-  check 0 'U1b handoff-test names the missing kit on stderr' 'kit not found' sh -c 'HANDOFF_TEST_KIT="$1" bash "$2/council.sh" handoff-test "$3" 2>&1; exit 0' _ "$H/absent" "$HERE" "$H/session.md"
-  check 3 'U1b handoff-test --timeout kills the kit and exits 3' '' env FAKE_KIT_MODE=sleep bash "$HERE/council.sh" handoff-test --timeout 1 --kit "$H/kit" "$H/session.md"
-  check 3 'U1b handoff-test usage error exits 3' '' bash "$HERE/council.sh" handoff-test
 )
 ptools_tests() (
   # the analysis tools are part of the skill: their own unittest suite must pass,
@@ -1770,10 +1552,8 @@ SH
 # implementations run from one fixed path under one frozen clock (a PATH date shim for the shell and
 # a sitecustomize time.time for the Python tools), so every byte is compared exactly, with no
 # timestamp normalisation.
-# 0.10.0 intentionally changes two things the 97f4c70 byte pins see: the user-approved handover prompt
-# addition (applied to the baseline copy, verbatim, so every other byte stays pinned) and the handoff-test
-# records a handover adds (state.handoff_tests, its log lines, D/handoff/, the Handoff tests report
-# section), which are stripped from both sides before comparing. Everything else is still compared.
+# 0.10.0 intentionally changes one thing the 97f4c70 byte pins see: the user-approved handover prompt
+# addition (applied to the baseline copy, verbatim, so every other byte stays pinned). Everything else is compared.
 approve_handover_prompt() {  # council.sh copy -> the 0.10.0 prompt text, nothing else
   python3 - "$1" <<'PY'
 import sys
@@ -1784,30 +1564,6 @@ new = ("(5) open items, pending questions and answers from the user; (6) the del
        "had to correct, or learned as a gotcha, explicitly saying none if applicable. Do not invent facts; mark unknowns explicitly. Self-contained")
 if s.count(old) != 1: sys.exit("approve_handover_prompt: anchor not found")
 open(p, "w", encoding="utf-8").write(s.replace(old, new))
-PY
-}
-strip_handoff_artifacts() {  # output prefix of run_impl -> the same outputs without handoff-test records
-  python3 - "$1" <<'PY'
-import glob, json, os, re, shutil, sys
-o = sys.argv[1]; hit = re.compile(r"handoff test \((handover|replacement)\)")
-shutil.rmtree(o + ".run/handoff", ignore_errors=True)
-st = o + ".run/state.json"
-if os.path.isfile(st):
-    raw = open(st, encoding="utf-8").read(); d = json.loads(raw)
-    if "handoff_tests" in d or any(hit.search(l) for l in d.get("log", [])):
-        d.pop("handoff_tests", None); d["log"] = [l for l in d.get("log", []) if not hit.search(l)]
-        open(st, "w", encoding="utf-8").write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
-def clean(p, section):
-    if not os.path.isfile(p): return
-    t = open(p, encoding="utf-8").read()
-    t2 = re.sub(r"(?ms)^%s\n.*?(?=^## |\Z)" % re.escape(section), "", t) if section else t
-    t2 = "".join(l for l in t2.splitlines(True) if not hit.search(l))
-    if t2 != t: open(p, "w", encoding="utf-8").write(t2)
-clean(o + ".run/transcript.md", "## Handoff tests")
-for p in glob.glob(o + ".step*.err") + glob.glob(o + ".step*.out"): clean(p, None)
-if os.path.isfile(o + ".report"):
-    t = open(o + ".report", encoding="utf-8").read()
-    open(o + ".report", "w", encoding="utf-8").write(re.sub(r"(?s)\nHandoff tests\n\n\|.*\Z", "", t) if "\nHandoff tests\n" in t else t)
 PY
 }
 legacy_differential_tests() (
@@ -1857,7 +1613,6 @@ PY2
   }
   same_outputs() {  # label -> compare every artifact and every step's exit/stdout/stderr of the two implementations
     local b="$D/out-$1-base" c="$D/out-$1-cur" n=1
-    strip_handoff_artifacts "$b"; strip_handoff_artifacts "$c"
     python3 "$D/cmp.py" "$b.run" "$c.run" || return 1
     cmp "$b.status" "$c.status" && cmp "$b.report" "$c.report" && cmp "$b.fo/calls.log" "$c.fo/calls.log" || return 1
     while [ -f "$b.step$n.rc" ]; do
@@ -2811,5 +2566,5 @@ PY2
   check 0 'D2 recovered session: nothing was captured and the mapper was prompted once' 'true 1' sh -c 'printf "%s %s" "$(jq -e ".capture_statuses==[]" "$1")" "$(grep -c "^prompt ses_fake1 " "$2")"' _ "$P/.council-run/map/$mk/coverage.json" "$D/fo-rescan-recovered/calls.log"
   check 0 'D2 recovered session: the task continues to completion after keep' '' keep rescan-recovered "$P"
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests handoff_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

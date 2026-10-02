@@ -701,7 +701,7 @@ def print_state_totals(gens):
 
 
 def load_prompt_report():
-    """prompt_report.py through importlib without leaving bytecode behind (as handoff_replay.py does);
+    """prompt_report.py through importlib without leaving bytecode behind;
     None when it cannot be loaded, in which case every phase is unknown."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt_report.py")
     saved, sys.dont_write_bytecode = sys.dont_write_bytecode, True

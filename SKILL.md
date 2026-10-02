@@ -101,7 +101,6 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |
 | prose style (optional) | `style` (top level and/or per member) | `normal` (default), `lite`, `caveman`, `ultra` — compresses only the prose a member writes for the others, modelled on the [caveman skill](https://github.com/juliusbrussee/caveman). The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
 | context handover threshold | `handover_at` (0..1], council-wide **and/or per member** | a fraction in (0,1] of the model's context window, **or an absolute token count** (≥ 1000, e.g. `150000`). At the threshold the session writes a handover note and is replaced by a fresh session (same member id, next generation). Set it per member to make one hand over earlier than the rest (`{"id":"A", …, "handover_at":0.3}`); a member without its own value uses the council-wide one. The roster prints the effective threshold per member, and `status` shows each member's context as a percentage of its own threshold |
-| handoff tests of member notes (optional) | `handoff_kit`, `handoff_config`, `handoff_timeout_s` | the external [handoff-test-kit](https://github.com/panaalexandrucristian/handoff-test-kit) directory (else `$HANDOFF_TEST_KIT`, else `/Users/apana/dev/handoff-test-kit` if it exists; an invalid explicit value is a named skip, never a fallback); your own kit config replacing the generated one (`repo_root` defaults to `dir`); one budget in seconds for check + `--fix` + recheck (default 60). All three may be omitted |
 | whether to seed the code map | `map_code` (one run-wide boolean) | **Ask the user once before writing the config:** “Map the code for this council?” Record true/false. It applies to every task. Hand-written configs that omit it are accepted as false; there is no prompt or pause. |
 
 Then: `council.sh show --config council.json` → paste the roster to the user and get a yes before `start`.
@@ -109,7 +108,7 @@ Then: `council.sh show --config council.json` → paste the roster to the user a
 config-only cost note with two measured comparisons and cost-reduction levers. Its warning
 is advisory; the measurements are not dollar predictions.
 
-When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:342`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:424,483`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
+When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:335`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:417,476`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
 
 The split contract file path is relative to the directory containing the map-decision JSON. A version-1 contract names `parent_id` and the exact contract `map_seed_id` printed at map review from `coverage.json`; the locator's `snapshot_id` is a distinct lookup identity and must not be substituted. It then supplies non-empty `subtasks`; every child declares unique `id`, complete `text`, boolean `execute`, and arrays `requires`, `modifies`, `deletes`, `creates`, `acceptance`, and `unresolved`. Existing-file declarations bind to `{ "path": "...", "sha256": "<64 lowercase hex>" }`; created paths must be absent. Each acceptance item requires a unique `id`, `description`, non-empty `argv`, integer `expected_exit`, and its own baseline/output paths. Shared reads are valid; sibling-output dependencies and overlapping writes are not. The validator is offline and failure returns to map review (exit 4); correct the contract or explicitly keep the parent task.
 
@@ -125,14 +124,7 @@ council.sh status --run-dir D                                                   
 council.sh report --run-dir D                                                     # token report: prompt bytes by section, de-duplication replay, duplication left
 council.sh resume --run-dir D --answers answers.json | --answer "text"            # after exit 4 (questions) or exit 2 (failure)
 council.sh resume --run-dir D --replace C=claude:sonnet:xhigh                     # swap a member's model/session (repeatable)
-council.sh handoff-test [--fix] [--config c.json] [--kit DIR] [--timeout S] FILE  # test a SESSION handover with the external kit
 ```
-
-`handoff-test` runs the external handoff-test-kit on a session handover document (e.g. `HANDOVER-3.md`)
-**unchanged** — section 4 executes the document's first `python3 - <<'PY'` block, so use it only on documents
-you trust — and passes the kit's exit through: 0 clean · 1 facts drifted · 2 coverage gap · 3 usage/config/
-operational error or `--timeout` expiry · **4 no kit found** (reason on stderr; never reported as passed).
-Pass `--fix` only when the user asks for a repair. Without `--config` the kit's own config discovery applies.
 
 `resume` re-runs only what is missing: a member that already has a valid post for the current
 round is reused, not called again. `--replace ID=kind:model:effort` (`kind` = `opencode` \| `claude`)
@@ -149,7 +141,7 @@ run's state). Exit codes: **0** all tasks reached consensus · **1** config erro
 council has questions for the user · **5** finished but a task is `unresolved`/`unratified`.
 
 **Claude member calls.** Each `claude -p` call runs as the leader of its own process group (a
-`python3` `os.setsid` exec wrapper, `scripts/council.sh:1103`), and every attempt writes its own
+`python3` `os.setsid` exec wrapper, `scripts/council.sh:1096`), and every attempt writes its own
 `D/raw/<tag>-<id>-a<N>.json` (`:1100`). `kill_group` stops the whole group: SIGTERM, up to 10 s,
 SIGKILL, then up to 10 s until no live process is left (`:1034-1037`). It runs on timeout, after a
 call that exited but left processes in its group, on TERM/INT/HUP to `start`/`resume` (the trap is
@@ -203,27 +195,14 @@ member's final-generation + retired subtotal and a **RUN TOTAL** across all gene
 **Handover gate (optional).** With `COUNCIL_HANDOVER_GATE=1` in the orchestrator's environment (it works on
 `start` and on `resume` of an existing run), the delivered handover note waits for an outside review before the
 successor reads it: `do_handover` writes `<note>.pending`, logs `handover gate: review <note>; remove
-<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1566-1580`).
+<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1488-1502`).
 The successor reads the note by path when its prompt is built, so a reviewer may correct the file in place before
 releasing it. Without the gate the successor's prompt is written 0-1 s after the note (measured on 5 handovers), too
 soon for any review. The wait is bounded by `COUNCIL_HANDOVER_GATE_TIMEOUT` seconds (default 3600); an unreleased
 note is never delivered: the calls still in flight are stopped and the run stops with the failed checkpoint
 (exit 2) before the old session is retired, so `resume` redoes the handover.
 
-**Handoff tests.** Before a successor reads a handover note, `scripts/ptools/handoff_test.py` runs the
-external handoff-test-kit on a copy in `D/handoff/` (config: `repo_root` = `dir`, `path_bases` = [`D`], or
-`handoff_config`). Section 4 is not applicable to member notes: every `python3 - <<'PY'` block is removed from
-the copy (never executed) and the section-4 gap does not count. A failing note is repaired with the kit's
-`--fix`; the section-4 checklist entry is dropped, python blocks are restored byte-for-byte, and only the gap
-checklist and the exact spans/values/banner the kit's own fixer plans for this config (`plan_edits`, recorded as
-`fix.authorization`) may differ from the original — then the successor receives
-`D/handoff/handover-g<N>-<ID>.fixed.md`. No kit, kit exit 3, unrecognised output, a refused repair or the
-`handoff_timeout_s` budget (default 60 s) never block the council: logged, original note delivered. Results:
-`state.json` `handoff_tests[]`, the log, and a **Handoff tests** table in the transcript and `council.sh report`
-(probable kit false positives listed, verdict unchanged). Replacement notes are checked, never altered. The
-handover prompt also asks for the deliverable, half-finished work and mistakes not to repeat.
-`python3 scripts/ptools/handoff_replay.py <corpus-dir> [--kit DIR]` replays the integration over a corpus of
-real handovers (README: Handoff tests).
+The handover prompt asks for the deliverable, half-finished work and mistakes not to repeat.
 
 **Lossless prompt de-duplication.** In voting rounds, an exactly matching candidate or a
 byte-identical proposal token can refer to a uniquely anchored peer post in the same prompt.
@@ -432,7 +411,7 @@ byte-for-byte match with one of the member's own prompt files, otherwise `unknow
 
 Build/test runner with a capped summary (`run_check.py`, Python 3 standard library, POSIX only, `-h`; it **executes** the command and **writes**
 files, so unlike the other tools it is not read-only; use a `--log-dir` outside the project, `.gitignore` covers `*.log` only and
-`diff_text` (`scripts/council.sh:1758-1759`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
+`diff_text` (`scripts/council.sh:1678-1679`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
 
 ```bash
 python3 scripts/ptools/run_check.py --log-dir D [--fallback-dir F] [--reports GLOB]... [--max-bytes N] [--timeout SECONDS] -- COMMAND [ARG...]
@@ -484,7 +463,7 @@ password at startup (`server password ...`); `--port`/`--hostname`/`--cors` conf
 
 ## Changing the skill
 
-`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (751 cases, including the handoff-test adapter), run automatically by
+`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (725 cases), run automatically by
 `scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it

@@ -8,15 +8,10 @@
 #   council.sh status --run-dir D                     where the run is: task, round, member context/tokens, pending questions
 #   council.sh report --run-dir D                     token report for the run: prompt bytes by section, de-duplication
 #                                                     replay and the remaining verbatim duplication (scripts/ptools, offline)
-#   council.sh handoff-test [--fix] [--config c.json] [--kit DIR] [--timeout S] FILE
-#                                                     run the external handoff-test-kit on a session handover document,
-#                                                     unchanged; exit 0/1/2/3 from the kit, 4 = no kit found
 #   council.sh resume --run-dir D [--answers F|--answer TEXT] [--confirm-mapper FILE] [--map-decision FILE]
 #                     [--replace ID=kind:model:effort]         swap a member's model/session (e.g. its provider ran out of quota):
 #                                                              C=claude:sonnet:xhigh or C=opencode:google/gemini-3.8-flash:high
 #
-# Member handover notes are tested automatically with the same kit (see handoff_check; config fields handoff_kit,
-# handoff_config, handoff_timeout_s — all optional).
 # Exit codes: 0 every task reached consensus · 1 usage/config error · 2 a member failed twice (checkpointed; resume
 #             re-runs the round) · 4 questions for the user are pending (see D/questions.json) · 5 finished, but at
 #             least one task is unresolved (max_rounds reached without unanimity)
@@ -55,8 +50,6 @@ done
 # python3 invocation (map delivery disabled for that attempt, or the report section marked
 # unavailable) — exactly what a missing-file invocation naturally produces.
 CM="$HERE/council_codemap.py"
-# handoff-test is dispatched before the option parser: its --config belongs to the kit, not to the council.
-if [ "${1:-}" = handoff-test ]; then shift; exec python3 "$PTOOLS/handoff_test.py" session "$@"; fi
 
 die() { echo "council: $*" >&2; exit 1; }
 log() { echo "council: $*" >&2; }
@@ -1487,77 +1480,6 @@ needs_handover() { st ".members[$1] | (.handover_at // $HANDOVER) as \$h
   | ((.session_calls // 0) >= 2 and (.ctx_used // 0) > 0
      and (if \$h > 1 then (.ctx_used >= \$h) else ((.ctx_limit // 0) > 0 and (.ctx_used / .ctx_limit) >= \$h) end))" | grep -q true; }
 
-# The external handoff-test-kit checks a note before a successor reads it (scripts/ptools/handoff_test.py).
-# It never blocks the council: a missing kit, a kit error, a timeout or an adapter crash keeps the original
-# note. One budget (handoff_timeout_s, default 60) covers check + --fix + recheck; the same deadline+kill
-# loop as a claude member call enforces it. Sets HANDOFF_DELIVER to the note the successor receives.
-HANDOFF_DELIVER=""
-handoff_check() {  # idx note kind(handover|replacement)
-  local i=$1 note=$2 kind=$3 id gen stem dir res budget deadline pid timed_out=0 rc r
-  id=$(mid $i); gen=$(mget $i gen); stem=$(basename "$note" .md); dir="$RUN/handoff"; res="$dir/$stem.result.json"
-  HANDOFF_DELIVER=$note
-  mkdir -p "$dir" 2>/dev/null; rm -f "$res"
-  budget=$(st '.config.handoff_timeout_s // 60')
-  local -a args=(member "$note" --project-dir "$DIR" --run-dir "$RUN" --out-dir "$dir" --kind "$kind")
-  [ "$kind" = replacement ] && args+=(--check-only)
-  [ "$(st '.config | has("handoff_kit")')" = true ] && args+=(--kit-field "$(st '.config.handoff_kit')")
-  [ "$(st '.config | has("handoff_config")')" = true ] && args+=(--user-config "$(st '.config.handoff_config')")
-  if ! [[ "$budget" =~ ^[1-9][0-9]*$ ]]; then
-    r=$(handoff_stub "$note" "$kind" error "handoff_timeout_s invalid: $budget (a positive integer number of seconds)")
-  else
-    deadline=$(( $(date +%s) + budget ))
-    python3 "$PTOOLS/handoff_test.py" "${args[@]}" --deadline "$deadline" >"$dir/$stem.adapter.out" 2>"$dir/$stem.adapter.err" &
-    pid=$!
-    while kill -0 "$pid" 2>/dev/null; do
-      if [ "$(date +%s)" -ge "$deadline" ]; then kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null; timed_out=1; break; fi
-      sleep 1
-    done
-    wait "$pid" 2>/dev/null; rc=$?
-    if [ "$timed_out" = 1 ]; then
-      r=$(handoff_stub "$note" "$kind" timeout "timeout after ${budget}s (handoff_timeout_s): the handoff test was killed")
-    elif jq -e '.status|type=="string"' "$res" >/dev/null 2>&1; then
-      r=$(jq -c . "$res")
-    else
-      r=$(handoff_stub "$note" "$kind" error "the handoff adapter produced no result (exit $rc): $(tail -n 1 "$dir/$stem.adapter.err" 2>/dev/null | cut -c1-200)")
-    fi
-  fi
-  if [ "$kind" = handover ] && [ "$(jq -r .fixed <<<"$r")" = true ] && [ -s "$(jq -r .delivered <<<"$r")" ]; then
-    HANDOFF_DELIVER=$(jq -r .delivered <<<"$r")
-  else
-    r=$(jq -c --arg n "$note" '.delivered=$n | .fixed=false' <<<"$r")
-  fi
-  local line="member $id g$gen handoff test ($kind): $(handoff_summary "$r")"
-  log "$line"
-  sts --argjson r "$r" --arg task "$(st '.task_id // ""')" --arg id "$id" --argjson gen "$gen" --arg line "$line" --arg now "$(now)" \
-    '.handoff_tests = ((.handoff_tests // []) + [$r + {task:$task, member:$id, gen:$gen}]) | .log += ["\($now) \($line)"]' || log "handoff test: could not record the result in state.json"
-  return 0
-}
-handoff_stub() {  # note kind status reason -> a result record when the adapter could not produce one
-  jq -cn --arg n "$1" --arg k "$2" --arg s "$3" --arg r "$4" \
-    '{version:1, kind:$k, note:$n, delivered:$n, fixed:false, status:$s, reason:$r, section4:"not applicable to member notes", kit:null, before:null, fix:null, after:null, false_positives:[]}'
-}
-handoff_summary() {  # result json -> one line for the log/report
-  jq -r '
-    def chk(c): if c == null then "-" else "kit exit \(c.raw_rc), effective \(c.effective_rc) (\(c.result_line))" end;
-    if .status=="skipped" then "skipped — \(.reason); original note delivered"
-    elif .status=="timeout" or .status=="error" then "\(.status) — \(.reason); original note delivered"
-    elif .status=="passed" then "passed — \(chk(.before)); section 4 \(.section4)"
-    elif .status=="fixed" then "failed → fixed — before: \(chk(.before)); --fix: \((.fix.kit_changes // []) | join(", ")); after: \(chk(.after)); section 4 \(.section4); fixed note delivered: \(.delivered)"
-    else "failed — \(chk(.before)); \(.reason // ""); section 4 \(.section4); original note delivered" end
-    + (if ((.false_positives // []) | length) > 0 then "; \(.false_positives|length) probable kit false positive(s)" else "" end)' <<<"$1"
-}
-handoff_report() {  # the handoff-test table for the transcript and `council.sh report`
-  [ "$(st '(.handoff_tests // []) | length')" -gt 0 ] || return 0
-  echo "| member | gen | kind | status | before (kit / effective) | after (kit / effective) | --fix changed | delivered | reason |"
-  echo "|---|---|---|---|---|---|---|---|---|"
-  st '.handoff_tests[] | "| \(.member) | g\(.gen) | \(.kind) | \(.status) | \(if .before then "\(.before.raw_rc) / \(.before.effective_rc)" else "-" end) | \(if .after then "\(.after.raw_rc) / \(.after.effective_rc)" else "-" end) | \(if .fix then ((.fix.kit_changes // []) + (if (.fix.section4_items_removed // 0) > 0 then ["section-4 checklist entry removed"] else [] end) | join("; ")) else "-" end) | `\(.delivered)` | \(.reason // "-") |"'
-  echo
-  echo "Section 4 (runs a python block from the note) is not applicable to member notes: the kit runs on a copy without python blocks and a section-4 gap does not count."
-  local fp; fp=$(st '[.handoff_tests[] | . as $t | (.false_positives // [])[] | "- member \($t.member) g\($t.gen): \(.kind): `\(.path)`"] | join("\n")')
-  [ -n "$fp" ] && { echo; echo "Probable kit false positives (listed only; the kit verdict is unchanged):"; echo "$fp"; }
-  return 0
-}
-
 # Optional handover gate (env COUNCIL_HANDOVER_GATE=1): the delivered note waits for an outside review before the
 # successor reads it (by path, at prompt build time), so the reviewer may correct the file in place. Release by
 # removing <note>.pending. Bounded by COUNCIL_HANDOVER_GATE_TIMEOUT seconds (default 3600); an unreleased note is
@@ -1586,7 +1508,6 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
   CALL_LEFT_RUNNING=0; launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
   [ "$CALL_LEFT_RUNNING" = 1 ] && return 1   # never open a new session beside a handover call that survived SIGKILL
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
-  handoff_check $i "$note" handover; note=$HANDOFF_DELIVER
   handover_gate "$note"
   local old; old=$(mget $i session)
   sts --argjson i $i --arg note "$note" --arg old "$old" \
@@ -1697,7 +1618,6 @@ replace_member() {  # "ID=kind:model:effort" -> new session for that member, han
   local note="$RUN/raw/replace-$id-g$(mget $i gen).md"
   { echo "Your predecessor session as member $id ($(mget $i kind) $(mget $i model), effort $(mget $i effort)) could not continue (provider failure or replacement by the user) and could not write a handover note. Below are ALL the posts it made in this run, oldest first — they are your positions so far; continue from them."
     local f; for f in $(ls -tr "$RUN/posts" 2>/dev/null | grep -- "-$id\.md$"); do echo; echo "--- post ${f%.md} ---"; cat "$RUN/posts/$f"; done; } >"$note"
-  handoff_check $i "$note" replacement   # check-only: a replacement note is never altered
   local old; old=$(mget $i session)
   sts --argjson i $i --arg kind "$kind" --arg model "$model" --arg effort "$effort" --argjson ctx "$ctx" --argjson extra "$extra" --arg note "$note" --arg old "$old" --arg now "$(now)" '
     .members[$i] |= (.retired += [{session:.session, gen:.gen, tokens:.session_tokens, cost:.session_cost, model:(.kind+" "+.model), reason:"replaced"}]
@@ -1933,7 +1853,6 @@ render_transcript() {
         echo "### $step — member $mem ($(jq -r '.vote // "?"' "$RUN/posts/${f%.md}.json" 2>/dev/null))"; echo; cat "$RUN/posts/$f"; echo
       done
     done
-    local ht; ht=$(handoff_report); [ -n "$ht" ] && { echo "## Handoff tests"; echo; echo "$ht"; echo; }
     local qa; qa=$(jq -r '.answers[]? | "- [\(.id)] member \(.member): \(.question)\n  → \(.answer)"' "$ST"); [ -n "$qa" ] && { echo "## Questions and answers"; echo; echo "$qa"; echo; }
     local pq; pq=$(jq -r '.pending_questions[]? | "- [\(.id)] member \(.member): \(.question)"' "$ST"); [ -n "$pq" ] && { echo "## PENDING questions for the user"; echo; echo "$pq"; echo; }
     if [ "$(st .status)" = done ] && [ -d "$RUN/prompts" ]; then
@@ -2004,7 +1923,6 @@ case "$CMD" in
   report)
     [ -n "$RUN" ] || die "report needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     echo "run: $RUN"; token_report; rc=$?
-    ht=$(handoff_report); [ -n "$ht" ] && { echo; echo "Handoff tests"; echo; echo "$ht"; }
     exit $rc ;;
 
   resume)
@@ -2076,5 +1994,5 @@ case "$CMD" in
     render_transcript
     run_tasks ;;
 
-  *) die "unknown command: $CMD (show|start|status|report|resume|handoff-test)" ;;
+  *) die "unknown command: $CMD (show|start|status|report|resume)" ;;
 esac
