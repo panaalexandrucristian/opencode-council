@@ -91,6 +91,8 @@ scripts/council.sh resume --run-dir D --answers answers.json # continue after th
 council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member a fresh session on another model
 ```
 
+`resume --answer TEXT` explicitly supplies one complete answer to all pending questions. When two or more pending questions belong to one task, they are stored as one answer record: `id` is the first question ID, `ids` lists every question ID, and `question` contains every question verbatim, labelled with its ID and originating member. The member list preserves first appearance. Existing prompt, mapper and transcript formats print that shared answer once per answer section. A single question and `--answers FILE` retain their existing representation; equal file-supplied answers are not merged. Existing checkpoints are not migrated, so older duplicate entries still print separately. Operator-compacted placeholders remain literal; operator-removed text must be restored by the operator.
+
 `council.json` — every field is explicit, nothing is defaulted silently:
 
 ```json
@@ -171,21 +173,28 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `bash scripts/test-completion.sh` — 1340 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (725 Python standard-library unittest cases for the analysis tools).
+- **Tests.** `bash scripts/test-completion.sh` — 1352 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (726 Python standard-library unittest cases for the analysis tools).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
 ## Release notes
 
-- **Unreleased** — the external handoff-test-kit integration (0.10.0) is removed: `handoff_check`,
+- **0.11.4** — `resume --answer TEXT` no longer stores (and prints) one full copy of the answer per pending
+  question. When two or more pending questions belong to one task, it stores one answer record: `id` is the first
+  question ID, `ids` lists all of them, `member` lists the originating members in first-appearance order, and
+  `question` holds every question verbatim, labelled `[<id>] member <m>: <question>`. The prompts, the mapper
+  instruction, inherited answers and the transcript print it with their existing formats, so the answer appears once
+  per section (a real run had one 10 KB answer 50 times in a 589 KB round-1 prompt). A single question and
+  `--answers FILE` are stored as before; existing checkpoints are not migrated. No renderer and no report parser
+  changed. The external handoff-test-kit integration (0.10.0) is removed: `handoff_check`,
   `council.sh handoff-test`, `scripts/ptools/handoff_test.py` and `handoff_replay.py`, and the config fields
   `handoff_kit`, `handoff_config` and `handoff_timeout_s` (now ignored). Over 47 recorded member-note tests its
   `--fix` never changed a verdict (36 notes were marked "fixed" with the same failures), all 158 fact failures
   were unresolvable paths (planned files, bare names), and it caught none of the stale facts the gate review
   found. Handover notes are verified through the gate (`COUNCIL_HANDOVER_GATE=1`) instead.
-  test-completion.sh: 1340 checks; test_ptools.py: 725 cases.
+  test-completion.sh: 1352 checks; test_ptools.py: 726 cases.
 - **0.11.3** — optional handover gate: with `COUNCIL_HANDOVER_GATE=1` the delivered handover note waits (bounded by
   `COUNCIL_HANDOVER_GATE_TIMEOUT`, default 3600 s) until `<note>.pending` is removed, so the note can be verified
   and corrected before the successor reads it; an unreleased note is never delivered (calls stopped, failed

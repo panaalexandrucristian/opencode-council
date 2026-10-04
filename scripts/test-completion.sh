@@ -1529,6 +1529,10 @@ case "$cmd" in
     elif grep -q -- 'FIXES REQUESTED' "$p"; then printf 'Fixed.\n```json\n{"vote":"done","report":"fixed","questions":[]}\n```\n'
     elif grep -q 'RATIFICATION' "$p" && [ -f "$F/disagree-once" ] && grep -q "$(cat "$F/disagree-once")" "$p"; then rm -f "$F/disagree-once"; printf 'Dissent.\n```json\n{"vote":"disagree","reason":"needs a fix","proposal":"1. apply the fix","questions":[]}\n```\n'
     elif grep -q 'RATIFICATION' "$p"; then printf 'Ratified.\n```json\n{"vote":"agree","reason":"ok","proposal":null,"questions":[]}\n```\n'
+    elif grep -q 'round 1 of' "$p" && [ -f "$F/ask-all" ] && ! grep -q "^Answers from the user to the council's questions" "$p"; then
+      printf 'Need input.\n```json\n'
+      jq -cn --argjson q "$(cat "$F/ask-all")" '{vote:"question",questions:$q,proposal:null}'
+      printf '```\n'
     elif grep -q 'round 1 of' "$p" && [ -f "$F/ask-once" ] && grep -q -- "$( [ -s "$F/ask-once" ] && cat "$F/ask-once" || echo 'second task')" "$p"; then rm -f "$F/ask-once"; printf 'Need input.\n```json\n{"vote":"question","questions":["Which greeting?"],"proposal":null}\n```\n'
     elif grep -q 'round 1 of' "$p"; then printf 'Plan.\n```json\n{"vote":"propose","proposal":"Deterministic plan.","questions":[]%s}\n```\n' "$cr"
     else printf 'Agree.\n```json\n{"vote":"agree","reason":"same","proposal":null,"questions":[]%s}\n```\n' "$cr"; fi ;;
@@ -1662,6 +1666,26 @@ PY2
     check 0 "T3 legacy $form plain resume reused the surviving member post" 'reusing its' cat "$D/out-$form-interrupt-cur.step2.err"
     for label in answer answers replace interrupt; do
       check 0 "T3 legacy $form $label: zero mapper calls and no pre-pass state" '' sh -c '! grep -q "map pre-pass" "$1" && jq -e "([keys[]|select(startswith(\"map_prepass\"))]|length)==0" "$2" >/dev/null' _ "$D/out-$form-$label-cur.fo/calls.log" "$D/out-$form-$label-cur.run/state.json"
+    done
+  done
+  mkdir -p "$D/legacy-multi"
+  cp -Rp "$legacy.run" "$D/legacy-multi/run"
+  jq '.pending_questions += [
+        {id:"t2/r1/B/q1",task:"t2",member:"B",question:"Second question?"},
+        {id:"t2/r1/A/q2",task:"t2",member:"A",question:"Third question?"}]
+      | .answers += [
+        {id:"t2/old/A/q1",task:"t2",member:"A",question:"Old first?",answer:"LEGACY_DUPLICATE"},
+        {id:"t2/old/B/q1",task:"t2",member:"B",question:"Old second?",answer:"LEGACY_DUPLICATE"},
+        {id:"t2/old/A/q2",task:"t2",member:"A",question:"Old compacted?",answer:"(same answer block as for question t2/old/A/q1 — not repeated)"}]' "$D/legacy-multi/run/state.json" >"$D/s.tmp" && mv "$D/s.tmp" "$D/legacy-multi/run/state.json" || exit 1
+  jq '.pending_questions' "$D/legacy-multi/run/state.json" >"$D/legacy-multi/run/questions.json"
+  for values in distinct equal; do
+    printf '{"t2/r1/A/q1":"Hello","t2/r1/B/q1":"Hello there","t2/r1/A/q2":"Hello again"}\n' >"$D/multi-$values-object.json"
+    if [ "$values" = equal ]; then
+      jq 'map_values("Same explicit answer")' "$D/multi-$values-object.json" >"$D/s.tmp" && mv "$D/s.tmp" "$D/multi-$values-object.json" || exit 1
+    fi
+    jq 'to_entries | map({id:.key,answer:.value})' "$D/multi-$values-object.json" >"$D/multi-$values-array.json"
+    for shape in object array; do
+      check 0 "T3 several $values $shape answers and legacy records remain byte-identical to 97f4c70" compared diff_case "multi-$values-$shape" "$D/legacy-multi/run" "$legacy.fo" -- resume --run-dir "$D/run" --answers "$D/multi-$values-$shape.json"
     done
   done
   check 0 'T3 legacy no-codemap form stays without codemap_version after resume' null jq -r '.codemap_version // "null"' "$D/out-nocodemap-answer-cur.run/state.json"
@@ -1848,6 +1872,61 @@ PY2
   set -- ; for n in $prompts; do set -- "$@" "$R/prompts/$n.md"; done
   check 0 'T1 inherited answers: every child round-1 and execution prompt (the resumed process included) carries the exact parent Q/A text' true python3 "$D/verbatim.py" "$D/parent-answers.json" "$@"
   check 0 'T1 inherited answers: the execution prompt keeps the last answer on its own line' true sh -c 'grep -qx "Nothing else." "$1" && echo true' _ "$R/prompts/child-a-exec1-A.md"
+)
+shared_answer_process_tests() (
+  local D="$scratch/shared-answer" R TEXT form
+  mkdir -p "$D/impl" "$D/proj" "$D/fo"
+  cp -R "$HERE" "$D/impl/" || exit 1
+  write_fake_oc "$D/impl/scripts/oc.sh"
+  TEXT=$'SHARED_ANSWER_SENTINEL — păstrează "quotes" and `code`.\nSecond line.'
+  printf '["Which layout?","Which scope?"]\n' >"$D/fo/ask-all"
+  jq -n --arg d "$D/proj" '{dir:$d,max_rounds:3,timeout_s:30,handover_at:1,executor:"A",map_code:false,members:[{id:"A",kind:"opencode",model:"p/m",effort:"medium",mode:"edit"},{id:"B",kind:"opencode",model:"p/m",effort:"medium",mode:"read"}],tasks:[{id:"t1",text:"shared answer fixture",execute:true}]}' >"$D/cfg.json"
+  step() { FAKE_OC_DIR="$D/fo" bash "$D/impl/scripts/council.sh" "$@" >"$D/step.out" 2>"$D/step.err"; }
+  for form in codemap nocodemap; do
+    R="$D/$form"
+    check 4 "shared answer $form: real start asks several questions" '' step start --config "$D/cfg.json" --run-dir "$R"
+    check 0 "shared answer $form: checkpoint has four actual questions" true jq -e '(.pending_questions|length)==4 and all(.pending_questions[]; .task=="t1")' "$R/state.json"
+    jq '.pending_questions' "$R/state.json" >"$D/pending-$form.json"
+    if [ "$form" = nocodemap ]; then
+      jq 'del(.codemap_version,.codemap_pending)' "$R/state.json" >"$D/state.t" && mv "$D/state.t" "$R/state.json" || exit 1
+    fi
+    printf 'TASK t1 — RATIFICATION\n' >"$D/fo/disagree-once"
+    check 0 "shared answer $form: real resume completes execution and fixes" '' step resume --run-dir "$R" --answer "$TEXT"
+    check 0 "shared answer $form: stored mapping, delivery and accounting" '' python3 - "$R" "$TEXT" "$D/pending-$form.json" "$HERE/ptools" <<'PY'
+import json, pathlib, sys
+run, text = pathlib.Path(sys.argv[1]), sys.argv[2]
+questions = json.loads(pathlib.Path(sys.argv[3]).read_text())
+sys.path.insert(0, sys.argv[4])
+import prompt_report
+state = json.loads((run / 'state.json').read_text())
+expected = dict(questions[0],
+                ids=[q['id'] for q in questions],
+                member=', '.join(dict.fromkeys(q['member'] for q in questions)),
+                question='\n'.join('[{}] member {}: {}'.format(q['id'], q['member'], q['question']) for q in questions),
+                answer=text)
+assert state['answers'] == [expected], state['answers']
+assert state['pending_questions'] is None and state['status'] == 'done'
+block = ("Answers from the user to the council's questions (verbatim, authoritative):\n"
+         + '- Q (member {}): {}\n  A: {}\n'.format(expected['member'], expected['question'], text)).encode()
+names = ['t1-r1-A', 't1-r1-B', 't1-r2-A', 't1-r2-B',
+         't1-exec1-A', 't1-x1-A', 't1-x1-B', 't1-exec2-A',
+         't1-x2-A', 't1-x2-B']
+for name in names:
+    data = (run / 'prompts' / (name + '.md')).read_bytes()
+    assert data.count(text.encode()) == 1, name
+    assert block in data, name
+    for q in questions:
+        line = '[{}] member {}: {}'.format(q['id'], q['member'], q['question']).encode()
+        assert data.count(line) == 1, (name, q['id'])
+    counts = prompt_report.section_bytes(data, state)
+    assert sum(counts.values()) == len(data), name
+    # Fix-prompt attribution already has a different boundary; do not broaden
+    # that existing parser behavior as part of an ingestion-only change.
+    if name != 't1-exec2-A':
+        assert counts['answers'] == len(block), (name, counts)
+assert (run / 'transcript.md').read_bytes().count(text.encode()) == 1
+PY
+  done
 )
 # T6 response matrix through real processes: every mapper outcome is classified with unknown
 # coverage, keeps its raw response, is never retried, and the task continues after review.
@@ -2566,5 +2645,5 @@ PY2
   check 0 'D2 recovered session: nothing was captured and the mapper was prompted once' 'true 1' sh -c 'printf "%s %s" "$(jq -e ".capture_statuses==[]" "$1")" "$(grep -c "^prompt ses_fake1 " "$2")"' _ "$P/.council-run/map/$mk/coverage.json" "$D/fo-rescan-recovered/calls.log"
   check 0 'D2 recovered session: the task continues to completion after keep' '' keep rescan-recovered "$P"
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

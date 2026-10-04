@@ -1958,18 +1958,38 @@ case "$CMD" in
           answer_mode="text"
         else die "pending questions — pass --answers answers.json ({qid: answer}) or --answer TEXT (same answer to all). See $RUN/questions.json"; fi
         answer_parents=$(jq -c '[.pending_questions[]?.task as $t | .config.tasks[] | select(.id==$t) | (.map_parent // .id)] | unique' "$ST") || { log "could not identify tasks associated with pending answers"; exit 4; }
+        # Only --answer explicitly shares one answer across this pending batch.
+        commit_answers='
+          if $mode=="object" then
+            .answers += [.pending_questions[] | . + {answer:$a[.id]}]
+          elif (.pending_questions | length)>1 and
+               ([.pending_questions[].task] | unique | length)==1 then
+            .pending_questions as $q
+            | .answers += [$q[0] + {
+                ids:($q | map(.id)),
+                member:($q | reduce .[] as $x ([];
+                  if index($x.member)==null then . + [$x.member] else . end)
+                  | join(", ")),
+                question:($q | map("[\(.id)] member \(.member): \(.question)")
+                  | join("\n")),
+                answer:$text
+              }]
+          else
+            .answers += [.pending_questions[] | . + {answer:$text}]
+          end
+        '
         # Commit answers, scope invalidation, and checkpoint clearing atomically. In particular,
         # do not remove the durable question file or purge reusable posts if this write fails.
         if [ "$CODEMAP" = 1 ]; then
           if ! sts --arg mode "$answer_mode" --argjson a "$ans" --arg text "$ANSWER_TEXT" --argjson ps "$answer_parents" \
-            'if $mode=="object" then .answers += [.pending_questions[] | . + {answer:$a[.id]}] else .answers += [.pending_questions[] | . + {answer:$text}] end
+            "$commit_answers"'
              | (if .map_prepass_version==1 then .map_prepasses |= with_entries(. as $entry | if ($ps|index($entry.key))!=null then .value.scope_applicability="unknown after scope-changing answers" else . end) else . end)
              | .codemap_pending=null | .pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; then
             log "could not persist answers; pending checkpoint and posts are preserved"; exit 4
           fi
         else
           if ! sts --arg mode "$answer_mode" --argjson a "$ans" --arg text "$ANSWER_TEXT" \
-            'if $mode=="object" then .answers += [.pending_questions[] | . + {answer:$a[.id]}] else .answers += [.pending_questions[] | . + {answer:$text}] end
+            "$commit_answers"'
              | .pending_questions=null | .status="running" | .last_votes=[] | .reuse_posts=false'; then
             log "could not persist answers; pending checkpoint and posts are preserved"; exit 4
           fi

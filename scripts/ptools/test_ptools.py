@@ -263,6 +263,31 @@ class SectionAccounting(unittest.TestCase):
         counts = self.partition_holds(data, state)
         self.assertEqual(counts["answers"], len(block.encode()))
 
+    def test_merged_answer_uses_existing_matcher_and_historical_prefix(self):
+        merged = {"id": "q1", "ids": ["q1", "q2", "q3"],
+                  "task": "t1", "member": "B, A",
+                  "question": "[q1] member B: Q one?\nContinuation\n[q2] member A: Q two?\n[q3] member B: Q three?",
+                  "answer": "Verbatim — answer\nsecond line"}
+        block = (prompt_report.ANSWERS.decode()
+                 + "- Q (member B, A): [q1] member B: Q one?\nContinuation\n"
+                 + "[q2] member A: Q two?\n[q3] member B: Q three?\n"
+                 + "  A: Verbatim — answer\nsecond line\n")
+        body, _ = post("unrelated")
+        data = prompt_round_n("t1", 2, "t1-c1", "CAND", [("A", body)],
+                              answers_block=block)
+        for later in ([], [{"task": "t1", "member": "A",
+                            "question": "Later?", "answer": "Later!"}]):
+            with self.subTest(later=bool(later)):
+                state = dict(self.state, answers=[merged] + later)
+                self.assertEqual(self.partition_holds(data, state)["answers"],
+                                 len(block.encode()))
+        state = dict(self.state, answers=[merged])
+        quoted, _ = post("I quote: " + block)
+        quote_data = prompt_round_n("t1", 2, "t1-c1", "CAND", [("A", quoted)])
+        self.assertEqual(self.partition_holds(quote_data, state)["answers"], 0)
+        changed = data.replace(b"second line", b"second Line")
+        self.assertEqual(self.partition_holds(changed, state)["answers"], 0)
+
     def test_quoted_answers_heading_inside_a_post_is_not_an_answers_section(self):
         state = dict(self.state, answers=[{"task": "t1", "member": "A",
                                            "question": "Q?", "answer": "A!"}])
@@ -3598,9 +3623,9 @@ class SessionReportCliTests(SessionReportCase):
                 self.assertIn(needle, block, "%s: %s" % (name, needle))
             self.assertNotIn("derived only from", block, name)
             self.assertNotIn("comes only from", block, name)
-        self.assertIn("725 Python standard-library unittest cases", (root / "README.md").read_text())
-        self.assertIn("1340 offline checks", (root / "README.md").read_text())
-        self.assertIn("725 cases", (root / "SKILL.md").read_text())
+        self.assertIn("726 Python standard-library unittest cases", (root / "README.md").read_text())
+        self.assertIn("1352 offline checks", (root / "README.md").read_text())
+        self.assertIn("726 cases", (root / "SKILL.md").read_text())
 
     def test_the_docs_state_the_fill_rule_the_component_format_the_state_type_rule_and_the_numbering(self):
         root = Path(os.environ.get("SESSION_REPORT_DOCS", str(HERE.parent.parent)))

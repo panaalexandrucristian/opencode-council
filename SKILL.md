@@ -183,6 +183,7 @@ language, shell and permissions instead of picking them). Read `D/questions.json
 answer on the user's behalf), write `answers.json` as `{"<id>": "<answer>"}` covering every id (or
 `--answer TEXT` for one answer to all), and `resume`. The answers are relayed verbatim to every member
 and the round is re-run without consuming the round budget.
+For two or more pending questions of one task, `--answer TEXT` records one explicitly shared answer with all question IDs in `ids` and all original questions labelled inside `question`. The answer applies to every listed question. `id` remains the first ID; `member` lists distinct originating members in first-appearance order. Do not assume one `.answers[]` entry means one original question or that its `member` names one council member. Single-question answers and `--answers FILE` are unchanged. Older stored records are not migrated, and placeholder strings are never interpreted or recovered.
 
 **Context handover.** After every call the member's context use is measured (OpenCode: tokens of the
 last assistant message vs the model's context limit; Claude: `usage` of the last iteration vs
@@ -463,7 +464,7 @@ password at startup (`server password ...`); `--port`/`--hostname`/`--cors` conf
 
 ## Changing the skill
 
-`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (725 cases), run automatically by
+`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (726 cases), run automatically by
 `scripts/test-completion.sh`.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
