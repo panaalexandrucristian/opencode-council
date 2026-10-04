@@ -108,7 +108,7 @@ Then: `council.sh show --config council.json` → paste the roster to the user a
 config-only cost note with two measured comparisons and cost-reduction levers. Its warning
 is advisory; the measurements are not dollar predictions.
 
-When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:335`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:417,476`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
+When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:642`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:738,800`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
 
 The split contract file path is relative to the directory containing the map-decision JSON. A version-1 contract names `parent_id` and the exact contract `map_seed_id` printed at map review from `coverage.json`; the locator's `snapshot_id` is a distinct lookup identity and must not be substituted. It then supplies non-empty `subtasks`; every child declares unique `id`, complete `text`, boolean `execute`, and arrays `requires`, `modifies`, `deletes`, `creates`, `acceptance`, and `unresolved`. Existing-file declarations bind to `{ "path": "...", "sha256": "<64 lowercase hex>" }`; created paths must be absent. Each acceptance item requires a unique `id`, `description`, non-empty `argv`, integer `expected_exit`, and its own baseline/output paths. Shared reads are valid; sibling-output dependencies and overlapping writes are not. The validator is offline and failure returns to map review (exit 4); correct the contract or explicitly keep the parent task.
 
@@ -141,7 +141,7 @@ run's state). Exit codes: **0** all tasks reached consensus · **1** config erro
 council has questions for the user · **5** finished but a task is `unresolved`/`unratified`.
 
 **Claude member calls.** Each `claude -p` call runs as the leader of its own process group (a
-`python3` `os.setsid` exec wrapper, `scripts/council.sh:1096`), and every attempt writes its own
+`python3` `os.setsid` exec wrapper, `scripts/council.sh:1431`), and every attempt writes its own
 `D/raw/<tag>-<id>-a<N>.json` (`:1100`). `kill_group` stops the whole group: SIGTERM, up to 10 s,
 SIGKILL, then up to 10 s until no live process is left (`:1034-1037`). It runs on timeout, after a
 call that exited but left processes in its group, on TERM/INT/HUP to `start`/`resume` (the trap is
@@ -196,7 +196,7 @@ member's final-generation + retired subtotal and a **RUN TOTAL** across all gene
 **Handover gate (optional).** With `COUNCIL_HANDOVER_GATE=1` in the orchestrator's environment (it works on
 `start` and on `resume` of an existing run), the delivered handover note waits for an outside review before the
 successor reads it: `do_handover` writes `<note>.pending`, logs `handover gate: review <note>; remove
-<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1488-1502`).
+<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1834-1850`). A replacement note (`resume --replace`) waits the same way.
 The successor reads the note by path when its prompt is built, so a reviewer may correct the file in place before
 releasing it. Without the gate the successor's prompt is written 0-1 s after the note (measured on 5 handovers), too
 soon for any review. The wait is bounded by `COUNCIL_HANDOVER_GATE_TIMEOUT` seconds (default 3600); an unreleased
@@ -316,6 +316,83 @@ While a step is owed a decision, **every**
 lookup route serves that one frozen view: naming another snapshot or another task/step returns an
 explicit `unavailable_for_this_step` rather than widening what the step may read.
 
+#### Telemetry (content-free, local, on by default)
+
+`start` and `resume` record what happened — never what was said — so councils can be compared and improved.
+`show`, `status` and `report` record nothing. Nothing is ever sent anywhere: no network.
+
+- **Where.** Each run writes `D/telemetry.jsonl` (0600). On **every** exit of `start`/`resume` — 0, 1 once the run
+  directory exists, 2, 4, 5, or a TERM/INT/HUP signal (143/130/129) — the events not yet exported, plus one
+  cumulative `run_summary` snapshot, are appended in one locked write to the portable ledger
+  `~/.council-telemetry/<host-id>.jsonl` (directory 0700, file 0600; override with `COUNCIL_TELEMETRY_DIR`). The
+  byte offset already exported is kept in `D/telemetry.shipped`; `state.json` holds only `.telemetry {run, inv, seq}`,
+  and each event's `seq` is reserved there (an atomic replace through an exclusively created temporary file) before
+  its line is written, so an interrupted write never lets a later invocation reuse it. A destination reached through
+  any symlink — whoever owns it, `/tmp` and `/var` included, and also when a `..` follows it — a symlinked or
+  non-regular cursor or `state.json`, or a non-regular file is refused before anything is exported or replaced;
+  existing telemetry files and directories lose group/other access, missing ledger parents are created 0700, and
+  `state.json` keeps its own permissions. The export re-validates each unexported line and ships only records the
+  schema accepts for this run (anything else is skipped, never copied), as does every reader.
+  Copy the ledger folder from several Macs into one place and report over all of them: each file is one Mac.
+- **Host id.** The first 16 hex characters of `sha256("council-telemetry-v1:" + IOPlatformUUID)` (from
+  `ioreg`, bounded to 5 s). Without a platform UUID: a random 128-bit seed in `~/.config/council-telemetry/host-seed`
+  (0600, outside the ledger folder) hashed the same way; failing both, `unknown`. The UUID, the seed, the host name
+  and the user name are never written to telemetry.
+- **What.** One JSON object per line, `schema` 1, with `ev`, `host`, `run` (a random uuid4 hex, the same across
+  resumes), `inv` (the recorded invocation, 1..n), `seq` (per run, continued across invocations; each summary has
+  its own) and `ts` (UTC epoch seconds). Events: `run_start`/`run_end` (command, status, skill/Claude/OpenCode
+  versions the run already measured, configuration dimensions, exit code), `member`, `call_start`/`call_end`
+  (member index, kind, mode, executor flag, model/effort, task index, split-child flag, step
+  plan/exec/ratify/handover/map, round, generation, attempt — every launch of the member in that step and round
+  over the whole run, across tasks, retries, resumes and generations; the mapper counts per task — outcome
+  ok/failed/killed, one failure class, duration, provider duration, the observed exit codes (Claude `exit_code`,
+  OpenCode `wait_exit_code`/`result_exit_code`), tokens {input, output, cache_read, cache_write, reasoning, total},
+  cost, context),
+  `retry`, `timeout`, `kill_group` (stopped/survived/refused/unknown — never a pid), `handover` (threshold or
+  replace, context before the note, the note call's outcome), `gate`
+  (wait and released/timeout/disabled), `questions` (counts and source member/mapper/contract at every exit-4
+  checkpoint), `votes` (accepted tails per round, replays flagged), `outcome`
+  (consensus/unresolved/ratified/unratified), `mapper_start` (the mapper operation's own identity) and one terminal
+  `mapper` per operation (its `stage` prepare/session/dispatch/wait/recover/validate/capture/done, status
+  complete/partial/unavailable/aborted, counts, linked to its operation and its call), `mapper_review`, `split_failed`,
+  `reused`, `replace`,
+  `stale_replay`; `run_summary` only in the ledger.
+- **Never.** Member ids and task ids (indices instead), prompts, task text, posts, notes, answers, paths, project
+  names, session ids, host or user names, provider error text. A model or effort outside
+  `^[A-Za-z0-9._/:@~-]{1,100}$` is recorded as `other`. Failure classes `quota`/`auth` come only from the
+  provider's own error evidence (OpenCode's structured message errors and adapter stderr; the structured errors and
+  outcome of the very page `oc.sh result` fetched, which it hands over on a separate internal channel only when that
+  fetch succeeded and the page was valid, for members and the mapper alike — never parsed out of the printed reply,
+  never inferred from another page's reply, never a stale, unreadable or unmarked channel; Claude `.result` when
+  `is_error`, CLI stderr) — never from a member's or the mapper's reply — and only the class name is kept. Without such
+  evidence a failed call stays `cli_error`.
+- **Unknown is not zero.** A value the run did not observe is `null`. OpenCode token components need a complete
+  turn in the message page the run already fetched; per-call totals and costs are deltas only from a trusted
+  baseline (a new session, or a sample taken earlier in the same invocation and generation) — the first call after
+  a resume is unknown. Durations are launch to observed completion, so they include collection delay; Claude's
+  own `duration_ms` is kept separately. A call interrupted by a crash or signal stays incomplete, never invented: a
+  leftover process stopped on resume closes its call only when its launch key (a salted hash of the recorded
+  process group and start time, kept by a `launched` event — never the pid) and generation identify exactly one
+  recorded launch, and a recovered mapper reply only when its session's key matches one recorded dispatch; time
+  proximity never links. Summaries count calls whose outcome is unknown (`outcome_unknown`) and question
+  checkpoints whose count is unknown (`questions_unknown`) explicitly; `questions` sums only the known counts.
+- **Resumes.** A run started without telemetry (opted out, or older than 0.12.0) records from its first enabled
+  resume with `history: partial`. Every resumed segment carries `gap: true`: an opted-out invocation leaves no
+  trace, so continuity is not guaranteed — it is not proof that calls are missing. Nothing is backfilled; events
+  recorded but not yet exported are exported by the next enabled invocation.
+- **Signals while arming.** A TERM/INT/HUP that arrives while telemetry obtains its identity (up to the 5 s
+  hardware probe) is held until the identity and invocation exist, then delivered to the command's usual handling,
+  so the exit status is unchanged and the run is still exported exactly once. This holds for a signal sent to the
+  whole process group too (a terminal's Ctrl-C or hang-up): the arming helpers ignore those signals while they are
+  held, the probe runs in its own session, and a helper's capture shell that the signal ended before the helper
+  started is rerun, at most twice; a helper that may have run is never rerun.
+- **Opt out.** `COUNCIL_TELEMETRY=0` (exactly `0`) disables everything for that invocation: no identity probe, no
+  seed, no files, no `state.json` change. The offline report is unaffected.
+- **Failures.** The first telemetry failure prints once `council: telemetry: write failed (<errno name>); telemetry
+  off for this invocation` (a held ledger lock waits 5 s and reports `ETIMEDOUT`) and telemetry stays off until the
+  next invocation, which exports what was missed. Telemetry never changes a status or an exit code.
+- **Report.** `python3 scripts/ptools/telemetry_report.py [INPUT ...]` — see "Changing the skill".
+
 ### 3. Token report
 
 `scripts/ptools/` is part of the skill, not an extra: `python3` is required and `council.sh` refuses to
@@ -412,7 +489,7 @@ byte-for-byte match with one of the member's own prompt files, otherwise `unknow
 
 Build/test runner with a capped summary (`run_check.py`, Python 3 standard library, POSIX only, `-h`; it **executes** the command and **writes**
 files, so unlike the other tools it is not read-only; use a `--log-dir` outside the project, `.gitignore` covers `*.log` only and
-`diff_text` (`scripts/council.sh:1678-1679`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
+`diff_text` (`scripts/council.sh:2056-2057`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
 
 ```bash
 python3 scripts/ptools/run_check.py --log-dir D [--fallback-dir F] [--reports GLOB]... [--max-bytes N] [--timeout SECONDS] -- COMMAND [ARG...]
@@ -464,8 +541,21 @@ password at startup (`server password ...`); `--port`/`--hostname`/`--cors` conf
 
 ## Changing the skill
 
-`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (726 cases), run automatically by
+`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (779 cases, including the telemetry writer/report), run automatically by
 `scripts/test-completion.sh`.
+
+`scripts/ptools/telemetry_report.py [INPUT ...]` reports offline over telemetry (read-only, standard library).
+INPUT is a ledger file, a directory (its immediate `*.jsonl`) or a run directory (its `telemetry.jsonl`); the default
+is `$COUNCIL_TELEMETRY_DIR`, else `~/.council-telemetry`; symlinks are skipped and counted, never followed; `-h` is
+the only option. It prints plain-text sections per host and for all hosts: coverage, calls by model/kind with the
+failure rate ((failed + killed) / all launches, retries included, incomplete calls unknown), failure classes,
+timeouts and kill results, retries, durations by step (nearest-rank median/p90), costs per council and per step
+(known subtotal + calls with unknown cost), handovers, gate waits, the mapper (complete and
+complete+partial rates, repair rate), questions, votes and outcomes, and the latest summary per run (never added to
+the event totals); then diagnostics. Records are deduplicated by (host, run, seq), so a run directory and its
+ledger can be given together; records that conflict under one identity are excluded and counted; malformed or
+truncated lines, other schemas, unknown events and invalid values are skipped and counted, never printed. Exit 0
+with a report, 2 with no readable input.
 
 `scripts/test-completion.sh` is an offline contract suite (no network, no model calls): it
 loads the real functions from both scripts and stubs only curl/api/adapters, covering transport and

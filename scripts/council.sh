@@ -77,8 +77,11 @@ abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$PWD/${1#./}" ;; es
 
 # Claude Code >= 2.1.277 reports a resumed session's CUMULATIVE spend on every result (total_cost_usd, modelUsage);
 # earlier versions report per-call figures. Detect once so session totals are neither double-counted nor under-counted.
+claude_version() { claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+CLAUDE_VERSION=""; CLAUDE_PROBED=0
+claude_probe() { CLAUDE_VERSION=$(claude_version); CLAUDE_PROBED=1; }   # start: the one version call, reused by telemetry
 claude_cumulative() {
-  local v; v=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); [ -n "$v" ] || { echo false; return; }
+  local v; if [ "$CLAUDE_PROBED" = 1 ]; then v=$CLAUDE_VERSION; else v=$(claude_version); fi; [ -n "$v" ] || { echo false; return; }
   printf '%s\n%s\n' "2.1.277" "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -1 | grep -qx "2.1.277" && echo true || echo false
 }
 
@@ -97,6 +100,287 @@ load_state() {
   if [ "$(st '.map_prepass_version // 0')" = 1 ] && [ "$(st '.config.map_code // false')" = true ]; then MAP_PREPASS=1; fi
   codemap_check_version
 }
+
+# -------------------------------------------------------------- telemetry ----
+# Content-free telemetry (scripts/council_telemetry.py, the only writer): start and resume record events in
+# $RUN/telemetry.jsonl and, on every exit, export the unshipped ones plus a run_summary to the ledger
+# ($COUNCIL_TELEMETRY_DIR, else ~/.council-telemetry). Exactly COUNCIL_TELEMETRY=0 disables it before any probe or
+# file. The first failure logs one warning and turns telemetry off for the rest of the invocation; telemetry never
+# changes a status or an exit code (tm keeps the caller's $?). Only the shell that armed it records (bash 3.2 has no
+# BASHPID: BASH_SUBSHELL is compared), so subshells and their own EXIT traps never finalize.
+TMPY="$HERE/council_telemetry.py"
+TM_ON=0; TM_OFF=0; TM_FINAL=0; TM_DEPTH=0; TM_OUT=""; TM_LAST=""; TM_HOST=""; TM_RID=""; TM_INV=0; TM_FLOOR=0; TM_T0=0
+TM_STEP=""; TM_ROUND=""; TM_HO=""; TM_HO_MEMBER=""; TM_GATE_T0=""; TM_KG=""; TM_LI=""; TM_STDIN=""; OPENCODE_VERSION=""
+TM_FC=""; TM_OC=""; TM_EVID=""; TM_EMPTY=0; TM_CEND=""; TM_LASTCLS=""; TM_LASTOUT=""; TM_LASTEV=""; TM_MAP_OC=""; TM_MAP_FC=""
+TM_BEGUN=1; TM_MAP_OP=""; TM_MAP_CS=""; TM_XC=""; TM_MAP_XC=""; TM_MAP_EVID=""; TM_MAP_REC=0; TM_MAP_STAGE=""; TM_LASTSEQ=""
+TM_SESS_OK=0; TM_CS=(); TM_NEW=(); TM_BG=()   # per member: open call seq, new-session flag, generation of the last trusted usage sample
+tm_opted_out() { [ "${COUNCIL_TELEMETRY-}" = 0 ]; }
+tm_live() { [ "$TM_ON" = 1 ] && [ "$TM_OFF" = 0 ] && [ "$BASH_SUBSHELL" = "$TM_DEPTH" ]; }
+tm_fail() { TM_OFF=1; log "telemetry: write failed ($1); telemetry off for this invocation"; }
+tm_call() {  # helper args... -> TM_OUT; 1 once telemetry is off. Only an errno name ever reaches the log.
+  # While arming holds TERM/INT/HUP (TM_HOLDING), the capture shell itself ignores them before it execs the helper, so a
+  # signal sent to the whole process group cannot kill the helper (or its probe) mid-way; see tm_held_rerun.
+  local out rc re='^E[A-Z0-9]+$' n=0
+  [ -f "$TMPY" ] || { tm_fail ENOENT; return 1; }
+  while :; do
+    if [ -n "$TM_STDIN" ]; then out=$(printf '%s' "$TM_STDIN" | python3 -B "$TMPY" "$@" 2>/dev/null); rc=$?
+    elif [ "$TM_HOLDING" = 1 ]; then out=$(trap '' TERM INT HUP; exec python3 -B "$TMPY" "$@" </dev/null 2>/dev/null); rc=$?
+    else out=$(python3 -B "$TMPY" "$@" </dev/null 2>/dev/null); rc=$?; fi
+    [ $rc -eq 0 ] && { TM_OUT=$out; return 0; }
+    tm_held_rerun $rc $n || break; n=$((n + 1))
+  done
+  [[ $out =~ $re ]] || out=EIO
+  tm_fail "$out"; return 1
+}
+tm_held_rerun() {  # status reruns-so-far -> 0 when a held-interval capture shell died of the held signal before its exec
+  # Under the direct shield the only process that a TERM/INT/HUP can end is the capture shell before its `trap ''` runs:
+  # after it, the shell and the helper it becomes ignore them, and the helper never exits 129/130/143 itself. So such a
+  # status, matching the signal the parent holds, proves that no helper ran and nothing was written: rerun, at most twice.
+  [ "$TM_HOLDING" = 1 ] && [ -z "$TM_STDIN" ] && [ "$2" -lt 2 ] || return 1
+  case "$1:$TM_PSIG" in 143:TERM|130:INT|129:HUP) return 0 ;; esac
+  return 1
+}
+tm_clock() {  # -> TM_T0 = now; while signals are held, from a directly shielded capture shell (rerun as tm_call does)
+  local rc n=0
+  while :; do
+    if [ "$TM_HOLDING" = 1 ]; then TM_T0=$(trap '' TERM INT HUP; exec date +%s); rc=$?; else TM_T0=$(date +%s); rc=$?; fi
+    [ $rc -eq 0 ] && return 0
+    tm_held_rerun $rc $n || return 0; n=$((n + 1))
+  done
+}
+tm() {  # ev [helper options] [k=v ...] -> one event, its seq in TM_LAST; returns the caller's $?
+  local rc=$?
+  tm_live || return $rc
+  TM_LAST=""
+  tm_call event "$@" --run "$RUN" --host "$TM_HOST" --rid "$TM_RID" --inv "$TM_INV" --floor "$TM_FLOOR" --state "$RUN/state.json" && TM_LAST=$TM_OUT
+  return $rc
+}
+tm_arm() {  # command -> 0 when this invocation records; installs the main shell's EXIT finalizer
+  tm_opted_out && return 1
+  TM_ON=1; TM_OFF=0; TM_FINAL=0; TM_DEPTH=$BASH_SUBSHELL; tm_clock; TM_HOST=""; TM_RID=""
+  [ "$1" = start ] && { TM_INV=1; TM_FLOOR=0; TM_BEGUN=0; }   # the start's invocation exists before the finalizer does
+  trap 'tm_exit' EXIT
+  tm_call init || return 1
+  TM_RID=${TM_OUT##* }; TM_HOST=${TM_OUT%% *}   # the host last: a non-empty TM_HOST means a complete identity
+}
+# Arming can block (the hardware identity probe takes up to 5 s). A TERM/INT/HUP arriving meanwhile is held, not acted
+# on: handled at once it would reach the finalizer with a half-made identity, which the helper rejects (the telemetry is
+# lost and a spurious warning logged). The hold covers the whole process group, not only this shell: while TM_HOLDING the
+# helper and timestamp captures ignore those signals from their own capture shell on (tm_call, tm_clock), and the probe
+# runs in its own session. Once the identity and the invocation exist the command's own handling is installed and a held
+# signal is delivered to it, so the exit status is unchanged; only its delivery waits for the arming.
+TM_PSIG=""; TM_HOLDING=0; TM_REV=""; TM_RESULT_EV=""; TM_MAP_RF=0; TM_MAP_REV=""
+tm_hold() { TM_PSIG=""; TM_HOLDING=1; trap 'TM_PSIG=TERM' TERM; trap 'TM_PSIG=INT' INT; trap 'TM_PSIG=HUP' HUP; }
+tm_release() {  # handler-installer -> install it, then deliver a signal held while arming
+  TM_HOLDING=0
+  "$1"
+  [ -z "$TM_PSIG" ] || { local s=$TM_PSIG; TM_PSIG=""; kill -s "$s" $$; }
+}
+tm_resig() {  # resume, until trap_calls: each signal still ends the process by its default action, as before telemetry
+  trap 'tm_resig_one TERM 143' TERM; trap 'tm_resig_one INT 130' INT; trap 'tm_resig_one HUP 129' HUP
+}
+tm_resig_one() {  # signal status -> finalize with the signal's status, then end by the signal itself (the restored
+  # default action runs no EXIT trap, so the finalizer runs here first)
+  trap - TERM INT HUP
+  if [ "$BASH_SUBSHELL" = "$TM_DEPTH" ] && [ "$TM_FINAL" = 0 ]; then trap - EXIT; tm_finish "$2"; fi
+  kill -s "$1" $$
+}
+tm_arm_start() {  # start, right after the run-dir leaf is created: armed before any setup or probe; the identity
+  tm_opted_out && return 0   # lives in memory until state.json is published
+  tm_hold; tm_arm start; tm_release trap_calls
+}
+tm_begin_start() {  # the start's run_start, once: after the version probe, or from the finalizer when an exit came first
+  tm_live && [ "$TM_BEGUN" = 0 ] || return 0
+  TM_BEGUN=1
+  local cv=""; [ "$CLAUDE_PROBED" = 1 ] && cv=$CLAUDE_VERSION
+  tm_call begin --run "$RUN" --host "$TM_HOST" --rid "$TM_RID" --inv 1 --floor 0 --command start --config "$CONFIG" \
+    --history full --gap false claude_version="$cv" opencode_version="$OPENCODE_VERSION" && TM_LAST=$TM_OUT
+}
+tm_state_json() { if [ "$TM_ON" = 1 ] && [ "$TM_OFF" = 0 ]; then printf '{"run":"%s","inv":1,"seq":%s}' "$TM_RID" "${TM_LAST:-0}"; else printf null; fi; }
+tm_arm_resume() {  # resume, before load_state (whose checkpoint can exit): only a readable state is recorded
+  tm_opted_out && return 0
+  ST="$RUN/state.json"
+  [ -f "$ST" ] && jq -e 'type=="object"' "$ST" >/dev/null 2>&1 || return 0
+  tm_hold; tm_resume_identity; tm_release tm_resig
+}
+tm_resume_identity() {  # resume's identity, invocation and run_start (signals held by the caller)
+  tm_arm resume || return 0
+  local re='^[0-9a-f]{32} [1-9][0-9]* [0-9]+ (auto|partial)$'
+  # the helper continues a trusted .telemetry above every recorded invocation and seq, else (a legacy or opted-out run)
+  # starts recording the new identity here; it stores the result in state.json itself (no shell redirect)
+  tm_call resume --run "$RUN" --rid "$TM_RID" || return 0
+  [[ $TM_OUT =~ $re ]] || { tm_fail EIO; return 0; }
+  set -- $TM_OUT; TM_RID=$1; TM_INV=$2; TM_FLOOR=$3
+  tm_call begin --run "$RUN" --host "$TM_HOST" --rid "$TM_RID" --inv "$TM_INV" --floor "$TM_FLOOR" --command resume \
+    --state "$ST" --history "$4" --gap true && TM_LAST=$TM_OUT
+}
+tm_exit() {  # the EXIT trap: finalize once, in the arming shell only, and keep the exit code
+  local rc=$?
+  [ "$BASH_SUBSHELL" = "$TM_DEPTH" ] && [ "$TM_FINAL" = 0 ] || return $rc
+  trap - EXIT
+  tm_finish "$rc"
+  exit "$rc"
+}
+tm_finish() {  # exit-code -> interrupted gate, exit-4 questions, run_end, a reserved summary seq, the export
+  TM_FINAL=1
+  tm_live || return 0
+  [ -n "$TM_HOST" ] && [ -n "$TM_RID" ] && [ "$TM_INV" != 0 ] || return 0   # never an empty identity or invocation 0
+  tm_begin_start
+  [ -n "$TM_GATE_T0" ] && tm gate member_index="$TM_HO_MEMBER" handover_seq="$TM_HO" wait_s=$(( $(date +%s) - TM_GATE_T0 )) result= interrupted=true
+  [ "$1" = 4 ] && tm questions --task
+  local created=""; [ -f "$RUN/state.json" ] || created=created
+  tm run_end --task exit_code="$1" duration_s=$(( $(date +%s) - TM_T0 )) claude_version="$CLAUDE_VERSION" \
+    opencode_version="$OPENCODE_VERSION" ${created:+status=created}
+  # the summary's seq, reserved in state.json by the helper before it is published: a later resume continues above it
+  tm_live && tm_call nextseq --run "$RUN" --rid "$TM_RID" --floor "$TM_FLOOR" --state "$RUN/state.json" || return 0
+  local seq=$TM_OUT
+  tm_call ship --run "$RUN" --host "$TM_HOST" --rid "$TM_RID" --inv "$TM_INV" --seq "$seq" --exit-code "$1" \
+    --state "$RUN/state.json" ${created:+--status created}
+}
+tm_call_start() {  # idx -> call_start for the launch about to happen (step/round from TM_STEP/TM_ROUND)
+  local rc=$?
+  TM_CS[$1]=""
+  tm call_start --member "$1" --task step="$TM_STEP" round="$TM_ROUND" && TM_CS[$1]=$TM_LAST
+  return $rc
+}
+tm_end() {  # idx ok|fail -> the one call_end of the member's current launch, classified by collect and the tail check
+  local rc=$? i=$1 out=ok cls="" ev=""
+  tm_live && [ -n "${TM_CS[$1]:-}" ] || return $rc
+  if [ "$2" != ok ]; then
+    out=${TM_OC:-failed}; cls=$TM_FC
+    if [ -z "$cls" ]; then if [ "$TM_EMPTY" = 1 ]; then cls=empty_output; else cls=no_valid_json_tail; fi; fi
+  fi
+  [ "$cls" = cli_error ] && [ -n "$TM_EVID" ] && { ev=--evidence-stdin; TM_STDIN=$TM_EVID; }
+  tm call_end call_seq="${TM_CS[$i]}" outcome=$out ${cls:+failure_class=$cls} $TM_CEND $TM_XC $ev
+  TM_STDIN=""; TM_XC=""; TM_LASTSEQ=${TM_CS[$i]}; TM_CS[$i]=""; TM_LASTCLS=$cls; TM_LASTOUT=$out; TM_LASTEV=$ev
+  return $rc
+}
+tm_launch_failed() {  # idx -> the launch that call_start announced never started
+  local rc=$?
+  tm_live && [ -n "${TM_CS[$1]:-}" ] || return $rc
+  tm call_end call_seq="${TM_CS[$1]}" outcome=failed failure_class=launch_failed
+  TM_CS[$1]=""; TM_LASTOUT=failed
+  return $rc
+}
+tm_killed() {  # idx reason [stale] -> kill_group for the member's call; stopped = killed, a survivor = failed/group_survived
+  # The call is this invocation's open launch (TM_CS); a leftover found on resume (stale) is linked only through the launch
+  # key its recorded process group and start time give (--stale --launch-key), and stays incomplete unless that key
+  # identifies exactly one recorded launch of the same generation.
+  local rc=$? i=$1 link
+  tm_live || return $rc
+  if [ -z "$i" ]; then tm kill_group reason="$2" result="$TM_KG"; return $rc; fi
+  if [ "${3:-}" = stale ]; then link=(--stale --launch-key); else link=(call_seq="${TM_CS[$i]:-}"); fi
+  tm kill_group --member "$i" "${link[@]}" reason="$2" result="$TM_KG"
+  case "$TM_KG" in
+    stopped) tm call_end --member "$i" "${link[@]}" outcome=killed ;;
+    survived|unknown) tm call_end --member "$i" "${link[@]}" outcome=failed failure_class=group_survived ;;
+  esac
+  TM_CS[$i]=""
+  return $rc
+}
+tm_delta() {  # now base -> now-base (C locale: a decimal point, whatever the user's locale), or null when unknown or decreasing
+  LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN { if (a == "null" || b == "null" || a == "" || b == "") { print "null"; exit }
+    d = a - b; if (d < 0) print "null"; else printf "%.10g\n", d }'
+}
+tm_base() {  # idx -> "tokens cost" the member's session had before this call, or "null null" when not trusted
+  if [ "${TM_NEW[$1]:-0}" = 1 ]; then echo "0 0"
+  elif [ -n "${TM_BG[$1]:-}" ] && [ "${TM_BG[$1]}" = "$(mget "$1" gen)" ]; then st ".members[$1] | \"\(.session_tokens // \"null\") \(.session_cost // \"null\")\""
+  else echo "null null"; fi
+}
+# Provider evidence of a failed `oc.sh result`: never its output (the reply text, member- or mapper-authored, may hold any
+# "[error]"/"[outcome]" line) and never another page's reply used as a boundary. oc.sh show_result itself publishes, on a
+# private channel (OC_RESULT_EVIDENCE), the structured assistant errors and the outcome of the very page that result
+# fetched, and only when that fetch succeeded and the page was valid. A channel is used only when it was established
+# fresh for that retrieval; a missing, stale, unreadable or unmarked one supplies nothing.
+tm_ev_prepare() {  # channel-file -> 0 when a fresh channel exists for this retrieval (telemetry live, no earlier file left)
+  tm_live || return 1
+  rm -f "$1" "$1.tmp" 2>/dev/null
+  [ ! -e "$1" ] && [ ! -L "$1" ] && [ ! -e "$1.tmp" ] && [ ! -L "$1.tmp" ]
+}
+tm_ev_take() {  # channel-file -> its evidence lines, only when the whole file was read and starts with the marker; removes it
+  local buf rc nl=$'\n'
+  buf=$(cat "$1" 2>/dev/null); rc=$?
+  rm -f "$1" "$1.tmp" 2>/dev/null
+  [ $rc -eq 0 ] && [ "${buf%%"$nl"*}" = "oc-result-evidence 1" ] || return 0
+  case "$buf" in *"$nl"*) printf '%s\n' "${buf#*"$nl"}" ;; esac
+}
+tm_result() {  # channel-file sid -> `oc.sh result sid`, run exactly once, its status kept; the channel's evidence in TM_RESULT_EV
+  local ok=0 rc; TM_RESULT_EV=""
+  tm_ev_prepare "$1" && ok=1
+  if [ "$ok" = 1 ]; then OC_RESULT_EVIDENCE="$1" "$OC" result "$2"; rc=$?; TM_RESULT_EV=$(tm_ev_take "$1")
+  else "$OC" result "$2"; rc=$?; fi
+  return $rc
+}
+tm_page_errors() {  # message-page desc|asc -> the structured assistant error messages of the page's current turn
+  jq -r --arg order "$2" '(.data // []) | (if $order == "asc" then reverse else . end) as $m
+    | ($m | map(.type=="user") | index(true)) as $u | (if $u == null then $m else $m[:$u] end)
+    | [.[] | select(.type=="assistant" and .error != null) | (.error.message // "" | tostring)] | join("\n")' <<<"$1" 2>/dev/null
+}
+tm_oc_sample() {  # idx wait-rc result-rc msg session out err -> TM_FC/TM_OC/TM_CEND/TM_EVID/TM_EMPTY for this OpenCode call
+  local i=$1 wrc=$2 rrc=$3 msg=$4 sraw=$5 out=$6 err=$7 turn sess base tot cost
+  turn=$(jq -r 'def num(f): if (f|type)=="number" and f>=0 and (f|floor)==f then f else null end;
+    (.data // []) as $m | ($m | map(.type=="user") | index(true)) as $u | (if $u == null then $m else $m[:$u] end) as $cur
+    | [$cur[] | select(.type=="assistant")] as $a
+    | def comp(f): if $u != null and ($a|length)>0 and all($a[]; num(f) != null) then ([$a[] | f] | add) else null end;
+    ($a[0].tokens // {}) as $t | [$t.input, $t.output, $t.reasoning, $t.cache.read, $t.cache.write] as $c
+    | "tokens.input=\(comp(.tokens.input) // "null") tokens.output=\(comp(.tokens.output) // "null") tokens.reasoning=\(comp(.tokens.reasoning) // "null") tokens.cache_read=\(comp(.tokens.cache.read) // "null") tokens.cache_write=\(comp(.tokens.cache.write) // "null") ctx_used=\(if ($a|length)>0 and ($c|all(type=="number")) then ($c|add) else "null" end)"' <<<"$msg" 2>/dev/null)
+  [ -n "$turn" ] || turn="tokens.input=null tokens.output=null tokens.reasoning=null tokens.cache_read=null tokens.cache_write=null ctx_used=null"
+  sess=$(jq -r '.data | [(.tokens | [.input, .output, .reasoning, .cache.read, .cache.write]) as $c | if ($c|all(type=="number")) then ($c|add) else "null" end,
+    (if (.cost|type)=="number" then .cost else "null" end)] | join(" ")' <<<"$sraw" 2>/dev/null)
+  [ -n "$sess" ] || sess="null null"
+  TM_SESS_OK=0; [[ $sess == *null* ]] || TM_SESS_OK=1
+  base=$(tm_base "$i")
+  tot=$(tm_delta "${sess%% *}" "${base%% *}"); cost=$(tm_delta "${sess##* }" "${base##* }")
+  if [ "$tot" = null ] && [[ $turn != *=null* ]]; then   # no trusted delta: the complete turn's own components
+    tot=$(LC_ALL=C awk '{ s = 0; for (i = 1; i <= 5; i++) { split($i, kv, "="); s += kv[2] } print s }' <<<"$turn")
+  fi
+  TM_CEND="$turn tokens.total=$tot cost_usd=$cost ctx_limit=$(st ".members[$i].ctx_limit // \"null\"") wait_exit_code=$wrc result_exit_code=$rrc"
+  if [ "$wrc" -eq 2 ]; then TM_FC=timeout; TM_OC=failed
+  elif [ "$wrc" -ne 0 ] || [ "$rrc" -ne 0 ]; then TM_FC=cli_error; TM_OC=failed
+    TM_EVID=$(jq -r '(.data // []) as $m | ($m | map(.type=="user") | index(true)) as $u | (if $u == null then $m else $m[:$u] end)
+      | [.[] | select(.type=="assistant" and .error != null) | (.error.message // "" | tostring)] | join("\n")' <<<"$msg" 2>/dev/null; cat "$err" 2>/dev/null
+      [ "$rrc" -eq 0 ] || printf '%s\n' "$TM_REV")
+  elif [ ! -s "$out" ] || [ "$(cat "$out")" = "(no text output in this turn)" ]; then TM_EMPTY=1; fi
+}
+tm_trust() {  # idx updated(0/1) -> the member's recorded session totals are (not) a trusted baseline for its next call
+  TM_NEW[$1]=0
+  if [ "$2" = 1 ]; then TM_BG[$1]=$(mget "$1" gen); else TM_BG[$1]=""; fi
+}
+tm_cl_sample() {  # idx raw-json rc -> TM_CEND/TM_FC/TM_OC/TM_EVID/TM_EMPTY for this Claude call (before state is updated)
+  local i=$1 j=$2 crc=$3 line now base cost
+  line=$(jq -r 'def num(f): if (f|type)=="number" and f>=0 then f else null end;
+    [.usage.input_tokens, .usage.output_tokens, .usage.cache_read_input_tokens, .usage.cache_creation_input_tokens] as $c
+    | ((.usage.iterations // [.usage]) | last) as $l
+    | "tokens.input=\(num($c[0]) // "null") tokens.output=\(num($c[1]) // "null") tokens.cache_read=\(num($c[2]) // "null") tokens.cache_write=\(num($c[3]) // "null") tokens.reasoning=null tokens.total=\(if ($c|all(type=="number")) then ($c|add) else "null" end) provider_duration_s=\(if (.duration_ms|type)=="number" and .duration_ms>=0 then .duration_ms/1000 else "null" end) ctx_used=\([$l.input_tokens, $l.cache_read_input_tokens, $l.cache_creation_input_tokens, $l.output_tokens] | if all(type=="number") then add else "null" end) ctx_limit=\((.modelUsage // {}) | to_entries | map(.value.contextWindow | select(type=="number")) | max // "null") @\(num(.total_cost_usd) // "null")"' "$j" 2>/dev/null)
+  [ -n "$line" ] || line="tokens.input=null tokens.output=null tokens.cache_read=null tokens.cache_write=null tokens.reasoning=null tokens.total=null provider_duration_s=null ctx_used=null ctx_limit=null @null"
+  now=${line##*@}; line=${line% @*}
+  if [ "$(st '.cl_cumulative // false')" = true ]; then base=$(tm_base "$i"); cost=$(tm_delta "$now" "${base##* }"); else cost=$now; fi
+  case "$line" in *ctx_limit=null*) line="${line% ctx_limit=null} ctx_limit=$(st ".members[$i].ctx_limit // \"null\"")" ;; esac
+  TM_CEND="$line cost_usd=$cost"
+  if [ "$CALL_LEFT_RUNNING" = 1 ]; then TM_FC=group_survived; TM_OC=failed
+  elif [ -n "$TM_FC" ]; then :   # the deadline already classified it
+  elif ! jq -e '.type=="result"' "$j" >/dev/null 2>&1; then TM_FC=cli_error; TM_OC=failed; TM_EVID=$(cat "$j.err" 2>/dev/null)
+  elif jq -e '.is_error==true' "$j" >/dev/null 2>&1; then TM_FC=cli_error; TM_OC=failed; TM_EVID=$(jq -r '.result // "" | tostring' "$j" 2>/dev/null)
+  elif [ "$crc" -eq 0 ] && [ -z "$(jq -r '.result // ""' "$j" 2>/dev/null)" ]; then TM_EMPTY=1; fi
+}
+tm_map_done() {  # dir status [--no-response] [--no-captures] -> the mapper call's end (once usage is recorded) and the operation's
+  # one terminal record (stage TM_MAP_STAGE, default done). In-run both link the seqs this invocation recorded; a recovery
+  # (TM_MAP_REC=1) links only the dispatch whose launch key matches the state's session, else the earlier records stay incomplete.
+  local rc=$? dir=$1 status=$2 cl ml; shift 2
+  tm_live || { TM_MAP_OC=""; TM_MAP_FC=""; TM_MAP_XC=""; TM_MAP_EVID=""; TM_MAP_REC=0; TM_MAP_STAGE=""; return $rc; }
+  if [ "$TM_MAP_REC" = 1 ]; then cl=--mapper-recover; ml=--mapper-recover
+  else cl=call_seq=$TM_MAP_CS; ml="op_seq=$TM_MAP_OP mapper_seq=$TM_MAP_CS"; fi
+  if [ -n "$TM_MAP_OC" ]; then
+    local ev=""; [ "$TM_MAP_FC" = cli_error ] && [ -n "$TM_MAP_EVID" ] && { ev=--evidence-stdin; TM_STDIN=$TM_MAP_EVID; }
+    tm call_end --mapper --task --mapper-usage $cl outcome="$TM_MAP_OC" ${TM_MAP_FC:+failure_class=$TM_MAP_FC} $TM_MAP_XC $ev
+    TM_STDIN=""
+  fi
+  if [ -n "$dir" ]; then tm mapper --task --mapper --mapdir "$dir" $ml "$@" status="$status" stage="${TM_MAP_STAGE:-done}"
+  else tm mapper --task --mapper $ml "$@" status="$status" stage="${TM_MAP_STAGE:-done}"; fi
+  TM_MAP_OC=""; TM_MAP_FC=""; TM_MAP_XC=""; TM_MAP_EVID=""; TM_MAP_OP=""; TM_MAP_CS=""; TM_MAP_REC=0; TM_MAP_STAGE=""
+  return $rc
+}
+tm_phase_step() { case "$(st .phase)" in plan|exec|ratify) st .phase ;; map|map_review|mapper_confirm) echo map ;; *) echo "" ;; esac; }
 
 # ---------------------------------------------------------------- codemap ----
 # state.codemap_version=1 is stamped on every new run; no opt-in field. Absent -> every
@@ -229,8 +513,12 @@ SCAN_SHAPE='type=="object" and (.links|type=="array") and (.case_insensitive|typ
 map_key() { printf '%s' "$1" | shasum -a 256 | cut -c1-16; }
 map_prepass_enabled() { [ "$MAP_PREPASS" = 1 ]; }
 map_finalize_failure() {  # terminal optimization failure still gets complete durable accounting artifacts
-  local tid=$1 dir=$2 reason=$3 outcome=${4:-unavailable} sid usage model effort
-  mkdir -p "$dir" || { log "cannot create mapper failure archive $dir"; return 1; }
+  local tid=$1 dir=$2 reason=$3 outcome=${4:-unavailable} sid usage model effort tm_absent=() tm_rf=$TM_MAP_RF tm_rev=$TM_MAP_REV
+  TM_MAP_RF=0; TM_MAP_REV=""
+  # A failure of this archive itself still ends the operation once (aborted at its current stage); a call_end only when
+  # the call was observed (TM_MAP_OC), so no paid call is invented.
+  mkdir -p "$dir" || { log "cannot create mapper failure archive $dir"; tm_map_done "" aborted; return 1; }
+  [ -f "$dir/response.txt" ] || tm_absent+=(--no-response); [ -f "$dir/capture-results.json" ] || tm_absent+=(--no-captures)
   sid=$(jq -r --arg t "$tid" '.map_prepasses[$t].session // empty' "$ST")
   model=$(st '.config.map_prepass.model // "google/gemini-3.8-flash"'); effort=$(st '.config.map_prepass.effort // "medium"')
   usage='{}'
@@ -239,6 +527,14 @@ map_finalize_failure() {  # terminal optimization failure still gets complete du
     [ -s "$dir/tool-records.json" ] || "$OC" messages "$sid" --raw >"$dir/tool-records.json" 2>"$dir/tools.err" || true
     usage=$(jq -c '.data | {input:(.tokens.input // null),cache_read:(.tokens.cache.read // null),cache_write:(.tokens.cache.write // null),output:(.tokens.output // null),reasoning:(.tokens.reasoning // null),cost:(.cost // null)}' "$dir/session.json" 2>/dev/null)
     [ -n "$usage" ] || usage='{}'
+  fi
+  # A failed result: the structured assistant errors of the mapper messages fetched above and the block oc.sh published
+  # from the page that result fetched (tm_result) are evidence; the mapper's text never is.
+  if [ "$tm_rf" = 1 ] && [ "$TM_MAP_FC" = cli_error ] && tm_live; then
+    local tm_recs; tm_recs=$(cat "$dir/tool-records.json" 2>/dev/null)
+    TM_MAP_EVID="$TM_MAP_EVID
+$(tm_page_errors "$tm_recs" asc)
+$tm_rev"
   fi
   [ -f "$dir/response.txt" ] || : >"$dir/response.txt"
   [ -f "$dir/tool-records.json" ] || echo '[]' >"$dir/tool-records.json"
@@ -265,18 +561,19 @@ map_finalize_failure() {  # terminal optimization failure still gets complete du
       captured_versions_ranges:$c,capture_statuses:$c,
       exclusions:[],boundary:$b,resource_schema_failures:[$r],
       mapper_unresolved:{attribution:{kind:"opencode",model:$m,effort:$e},items:[]},
-      telemetry_complete:false,tool_records_complete:false,coverage:"unknown"}' >"$dir/coverage.json.tmp" || return 1
-  mv "$dir/coverage.json.tmp" "$dir/coverage.json" || return 1
+      telemetry_complete:false,tool_records_complete:false,coverage:"unknown"}' >"$dir/coverage.json.tmp" || { tm_map_done "" aborted; return 1; }
+  mv "$dir/coverage.json.tmp" "$dir/coverage.json" || { tm_map_done "" aborted; return 1; }
   # Preserve any validated mapper unresolved targets when failure happens after validation.
   if [ -s "$dir/validation.json" ]; then
     local unresolved; unresolved=$(jq -c '.result.unresolved // []' "$dir/validation.json" 2>/dev/null) || unresolved='[]'
     [ -n "$unresolved" ] || unresolved='[]'
-    jq --argjson u "$unresolved" '.mapper_unresolved.items=$u' "$dir/coverage.json" >"$dir/coverage.json.tmp" && mv "$dir/coverage.json.tmp" "$dir/coverage.json" || return 1
+    jq --argjson u "$unresolved" '.mapper_unresolved.items=$u' "$dir/coverage.json" >"$dir/coverage.json.tmp" && mv "$dir/coverage.json.tmp" "$dir/coverage.json" || { tm_map_done "" aborted; return 1; }
   fi
   sts --arg t "$tid" --arg r "$reason" --arg s "$outcome" --arg dir "$dir" --argjson u "$usage" \
     '.map_prepasses[$t].status=$s | .map_prepasses[$t].failure=$r | .map_prepasses[$t].usage=$u
      | .map_prepasses[$t].artifacts={directory:$dir,coverage:($dir+"/coverage.json"),response:($dir+"/response.txt"),selectors:($dir+"/candidates.json"),session:($dir+"/session.json"),tools:($dir+"/tool-records.json")}
      | .map_prepasses[$t].finished_at=(now|floor)'
+  tm_map_done "$dir" "$outcome" "${tm_absent[@]}"
 }
 map_prepass_run() {  # original task only; durable dispatch state prevents duplicate paid launches
   local task=$1 tid key dir entry status sid prompt raw parsed errors maxbytes model effort timeout digest cmdrc answers recovered=0 result_tmp
@@ -285,17 +582,23 @@ map_prepass_run() {  # original task only; durable dispatch state prevents dupli
   status=$(jq -r '.status // "new"' <<<"$entry")
   case "$status" in complete|partial|unavailable) return 0;; dispatching|dispatched)
     sid=$(jq -r '.session // empty' <<<"$entry")
+    TM_MAP_REC=1; TM_MAP_STAGE=recover   # telemetry links only the dispatch (and its operation) the session's launch key identifies
     if [ -z "$sid" ]; then map_finalize_failure "$tid" "$dir" "dispatch state has no session; not relaunched" || return 1; return 0; else
       "$OC" wait "$sid" --timeout 1 --ask >/dev/null 2>"$dir/resume-wait.err"; cmdrc=$?
+      TM_MAP_XC="wait_exit_code=$cmdrc"
       if [ "$cmdrc" -eq 0 ]; then
         result_tmp="$dir/response.txt.recovery-$$.tmp"
-        if ! "$OC" result "$sid" >"$result_tmp" 2>"$dir/result-recovery.err"; then
+        if ! tm_result "$dir/result-recovery-evidence" "$sid" >"$result_tmp" 2>"$dir/result-recovery.err"; then
           [ -s "$result_tmp" ] && mv "$result_tmp" "$dir/response-retrieval-partial.txt"
+          TM_MAP_OC=failed; TM_MAP_FC=cli_error; TM_MAP_XC="$TM_MAP_XC result_exit_code=1"; TM_MAP_EVID=$(cat "$dir/result-recovery.err" 2>/dev/null)
+          TM_MAP_RF=1; TM_MAP_REV=$TM_RESULT_EV   # map_finalize_failure adds the structured and adapter evidence
           map_finalize_failure "$tid" "$dir" "completed mapper result could not be retrieved" || return 1; return 0
         fi
         mv "$result_tmp" "$dir/response.txt" || { log "could not publish recovered mapper response"; return 1; }
-        status=dispatched; recovered=1
+        status=dispatched; recovered=1; TM_MAP_OC=ok; TM_MAP_XC="$TM_MAP_XC result_exit_code=0"; TM_MAP_STAGE=""
       else
+        # still running: a timeout, interrupted; any other uncertain wait leaves the outcome unknown (no end invented)
+        [ "$cmdrc" -eq 2 ] && { TM_MAP_OC=failed; TM_MAP_FC=timeout; tm timeout --task --mapper --mapper-recover timeout_s=1; }
         [ "$cmdrc" -eq 2 ] && "$OC" interrupt "$sid" >/dev/null 2>&1 || true
         map_finalize_failure "$tid" "$dir" "incomplete or uncertain dispatch (wait exit $cmdrc); not relaunched" || return 1; return 0
       fi
@@ -310,8 +613,11 @@ map_prepass_run() {  # original task only; durable dispatch state prevents dupli
       --arg kind "$mapper_kind" --argjson timeout "$timeout" --argjson maxbytes "$maxbytes" \
       '{task_id:$id,task_text:$text,original_task:$original,answers:$answers,root:$root,mapper:{kind:$kind,model:$model,effort:$effort,timeout_s:$timeout,max_output_bytes:$maxbytes},exclusions:[]}' >"$dir/input.json"
     digest=$(shasum -a 256 <"$dir/input.json" | cut -d' ' -f1)
+    TM_MAP_OP=""; TM_MAP_CS=""; TM_MAP_REC=0; tm mapper_start --task --mapper && TM_MAP_OP=$TM_LAST   # the operation's own identity
+    TM_MAP_STAGE=prepare
     sts --arg t "$tid" --arg d "$digest" --arg dir "$dir" --arg now "$(date +%s)" \
-      '.map_prepasses[$t]={status:"preparing",input_fingerprint:$d,artifact_dir:$dir,started_at:($now|tonumber),usage:null,coverage:"unknown"}' || { log "could not persist mapper preparation checkpoint"; return 1; }
+      '.map_prepasses[$t]={status:"preparing",input_fingerprint:$d,artifact_dir:$dir,started_at:($now|tonumber),usage:null,coverage:"unknown"}' || {
+        tm_map_done "" aborted; log "could not persist mapper preparation checkpoint"; return 1; }
     # Project boundary before mapper access. OpenCode checks paths lexically (it never resolves a
     # symlink), so the orchestrator scans the whole project for in-project symlinks that resolve
     # outside it (and for directory aliases leading to one) and denies them by name. grep/glob are
@@ -328,7 +634,8 @@ map_prepass_run() {  # original task only; durable dispatch state prevents dupli
     [ "$escaping" -gt 0 ] && boundary_reason="grep/glob denied for this mapper session: $escaping in-project symlink(s) resolve outside the project or lead to one: $(jq -r '[.links[].path]|join(", ")' <<<"$scan")"
     [ "$escaping" -gt 0 ] && [ "$(jq -r .case_insensitive <<<"$scan")" = true ] && boundary_reason="$boundary_reason; the filesystem ignores letter case, so their read denies are case-folded and may also block same-shaped in-project names"
     sts --arg t "$tid" --argjson scan "$scan" --arg r "$boundary_reason" \
-      '.map_prepasses[$t].boundary={blocked_symlinks:$scan.links,case_insensitive:$scan.case_insensitive,search_denied:($scan.links|length>0),reason:(if $r=="" then null else $r end)}' || { log "could not persist mapper boundary baseline"; return 1; }
+      '.map_prepasses[$t].boundary={blocked_symlinks:$scan.links,case_insensitive:$scan.case_insensitive,search_denied:($scan.links|length>0),reason:(if $r=="" then null else $r end)}' || {
+        tm_map_done "" aborted; log "could not persist mapper boundary baseline"; return 1; }
     local boundary_line="Boundary: only paths inside the project root are accessible; in-project symlinks that resolve outside it are blocked."
     [ "$escaping" -gt 0 ] && boundary_line="$boundary_line grep and glob are unavailable in this session because such symlinks exist; use read to list directories and read files."
     cat >"$dir/instruction.md" <<EOF
@@ -363,38 +670,52 @@ EOF
     else
       mapper_rules+=(--allow grep --allow glob)
     fi
+    TM_MAP_STAGE=session
     sid=$("$OC" new --dir "$DIR" --model "$model" --variant "$effort" --agent plan --title "Council map pre-pass" "${mapper_rules[@]}") || {
         map_finalize_failure "$tid" "$dir" "mapper session creation failed" || return 1; return 0; }
     if ! sts --arg t "$tid" --arg s "$sid" '.map_prepasses[$t].session=$s | .map_prepasses[$t].status="created"'; then
       "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      tm_map_done "" aborted
       log "could not persist mapper session identity; no prompt dispatched"
       return 1
     fi
+    TM_MAP_STAGE=dispatch
     if ! sts --arg t "$tid" '.map_prepasses[$t].status="dispatching"'; then
       "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      tm_map_done "" aborted
       log "could not persist mapper dispatch checkpoint; no prompt dispatched"
       return 1
     fi
+    tm call_start --task --mapper --launch-key step=map && TM_MAP_CS=$TM_LAST   # keyed by the persisted session
     if ! "$OC" prompt "$sid" --file "$dir/instruction.md" --no-wait --ask >/dev/null 2>"$dir/dispatch.err"; then
       "$OC" interrupt "$sid" >/dev/null 2>&1 || true
+      TM_MAP_OC=failed; TM_MAP_FC=launch_failed
       map_finalize_failure "$tid" "$dir" "mapper prompt dispatch failed" || return 1; return 0
     fi
     sts --arg t "$tid" '.map_prepasses[$t].status="dispatched"' || { log "mapper prompt may be dispatched; durable state remains dispatching for recovery"; return 1; }
   fi
   sid=$(jq -r --arg t "$tid" '.map_prepasses[$t].session' "$ST")
   if [ "$recovered" -eq 0 ]; then
+    TM_MAP_STAGE=wait
     "$OC" wait "$sid" --timeout "$timeout" --ask >/dev/null 2>"$dir/wait.err"; cmdrc=$?
+    TM_MAP_XC="wait_exit_code=$cmdrc"
     if [ "$cmdrc" -ne 0 ]; then
+      TM_MAP_OC=failed; TM_MAP_FC=cli_error; TM_MAP_EVID=$(cat "$dir/wait.err" 2>/dev/null)   # the adapter's own diagnostics
+      [ "$cmdrc" -eq 2 ] && { TM_MAP_FC=timeout; tm timeout --task --mapper call_seq="$TM_MAP_CS" timeout_s="$timeout"; }
       [ "$cmdrc" -eq 2 ] && "$OC" interrupt "$sid" >/dev/null 2>&1 || true
       map_finalize_failure "$tid" "$dir" "timeout or blocked mapper permission (wait exit $cmdrc); no retry" || return 1; return 0
     fi
     result_tmp="$dir/response.txt.result-$$.tmp"
-    if ! "$OC" result "$sid" >"$result_tmp" 2>"$dir/result.err"; then
+    if ! tm_result "$dir/result-evidence" "$sid" >"$result_tmp" 2>"$dir/result.err"; then
       [ -s "$result_tmp" ] && mv "$result_tmp" "$dir/response-retrieval-partial.txt"
+      TM_MAP_OC=failed; TM_MAP_FC=cli_error; TM_MAP_XC="$TM_MAP_XC result_exit_code=1"; TM_MAP_EVID=$(cat "$dir/result.err" 2>/dev/null)
+      TM_MAP_RF=1; TM_MAP_REV=$TM_RESULT_EV   # map_finalize_failure adds the structured and adapter evidence
       map_finalize_failure "$tid" "$dir" "mapper result retrieval failed" || return 1; return 0
     fi
+    TM_MAP_OC=ok; TM_MAP_XC="$TM_MAP_XC result_exit_code=0"
     mv "$result_tmp" "$dir/response.txt" || { log "could not publish mapper response"; return 1; }
   fi
+  TM_MAP_STAGE=validate
   "$OC" api GET "/api/session/$sid" >"$dir/session.json" 2>"$dir/session.err" || true
   "$OC" messages "$sid" --raw >"$dir/tool-records.json" 2>"$dir/tools.err" || true
   local usage; usage=$(jq -c '.data | {input:(.tokens.input // null),cache_read:(.tokens.cache.read // null),cache_write:(.tokens.cache.write // null),output:(.tokens.output // null),reasoning:(.tokens.reasoning // null),cost:(.cost // null)}' "$dir/session.json" 2>/dev/null)
@@ -419,6 +740,7 @@ EOF
   fi
   parsed=$(jq -c '.result' "$dir/validation.json" 2>/dev/null); errors=$(jq -c '.errors // []' "$dir/validation.json" 2>/dev/null); [ -n "$parsed" ] || { parsed='{"status":"unavailable","coverage":"unknown","candidates":[]}'; errors='["validation failed"]'; }
   jq -n --argjson r "$parsed" '$r.candidates' >"$dir/captures.json"
+  TM_MAP_STAGE=capture
   if [ "$(jq -r '.candidates|length' <<<"$parsed")" -gt 0 ]; then
     if ! python3 "$CM" ingest --run-dir "$RUN" --dir "$DIR" --capture-json "$dir/captures.json" --capture-lines >"$dir/capture-results.json" 2>"$dir/capture.err"; then
       map_finalize_failure "$tid" "$dir" "codemap ingestion failed" || return 1; return 0
@@ -451,8 +773,10 @@ EOF
   elif jq -e 'any(.results[]?; .status!="ok")' "$dir/capture-results.json" >/dev/null 2>&1 && [ "$status" = ok ]; then status=partial; fi
   [ "$status" = ok ] && status=complete
   [ "$status" = "partial" ] && parsed=$(jq -c '.status="partial"' <<<"$parsed")
+  TM_MAP_STAGE=done
   sts --arg t "$tid" --arg s "$status" --arg dir "$dir" --argjson result "$parsed" --argjson u "$usage" \
     '.map_prepasses[$t].status=$s | .map_prepasses[$t].artifacts={directory:$dir,coverage:($dir+"/coverage.json"),response:($dir+"/response.txt"),selectors:($dir+"/candidates.json"),session:($dir+"/session.json"),tools:($dir+"/tool-records.json")} | .map_prepasses[$t].mapper_result=$result | .map_prepasses[$t].usage=$u | .map_prepasses[$t].finished_at=(now|floor)'
+  tm_map_done "$dir" "$status"   # keeps the publication's status
 }
 map_prepass_review() {  # pause once per original task until explicit user decision
   local task=$1 tid key dir reviewed locator seed_id; tid=$(jq -r .id <<<"$task"); key=$(map_key "$tid"); dir="$RUN/map/$key"
@@ -545,6 +869,7 @@ checkpoint_split_invalid() {
   local child=$1 error=$2
   sts --arg t "$child" --arg e "$error" \
     '.status="questions" | .phase="split_invalid" | .pending_questions=[{id:("split-invalid/"+$t),task:$t,member:"orchestrator",question:("Approved split contract/baseline is invalid: "+$e+". Resolve it with the user before continuing.")}]'
+  tm split_failed --task
   jq '.pending_questions' "$ST" >"$RUN/questions.json"
   render_transcript
 }
@@ -708,6 +1033,7 @@ apply_map_decision() {
   if jq -e --arg p "$parent" '.map_prepasses[$p].review_started_at != null' "$ST" >/dev/null 2>&1; then
     sts --arg p "$parent" '.map_prepasses[$p].review_finished_at=(now|floor) | .map_prepasses[$p].review_seconds=(.map_prepasses[$p].review_finished_at-.map_prepasses[$p].review_started_at)' || { log "could not persist map review completion"; exit 4; }
   fi
+  tm mapper_review --task action="$action" review_s="$(jq -r --arg p "$parent" '.map_prepasses[$p].review_seconds // "null"' "$ST")"
   rm -f "$RUN/questions.json"
   render_transcript
 }
@@ -809,6 +1135,7 @@ codemap_finish_step() {  # tid tag -> 0 normal, 1 stale (caller must fail the st
       return 0 ;;
     changed)
       log "codemap: a source exposed as current in $tid/$tag's frozen view changed during the round — checkpointing and replaying this round (its posts are not reused)"
+      tm stale_replay --task step="$TM_STEP" round="$TM_ROUND" where=in_run
       codemap_archive_posts "$tid" "$tag"
       rm -f "$RUN"/posts/"$tid-$tag-"*
       sts '.codemap_pending=null'
@@ -831,6 +1158,7 @@ codemap_resume_check() {  # called before an ordinary resume reuses posts of the
   fi
   if [ "$status" = changed ]; then
     log "codemap: a guarded source changed while checkpointed — purging $tid/$tag's posts so they are not reused on resume"
+    tm stale_replay --task step="$(tm_phase_step)" round="$(st .round)" where=resume
     codemap_archive_posts "$tid" "$tag"
     rm -f "$RUN"/posts/"$tid-$tag-"*
     sts '.codemap_pending=null'
@@ -1023,11 +1351,14 @@ group_left() {  # pgid -> space-separated pids of the group's live (non-zombie) 
 }
 kill_group() {  # pgid -> 0 once no live member is left; 1 (pids logged) if any survived SIGKILL for 10 s
   local pg=$1 n left
+  TM_KG=refused   # telemetry: refused / stopped / survived / unknown (ps failed), never a pid
   if ! [[ "$pg" =~ ^[0-9]+$ ]] || [ "$pg" -le 1 ] || [ "$pg" = "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then log "refusing to signal process group '$pg'"; return 1; fi
+  TM_KG=stopped
   kill -TERM -- "-$pg" 2>/dev/null
   for n in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(group_left "$pg")" ] && return 0; sleep 1; done
   kill -KILL -- "-$pg" 2>/dev/null
   for n in 1 2 3 4 5 6 7 8 9 10; do left=$(group_left "$pg"); [ -z "$left" ] && return 0; sleep 1; done
+  case "$left" in *'?'*) TM_KG=unknown ;; *) TM_KG=survived ;; esac
   log "process group $pg still has live processes after SIGKILL: $left(? = ps failed, so this could not be verified)"; return 1
 }
 inflight_group() {  # idx -> prints the pgid of the member's in-flight attempt if live processes may still belong to it
@@ -1038,18 +1369,20 @@ inflight_group() {  # idx -> prints the pgid of the member's in-flight attempt i
   [ -n "$(group_left "$pg")" ] || return 1
   printf '%s' "$pg"
 }
-stop_inflight() {  # stop every claude attempt still in flight; returns 1 if a group survived SIGKILL (its record is kept)
-  local i pg left=0
+stop_inflight() {  # [reason] -> stop every claude attempt still in flight; returns 1 if a group survived SIGKILL (its record is kept)
+  local i pg left=0 why=${1:-cleanup} ev
   if [ "$CL_LAUNCHING" = pending ]; then   # interrupted around the fork: a new $! is the attempt, an unchanged one means not forked yet
     if [ -n "$!" ] && [ "$!" != "$CL_PREV" ]; then CL_LAUNCHING=$!; else CL_LAUNCHING=; fi
   fi
   if [ -n "$CL_LAUNCHING" ]; then   # launched but not yet recorded; before its setsid it is still in our group, so signal it directly too
     kill -TERM "$CL_LAUNCHING" 2>/dev/null
-    kill_group "$CL_LAUNCHING" || { left=1; log "the call being launched (pid $CL_LAUNCHING) still runs: pids above"; }; CL_LAUNCHING=
+    if kill_group "$CL_LAUNCHING"; then tm_killed "$TM_LI" "$why"; else tm_killed "$TM_LI" "$why"; left=1; log "the call being launched (pid $CL_LAUNCHING) still runs: pids above"; fi; CL_LAUNCHING=
   fi
   [ -n "$ST" ] && [ -f "$ST" ] || return $left
   for i in $(jq -r '.members | to_entries[] | select(.value.inflight.pgid != null) | .key' "$ST" 2>/dev/null); do
-    if pg=$(inflight_group $i); then log "member $(mid $i): stopping its in-flight call (process group $pg)"; kill_group "$pg" || { left=1; continue; }; fi
+    # a leftover found on resume is linked by evidence only: the launch key of its recorded process group and start time
+    ev=(); [ "$why" = stale ] && ev=(stale)
+    if pg=$(inflight_group $i); then log "member $(mid $i): stopping its in-flight call (process group $pg)"; if kill_group "$pg"; then tm_killed "$i" "$why" ${ev[@]+"${ev[@]}"}; else tm_killed "$i" "$why" ${ev[@]+"${ev[@]}"}; left=1; continue; fi; fi
     sts --argjson i $i '.members[$i].inflight=null'
   done
   return $left
@@ -1062,9 +1395,9 @@ trap_failed() {  # signal cleanup left a group alive: the existing failed checkp
 trap_calls() {  # attempts no longer share the orchestrator's group: a TERM/INT/HUP stops them before the orchestrator exits
   # Only start and resume install it: status/report load the same state and must never stop a live run's calls. A signal
   # ignored when council.sh started stays ignored (bash cannot trap it), and it cannot end the orchestrator either.
-  trap 'trap "" TERM INT HUP; stop_inflight && exit 143; trap_failed' TERM
-  trap 'trap "" TERM INT HUP; stop_inflight && exit 130; trap_failed' INT
-  trap 'trap "" TERM INT HUP; stop_inflight && exit 129; trap_failed' HUP
+  trap 'trap "" TERM INT HUP; stop_inflight signal && exit 143; trap_failed' TERM
+  trap 'trap "" TERM INT HUP; stop_inflight signal && exit 130; trap_failed' INT
+  trap 'trap "" TERM INT HUP; stop_inflight signal && exit 129; trap_failed' HUP
 }
 reap_stale_calls() {  # resume: before anything is relaunched, stop calls a previous orchestrator left in flight
   local i
@@ -1072,20 +1405,22 @@ reap_stale_calls() {  # resume: before anything is relaunched, stop calls a prev
     log "member $(mid $i): its in-flight call was recorded by council 0.11.0 or older (pid $(st ".members[$i].inflight.pid") only) and cannot be verified — look for a leftover claude -p whose parent is pid 1: ps -A -o pid,ppid,command | grep -- '-p --output-format json'"
     sts --argjson i $i '.members[$i].inflight=null'
   done
-  stop_inflight || { log "resume refused: a call left in flight still runs (pids above); resume again once it is gone"; exit 2; }
+  stop_inflight stale || { log "resume refused: a call left in flight still runs (pids above); resume again once it is gone"; exit 2; }
 }
 
 launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inflight
   local i=$1 pf=$2 tag=$3 kind sid
+  TM_CS[$i]=""
   validate_child_launch || { [ "$(st .phase)" = split_invalid ] && exit 4; return 1; }
   kind=$(mget $i kind); sid=$(mget $i session)
+  tm_call_start $i; TM_LI=$i
   if [ "$kind" = opencode ]; then
-    if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(oc_new_session $i) || return 1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s'; fi
+    if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(oc_new_session $i) || return 1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s'; TM_NEW[$i]=1; fi
     "$OC" prompt "$sid" --file "$pf" --no-wait >/dev/null || return 1
     sts --argjson i $i --arg t "$tag" '.members[$i].inflight={tag:$t}'
   else
     local args=(-p --output-format json --model "$(mget $i model)" --effort "$(mget $i effort)" --permission-mode "$(mget $i permission_mode)" --max-turns "$MAXT")
-    if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(cl_new_session); args+=(--session-id "$sid"); sts --argjson i $i --arg s "$sid" '.members[$i].session=$s|.members[$i].cl_started=false'
+    if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(cl_new_session); args+=(--session-id "$sid"); TM_NEW[$i]=1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s|.members[$i].cl_started=false'
     else args+=(--resume "$sid"); fi
     if [ "$(mget $i mode)" = read ]; then args+=(--disallowedTools "Edit Write MultiEdit NotebookEdit")
     else args+=(--allowedTools "Bash Edit Write MultiEdit NotebookEdit"); fi   # headless: nobody can answer a permission prompt
@@ -1098,18 +1433,21 @@ launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inf
     sts --argjson i $i --arg t "$tag" --argjson p $CL_LAUNCHING --arg s "$(LC_ALL=C ps -o lstart= -p $CL_LAUNCHING 2>/dev/null)" --arg o "$out" \
       '.members[$i].inflight={tag:$t,pid:$p,pgid:$p,started:$s,raw:$o}'
     CL_LAUNCHING=
+    # the launch key binds the recorded launch to this process (its group and start time), for a later stale cleanup
+    if [ -n "${TM_CS[$i]:-}" ]; then tm launched --member $i --launch-key call_seq="${TM_CS[$i]}"; fi; :
   fi
 }
 
 collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 failed
   local i=$1 kind sid tag id out rc=0
-  CALL_LEFT_RUNNING=0
+  CALL_LEFT_RUNNING=0; TM_FC=""; TM_OC=""; TM_EVID=""; TM_EMPTY=0; TM_CEND=""; TM_REV=""
   kind=$(mget $i kind); sid=$(mget $i session); id=$(mid $i); tag=$(st ".members[$i].inflight.tag")
   out="$RUN/raw/$tag-$id.md"
   if [ "$kind" = opencode ]; then
     "$OC" wait "$sid" --timeout "$TIMEOUT" >/dev/null 2>"$RUN/raw/$tag-$id.err"; rc=$?
-    if [ $rc -eq 2 ]; then "$OC" interrupt "$sid" >/dev/null 2>&1; log "member $id: timeout after ${TIMEOUT}s (interrupted)"; fi
-    "$OC" result "$sid" >"$out" 2>&1; local result_rc=$?
+    local wait_rc=$rc
+    if [ $rc -eq 2 ]; then tm timeout --member $i call_seq="${TM_CS[$i]:-}" timeout_s="$TIMEOUT"; "$OC" interrupt "$sid" >/dev/null 2>&1; log "member $id: timeout after ${TIMEOUT}s (interrupted)"; fi
+    tm_result "$RUN/raw/$tag-$id.oc-evidence" "$sid" >"$out" 2>&1; local result_rc=$?; TM_REV=$TM_RESULT_EV
     if [ $result_rc -ne 0 ]; then
       local why; why=$(grep -m1 -E '^\[(error|outcome)\]' "$out" | cut -c1-300)
       log "member $id: result failed (exit $result_rc)${why:+ — $why}"
@@ -1118,29 +1456,36 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
     # tokens: last assistant message of this turn = context in use; session totals = consumed
     local msg; msg=$("$OC" api GET "/api/session/$sid/message?order=desc&limit=40" 2>/dev/null)
     local ctx; ctx=$(jq '[.data[] | select(.type=="assistant")][0].tokens | (.input + .output + (.reasoning//0) + .cache.read + .cache.write)' <<<"$msg" 2>/dev/null)
-    local tot; tot=$("$OC" api GET "/api/session/$sid" 2>/dev/null | jq -c '.data | {t:(.tokens | .input + .output + (.reasoning//0) + .cache.read + .cache.write), c:(.cost//0)}')
+    local sraw; sraw=$("$OC" api GET "/api/session/$sid" 2>/dev/null)
+    local tot; tot=$(jq -c '.data | {t:(.tokens | .input + .output + (.reasoning//0) + .cache.read + .cache.write), c:(.cost//0)}' <<<"$sraw")
     [ -n "$tot" ] || tot='{"t":0,"c":0}'
+    tm_live && tm_oc_sample $i "$wait_rc" "$result_rc" "$msg" "$sraw" "$out" "$RUN/raw/$tag-$id.err"   # provider values, before the //0 defaults land in state
     [ -n "$ctx" ] && [ "$ctx" != null ] && sts --argjson i $i --argjson c "$ctx" --argjson t "$tot" \
       '.members[$i] |= (.ctx_used=$c | .session_tokens=$t.t | .session_cost=$t.c | .calls+=1 | .session_calls+=1)'
+    tm_live && tm_trust $i "$( [ -n "$ctx" ] && [ "$ctx" != null ] && [ "$TM_SESS_OK" = 1 ] && echo 1 || echo 0)"
   else
     local pid pg j; pid=$(st ".members[$i].inflight.pid"); pg=$(st ".members[$i].inflight.pgid"); j=$(st ".members[$i].inflight.raw")
     local deadline=$(( $(date +%s) + TIMEOUT ))
     while kill -0 "$pid" 2>/dev/null; do
       if [ "$(date +%s)" -ge "$deadline" ]; then
-        if kill_group "$pg"; then log "member $id: timeout after ${TIMEOUT}s (killed)"
-        else CALL_LEFT_RUNNING=1; log "member $id: timeout after ${TIMEOUT}s; its process group survived SIGKILL — not retried; resume once those processes are gone"; fi
+        tm timeout --member $i call_seq="${TM_CS[$i]:-}" timeout_s="$TIMEOUT"
+        if kill_group "$pg"; then TM_FC=timeout; TM_OC=killed; tm kill_group --member $i call_seq="${TM_CS[$i]:-}" reason=timeout result="$TM_KG"; log "member $id: timeout after ${TIMEOUT}s (killed)"
+        else tm kill_group --member $i call_seq="${TM_CS[$i]:-}" reason=timeout result="$TM_KG"; CALL_LEFT_RUNNING=1; log "member $id: timeout after ${TIMEOUT}s; its process group survived SIGKILL — not retried; resume once those processes are gone"; fi
         rc=1; break; fi
       sleep 2
     done
     if [ $rc -eq 0 ] && [ -n "$(group_left "$pg")" ]; then   # the call exited but left processes in its group: stop them before its reply is used
       log "member $id: its call exited but left processes in process group $pg: $(group_left "$pg")— stopping them"
-      kill_group "$pg" || { CALL_LEFT_RUNNING=1; rc=1; log "member $id: processes its call left survived SIGKILL — not retried; resume once those processes are gone"; }
+      if kill_group "$pg"; then tm kill_group --member $i call_seq="${TM_CS[$i]:-}" reason=leftover result="$TM_KG"
+      else tm kill_group --member $i call_seq="${TM_CS[$i]:-}" reason=leftover result="$TM_KG"; CALL_LEFT_RUNNING=1; rc=1; log "member $id: processes its call left survived SIGKILL — not retried; resume once those processes are gone"; fi
     fi
     local prc=1; [ "$CALL_LEFT_RUNNING" = 1 ] || { wait "$pid" 2>/dev/null; prc=$?; }   # never block on a child that survived SIGKILL
     if ! jq -e '.type=="result"' "$j" >/dev/null 2>&1; then log "member $id: claude exit $prc: $(head -c 300 "$j.err" "$j" 2>/dev/null | tr '\n' ' ')"; rc=1
     elif jq -e '.is_error==true' "$j" >/dev/null; then log "member $id: claude error: $(jq -r '.result' "$j" | head -c 300)"; rc=1; fi
     jq -r '.result // ""' "$j" >"${j%.json}.md" 2>/dev/null; cp "${j%.json}.md" "$out"   # the attempt's own text; the canonical name holds the latest attempt
     sts --argjson i $i '.members[$i].cl_started=true'
+    tm_live && tm_cl_sample $i "$j" "$rc"   # per-call usage and cost delta, before state is updated
+    TM_XC="exit_code="; [ "$CALL_LEFT_RUNNING" = 1 ] || TM_XC="exit_code=$prc"   # the process exit the run observed; unknown for a survivor
     local u; u=$(jq -c '{ctx:((.usage.iterations // [.usage] | last) | (.input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens + .output_tokens)),
                         tot:(.usage | .input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens + .output_tokens),
                         cum:([(.modelUsage // {})[] | .inputTokens + .cacheReadInputTokens + .cacheCreationInputTokens + .outputTokens] | add // 0),
@@ -1150,6 +1495,7 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
       '.members[$i] |= (.ctx_used=$u.ctx | .calls+=1 | .session_calls+=1 | (if $u.lim then .ctx_limit=$u.lim else . end)
         | (if $cum then .session_tokens=$u.cum | .session_cost=$u.cost          # >= 2.1.277: result already carries the whole session
            else .session_tokens+=$u.tot | .session_cost+=$u.cost end))'
+    tm_live && tm_trust $i "$( [ -n "$u" ] && jq -e '(.total_cost_usd|type)=="number"' "$j" >/dev/null 2>&1 && echo 1 || echo 0)"
   fi
   [ "$CALL_LEFT_RUNNING" = 1 ] || sts --argjson i $i '.members[$i].inflight=null'   # a surviving group stays recorded for resume
   return $rc
@@ -1486,26 +1832,35 @@ needs_handover() { st ".members[$1] | (.handover_at // $HANDOVER) as \$h
 # never delivered: the calls still in flight are stopped and the run stops with the failed checkpoint (exit 2),
 # before the old session is retired, so resume redoes the handover.
 handover_gate() {  # note
-  [ "${COUNCIL_HANDOVER_GATE:-0}" = 1 ] || return 0
+  if [ "${COUNCIL_HANDOVER_GATE:-0}" != 1 ]; then tm gate member_index="$TM_HO_MEMBER" handover_seq="$TM_HO" result=disabled wait_s=0; return 0; fi
   local note=$1 pend="$1.pending" limit=${COUNCIL_HANDOVER_GATE_TIMEOUT:-3600} t0
   printf '%s\n' "$note" >"$pend" || { log "handover gate: cannot write $pend — stopping with the failed checkpoint"; stop_inflight; sts '.status="failed"'; exit 2; }
   log "handover gate: review $note; remove $pend to release (timeout ${limit}s)"
-  t0=$(date +%s)
+  t0=$(date +%s); TM_GATE_T0=$t0
   while [ -e "$pend" ]; do
     if [ $(( $(date +%s) - t0 )) -ge "$limit" ]; then
+      TM_GATE_T0=""; tm gate member_index="$TM_HO_MEMBER" handover_seq="$TM_HO" result=timeout wait_s=$(( $(date +%s) - t0 ))
       log "handover gate: $pend not released within ${limit}s — the note is not delivered; stopping with the failed checkpoint (resume redoes the handover)"
-      stop_inflight; sts '.status="failed"'; exit 2
+      stop_inflight gate; sts '.status="failed"'; exit 2
     fi
     sleep 2
   done
+  TM_GATE_T0=""; tm gate member_index="$TM_HO_MEMBER" handover_seq="$TM_HO" result=released wait_s=$(( $(date +%s) - t0 ))
   log "handover gate: released $note"
 }
 do_handover() {  # idx -> old session writes a note; new session created; note stored for the next prompt
   local i=$1 id; id=$(mid $i)
   log "member $id: context $(st ".members[$i].ctx_used // 0") tokens ($(ctx_pct $i)%) reached its $(st ".members[$i] | (.handover_at // $HANDOVER) as \$h | if \$h > 1 then (\$h|tostring)+\" tokens\" else ((\$h*100|floor)|tostring)+\"%\" end") handover threshold — new session"
+  local tm_step=$TM_STEP ogen; ogen=$(mget $i gen)
+  tm handover --member $i --task step="$tm_step" round="$TM_ROUND" type=threshold stage=start ctx_used="$(st ".members[$i].ctx_used // \"null\"")" ctx_limit="$(st ".members[$i].ctx_limit // \"null\"")"
+  TM_HO=$TM_LAST; TM_HO_MEMBER=$i; TM_LASTOUT=""
   local pf="$RUN/prompts/handover-$id-g$(mget $i gen).md"; prompt_handover $i >"$pf"
   append_historical_map_locator "$pf" "$(st .task_id)"
-  CALL_LEFT_RUNNING=0; launch $i "$pf" "handover-g$(mget $i gen)" && collect $i
+  CALL_LEFT_RUNNING=0; TM_STEP=handover
+  if launch $i "$pf" "handover-g$(mget $i gen)"; then
+    collect $i; tm_end $i "$( [ $? -eq 0 ] && [ "$TM_EMPTY" != 1 ] && echo ok || echo fail)"
+  else tm_launch_failed $i; fi
+  TM_STEP=$tm_step
   [ "$CALL_LEFT_RUNNING" = 1 ] && return 1   # never open a new session beside a handover call that survived SIGKILL
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
   handover_gate "$note"
@@ -1513,6 +1868,8 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
   sts --argjson i $i --arg note "$note" --arg old "$old" \
     '.members[$i] |= (.retired += [{session:.session, gen:.gen, tokens:.session_tokens, cost:.session_cost}] | .gen+=1 | .session=null | .fresh=true | .handover_note=$note | .ctx_used=0 | .session_tokens=0 | .session_cost=0 | .session_calls=0)
      | .log += ["\($now) member \(.members[$i].id) g\(.members[$i].gen): handover from \($old)"]' --arg now "$(now)"
+  tm handover --member $i --task step="$tm_step" round="$TM_ROUND" type=threshold stage=end handover_seq="$TM_HO" gen=$ogen new_gen="$(mget $i gen)" note_outcome="$TM_LASTOUT"
+  TM_HO=""; TM_HO_MEMBER=""
   render_transcript
 }
 
@@ -1525,15 +1882,19 @@ run_step() {
   local idxs; if [ -n "$only" ]; then idxs=$only; else idxs=$(seq 0 $((N-1))); fi
   local -a launch_gen=()   # generation recorded at launch time, for attribution (see codemap_stage_accepted)
   local -a launch_id=()    # the orchestration-owned identity of the launch that produced the reply
+  local tstep; case "$gen" in prompt_exec|prompt_fix) tstep=exec ;; prompt_ratify) tstep=ratify ;; *) tstep=plan ;; esac
+  local vp=0 va=0 vd=0 vq=0 vdn=0 vf=0 vc=0   # telemetry: accepted tails by vote, failed members, no-assumptions conversions
+  TM_STEP=$tstep; TM_ROUND=$r
   CODEMAP_STEP=0
   if [ "$CODEMAP" = 1 ] && codemap_is_deliberation "$gen"; then
     codemap_prepare "$tid" "$tag" "$( [ "$gen" = prompt_round1 ] && echo 1 || echo 0 )"
   fi
   for i in $idxs; do
-    if needs_handover $i; then do_handover $i; [ "$CALL_LEFT_RUNNING" = 1 ] && { stop_inflight; return 1; }; fi
+    if needs_handover $i; then do_handover $i; [ "$CALL_LEFT_RUNNING" = 1 ] && { stop_inflight handover; return 1; }; fi
     pf="$RUN/prompts/$tid-$tag-$(mid $i).md"
     if [ "$(st '.reuse_posts // false')" = true ] && post_valid "$RUN/posts/$tid-$tag-$(mid $i).json" && [ -s "$RUN/posts/$tid-$tag-$(mid $i).md" ]; then
-      log "member $(mid $i): reusing its $tag post from the checkpoint (not re-run)"; sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'; continue
+      log "member $(mid $i): reusing its $tag post from the checkpoint (not re-run)"; sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'
+      tm reused --member $i --task step=$tstep round=$r; continue
     fi
     launch_gen[$i]=$(mget $i gen)
     codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID
@@ -1555,22 +1916,28 @@ run_step() {
     codemap_append_locator "$pf" "$tid" "$tag" prompt
     case "$gen" in prompt_round1|prompt_roundN) ;; *) append_historical_map_locator "$pf" "$tid" ;; esac
     $gen $i "$t" "$r" >>"$pf"
-    launch $i "$pf" "$tid-$tag" || { log "member $(mid $i): launch failed"; stop_inflight; return 1; }   # members launched before it are not left running unwatched
+    launch $i "$pf" "$tid-$tag" || { tm_launch_failed $i; log "member $(mid $i): launch failed"; stop_inflight launch_failed; return 1; }   # members launched before it are not left running unwatched
     codemap_record_launched "$pf" "$tid" "$tag"
   done
   local fail=0
   for i in $idxs; do
     local id; id=$(mid $i); local ok=0 attempt
-    if [ "$(st ".members[$i].inflight.tag")" = reuse ]; then sts --argjson i $i '.members[$i].inflight=null'; continue; fi
+    if [ "$(st ".members[$i].inflight.tag")" = reuse ]; then
+      sts --argjson i $i '.members[$i].inflight=null'
+      tm_live && case "$(jq -r .vote "$RUN/posts/$tid-$tag-$id.json" 2>/dev/null)" in propose) vp=$((vp+1)) ;; agree) va=$((va+1)) ;; disagree) vd=$((vd+1)) ;; question) vq=$((vq+1)) ;; done) vdn=$((vdn+1)) ;; esac
+      continue
+    fi
     for attempt in 1 2; do
-      if collect $i && tail_json "$RUN/raw/$tid-$tag-$id.md" >"$RUN/posts/$tid-$tag-$id.json" && jq -e '(.vote|IN("propose","agree","disagree","question","done")) and
+      local crc; collect $i; crc=$?
+      if [ $crc -eq 0 ] && tail_json "$RUN/raw/$tid-$tag-$id.md" >"$RUN/posts/$tid-$tag-$id.json" && jq -e '(.vote|IN("propose","agree","disagree","question","done")) and
                  (if .vote=="propose" or .vote=="disagree" then ((.proposal|type)=="string" and (.proposal|length)>0)
                   elif .vote=="done" then ((.report|type)=="string" and (.report|length)>0)
-                  elif .vote=="question" then ((.questions|type)=="array" and (.questions|length)>0) else true end)' "$RUN/posts/$tid-$tag-$id.json" >/dev/null; then ok=1; break; fi
+                  elif .vote=="question" then ((.questions|type)=="array" and (.questions|length)>0) else true end)' "$RUN/posts/$tid-$tag-$id.json" >/dev/null; then ok=1; tm_end $i ok; break; fi
+      tm_end $i fail
       # A re-dispatched retry is a genuinely new launch: it gets its own immutable record, so the
       # reply it produces is bound to it and not to the launch whose reply was unusable.
       [ $attempt -eq 1 ] && [ "$CALL_LEFT_RUNNING" = 1 ] && break   # never retry beside a group that is still running
-      [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch_gen[$i]=$(mget $i gen); codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || break; }
+      [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; TM_STDIN=$TM_EVID; tm retry --member $i --task call_seq="$TM_LASTSEQ" step=$tstep round=$r failure_class="$TM_LASTCLS" $TM_LASTEV; TM_STDIN=""; prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch_gen[$i]=$(mget $i gen); codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID; TM_STEP=$tstep; TM_ROUND=$r; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || { tm_launch_failed $i; break; }; }
     done
     sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null'
     if [ $ok -eq 1 ]; then
@@ -1578,11 +1945,12 @@ run_step() {
       # no-assumptions guard: an open item not settled by the task or the working directory is a question, whatever the vote says
       if jq -e '(.vote=="propose" or .vote=="disagree") and any((.open // [])[]; (.settled_by|ascii_downcase|IN("task","dir","user"))|not)' "$RUN/posts/$tid-$tag-$id.json" >/dev/null 2>&1; then
         jq -c '.questions = ((.questions // []) + [ .open[] | select((.settled_by|ascii_downcase|IN("task","dir","user"))|not) | (.where // .item) ]) | .vote="question" | .proposal=null' "$RUN/posts/$tid-$tag-$id.json" >"$RUN/posts/$tid-$tag-$id.json.tmp" && mv "$RUN/posts/$tid-$tag-$id.json.tmp" "$RUN/posts/$tid-$tag-$id.json"
-        log "member $id: proposal had open items not settled by task/dir — converted to questions for the user"
+        log "member $id: proposal had open items not settled by task/dir — converted to questions for the user"; vc=$((vc+1))
       fi
       codemap_stage_accepted $i "$tid" "$tag" "$RUN/posts/$tid-$tag-$id.json" "${launch_gen[$i]}" "${launch_id[$i]}"
     else fail=1; log "member $id: failed twice in step $tag"; fi
     local vote=FAILED; [ $ok -eq 1 ] && vote=$(jq -r '.vote' "$RUN/posts/$tid-$tag-$id.json")
+    case "$vote" in propose) vp=$((vp+1)) ;; agree) va=$((va+1)) ;; disagree) vd=$((vd+1)) ;; question) vq=$((vq+1)) ;; done) vdn=$((vdn+1)) ;; FAILED) vf=$((vf+1)) ;; esac
     local cu cl stt; cu=$(st ".members[$i].ctx_used // 0"); cl=$(st ".members[$i].ctx_limit // \"?\""); stt=$(st ".members[$i].session_tokens // 0")
     log "$(now) $tid $tag member $id: $vote · ctx $(ctx_pct $i)% [$cu/$cl] · session tokens $stt"
   done
@@ -1592,6 +1960,7 @@ run_step() {
   # collect votes from the post tails
   local votes="[]"; for i in $idxs; do local id; id=$(mid $i); [ -f "$RUN/posts/$tid-$tag-$id.json" ] && votes=$(jq -c --arg m "$id" --slurpfile p "$RUN/posts/$tid-$tag-$id.json" '. + [ $p[0] + {member:$m} ]' <<<"$votes"); done
   sts --argjson v "$votes" '.last_votes=$v | .notices=[] | .reuse_posts=false'
+  tm votes --task step=$tstep round=$r vote_propose=$vp vote_agree=$va vote_disagree=$vd vote_question=$vq vote_done=$vdn failed_members=$vf converted=$vc
   render_transcript
   return $fail
 }
@@ -1615,9 +1984,13 @@ replace_member() {  # "ID=kind:model:effort" -> new session for that member, han
               ctx=$(jq '.limit.context' <<<"$mj"); extra=$(jq -cn --arg a "$( [ "$mode" = edit ] && echo build || echo plan )" '{agent:$a, permission_mode:null}') ;;
     *) die "--replace: kind must be opencode|claude" ;;
   esac
+  local ogen okind omodel oeffort; ogen=$(mget $i gen); okind=$(mget $i kind); omodel=$(mget $i model); oeffort=$(mget $i effort)
+  tm handover --member $i --task step=replace type=replace stage=start ctx_used="$(st ".members[$i].ctx_used // \"null\"")" ctx_limit="$(st ".members[$i].ctx_limit // \"null\"")"
+  TM_HO=$TM_LAST; TM_HO_MEMBER=$i
   local note="$RUN/raw/replace-$id-g$(mget $i gen).md"
   { echo "Your predecessor session as member $id ($(mget $i kind) $(mget $i model), effort $(mget $i effort)) could not continue (provider failure or replacement by the user) and could not write a handover note. Below are ALL the posts it made in this run, oldest first — they are your positions so far; continue from them."
     local f; for f in $(ls -tr "$RUN/posts" 2>/dev/null | grep -- "-$id\.md$"); do echo; echo "--- post ${f%.md} ---"; cat "$RUN/posts/$f"; done; } >"$note"
+  handover_gate "$note"   # the replacement note also waits for an outside review (COUNCIL_HANDOVER_GATE=1)
   local old; old=$(mget $i session)
   sts --argjson i $i --arg kind "$kind" --arg model "$model" --arg effort "$effort" --argjson ctx "$ctx" --argjson extra "$extra" --arg note "$note" --arg old "$old" --arg now "$(now)" '
     .members[$i] |= (.retired += [{session:.session, gen:.gen, tokens:.session_tokens, cost:.session_cost, model:(.kind+" "+.model), reason:"replaced"}]
@@ -1626,6 +1999,9 @@ replace_member() {  # "ID=kind:model:effort" -> new session for that member, han
     | .config.members[$i] |= (. + {kind:$kind, model:$model, effort:$effort} + $extra | del(.[] | nulls))
     | .notices += ["member \(.members[$i].id) is now \($kind) \($model) (effort \($effort)); its previous session could not continue. It has its earlier posts."]
     | .log += ["\($now) member \(.members[$i].id) g\(.members[$i].gen): replaced \($old) with \($kind) \($model) [\($effort)]"]'
+  tm replace --member $i old_kind="$okind" old_model="$omodel" old_effort="$oeffort"
+  tm handover --member $i --task step=replace type=replace stage=end handover_seq="$TM_HO" gen=$ogen new_gen="$(mget $i gen)"
+  TM_HO=""; TM_HO_MEMBER=""
   log "member $id: replaced with $kind $model [$effort] (previous session $old retired; note built from $(grep -c '^--- post' "$note") earlier posts)"
 }
 
@@ -1660,6 +2036,7 @@ deliberate() {  # task json -> sets .results[-1] {task, outcome, text, rounds}; 
       has_questions && pause_for_questions
       if all_agree; then
         sts --arg tid "$tid" --argjson r $r '.results += [{task:$tid, outcome:"consensus", text:.candidate.text, rounds:$r, candidate:.candidate.id}] | .round=1'
+        tm outcome --task milestone=consensus round=$r
         log "task $tid: CONSENSUS in round $r on candidate $(st .candidate.id)"; return 0
       fi
       local p=$(( (r-1) % N ))   # rotating proposer for the next candidate
@@ -1670,6 +2047,7 @@ deliberate() {  # task json -> sets .results[-1] {task, outcome, text, rounds}; 
   done
   # exhausted: record unresolved with the candidate of the LAST VOTE (not the next rotating proposal) and every dissent
   sts --arg tid "$tid" --argjson r "$MAXR" '(.voted_candidate // .candidate) as $c | .results += [{task:$tid, outcome:"unresolved", text:$c.text, candidate:$c.id, rounds:$r, dissent:[.last_votes[] | select(.vote!="agree") | {member, reason, proposal}]}] | .round=1 | .voted_candidate=null'
+  tm outcome --task milestone=unresolved round=$MAXR
   log "task $tid: UNRESOLVED after $MAXR rounds"; return 1
 }
 
@@ -1714,11 +2092,13 @@ execute_and_ratify() {  # task json; assumes .results[-1] is the consensus plan;
     has_questions && pause_for_questions
     if all_agree; then
       sts --arg tid "$tid" --argjson r $r '.results[-1] += {outcome:"ratified", implementation:.candidate.text, ratify_rounds:$r} | .round=1 | .phase="plan"'
+      tm outcome --task milestone=ratified round=$r
       log "task $tid: implementation RATIFIED in ratification round $r"; return 0
     fi
     sts '.fixes=[.last_votes[] | select(.vote=="disagree")] | .phase="exec"'; r=$((r+1))
   done
   sts --arg tid "$tid" '.results[-1] += {outcome:"unratified", implementation:.candidate.text, dissent:[.last_votes[] | select(.vote!="agree") | {member, reason, proposal}]} | .round=1 | .phase="plan"'
+  tm outcome --task milestone=unratified round=$MAXR
   log "task $tid: implementation NOT ratified after $MAXR rounds"; return 1
 }
 
@@ -1877,21 +2257,24 @@ case "$CMD" in
     [ -n "$CONFIG" ] && [ -n "$RUN" ] || die "start needs --config F --run-dir D"
     RUN=$(abs "$RUN"); [ -e "$RUN" ] && die "run dir exists: $RUN (use resume, or a new dir)"
     cfg=$(validate_config "$CONFIG") || exit 1
-    "$OC" ensure >/dev/null || exit 1
+    ens=$("$OC" ensure) || exit 1
+    tm_opted_out || OPENCODE_VERSION=$(jq -r '.version // empty' <<<"$ens" 2>/dev/null)
     lim=$(check_opencode_models "$cfg") || exit 1
     check_mapper_available "$cfg"
     # Ownership: the leaf is created here (mkdir without -p fails if it appeared meanwhile), so a
     # failed initial state write may remove it and the identical start can simply be rerun.
     mkdir -p "$(dirname "$RUN")" && mkdir "$RUN" 2>/dev/null || die "cannot create run dir (it must not exist): $RUN"
+    tm_arm_start   # telemetry from here, before any setup or probe: every later exit of this start is recorded and exported
     mkdir -p "$RUN/prompts" "$RUN/posts" "$RUN/raw"; cp "$CONFIG" "$RUN/config.json"
-    if ! jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" '
+    claude_probe; tm_begin_start   # run_start reuses the one version probe
+    if ! jq -n --argjson cfg "$cfg" --arg lim "$lim" --arg run "$RUN" --arg ts "$(date '+%Y-%m-%d %H:%M:%S')" --argjson cum "$(claude_cumulative)" --argjson tm "$(tm_state_json)" '
       ($lim | split("\n") | map(select(length>0) | split("\t") | {key:.[0], value:(.[1]|tonumber)}) | from_entries) as $L |
       ({config:$cfg, run_dir:$run, started:$ts, status:"created", cl_cumulative:$cum, task_idx:0, task_id:null, round:1, phase:"plan", candidate:null, last_votes:[],
         codemap_version:1, codemap_pending:null,
         answers:[], pending_questions:null, notices:[], reuse_posts:false, results:[], log:[],
         members:[ $cfg.members[] | . + {session:null, gen:1, fresh:true, handover_note:null, ctx_used:0, ctx_limit:($L[.id] // null), session_tokens:0, session_cost:0, calls:0, session_calls:0, retired:[], inflight:null} ]}
-        + (if $cfg.map_code then {map_prepass_version:1,map_prepasses:{}} else {} end))' >"$RUN/state.json.tmp" || ! mv "$RUN/state.json.tmp" "$RUN/state.json"; then
-      rm -rf -- "$RUN"; log "could not persist initial run state; no model call made"; exit 1
+        + (if $cfg.map_code then {map_prepass_version:1,map_prepasses:{}} else {} end) + (if $tm then {telemetry:$tm} else {} end))' >"$RUN/state.json.tmp" || ! mv "$RUN/state.json.tmp" "$RUN/state.json"; then
+      tm_finish 1; rm -rf -- "$RUN"; log "could not persist initial run state; no model call made"; exit 1
     fi
     load_state
     if [ "$(jq -r '.map_code' <<<"$cfg")" = true ]; then
@@ -1926,8 +2309,9 @@ case "$CMD" in
     exit $rc ;;
 
   resume)
-    [ -n "$RUN" ] || die "resume needs --run-dir D"; RUN=$(abs "$RUN"); load_state; trap_calls; reap_stale_calls
-    "$OC" ensure >/dev/null || exit 1
+    [ -n "$RUN" ] || die "resume needs --run-dir D"; RUN=$(abs "$RUN"); tm_arm_resume; load_state; trap_calls; reap_stale_calls
+    ens=$("$OC" ensure) || exit 1
+    tm_opted_out || OPENCODE_VERSION=$(jq -r '.version // empty' <<<"$ens" 2>/dev/null)
     ensure_mapper_authorized
     status=$(st .status)
     case "$status" in

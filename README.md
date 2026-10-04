@@ -173,14 +173,33 @@ How it works:
   the de-duplication replay, and the verbatim duplication still present); `council.sh report --run-dir D`
   prints it for any run at any time. It comes from `scripts/ptools/` — required, not optional — which runs
   offline with no model calls.
-- **Tests.** `bash scripts/test-completion.sh` — 1352 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (726 Python standard-library unittest cases for the analysis tools).
+- **Telemetry (content-free, local).** `start` and `resume` record calls, failures by class, timeouts,
+  retries, durations, tokens/cost, handovers, gates, questions, votes, outcomes and the mapper in
+  `D/telemetry.jsonl`, and export them on every exit to `~/.council-telemetry/<host-id>.jsonl` (a salted hash of
+  the Mac's platform UUID; never ids, task text, posts, notes, paths or names). `COUNCIL_TELEMETRY=0` turns it off;
+  `COUNCIL_TELEMETRY_DIR` moves the ledger; `scripts/ptools/telemetry_report.py` reports offline over one or many
+  Macs' ledgers. Details in SKILL.md, "Telemetry".
+- **Tests.** `bash scripts/test-completion.sh` — 1723 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (779 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
 ## Release notes
 
+- **0.12.0** — content-free telemetry. `start`/`resume` record run, call, failure-class, timeout, kill,
+  retry, handover, gate, question, vote, outcome and mapper events in `D/telemetry.jsonl` through a
+  new standard-library writer, `scripts/council_telemetry.py` (a per-event field registry: indices, enums, counts,
+  durations, versions, sanitized model/effort names; nothing else is accepted). Every exit — 0, 1 after the run
+  directory exists, 2, 4, 5 and signals — exports the unshipped events plus a cumulative `run_summary` in one
+  locked write to `~/.council-telemetry/<host-id>.jsonl`; only records the schema accepts for that run are
+  exported, and any symlink on a telemetry path is refused. A failure warns once and never changes an exit code.
+  Exactly `COUNCIL_TELEMETRY=0` opts out with no files at all. New offline report
+  `scripts/ptools/telemetry_report.py` (per host and all hosts; dedup by host/run/seq; unknowns never counted as
+  zero). The start reuses its one `claude --version` call and the `oc.sh ensure` reply for the versions. The test
+  harness now isolates `HOME`, `COUNCIL_TELEMETRY_DIR`, `COUNCIL_HANDOVER_GATE` and the `ioreg`/`claude --version`
+  probes. The handover gate now also holds a replacement note (`resume --replace`).
+  test-completion.sh: 1723 checks; test_ptools.py: 779 cases.
 - **0.11.4** — `resume --answer TEXT` no longer stores (and prints) one full copy of the answer per pending
   question. When two or more pending questions belong to one task, it stores one answer record: `id` is the first
   question ID, `ids` lists all of them, `member` lists the originating members in first-appearance order, and
@@ -358,7 +377,7 @@ python3 scripts/ptools/run_check.py --log-dir /tmp/checks -- sh -c 'pytest --jun
   shell) with the caller's cwd and environment plus `RUN_CHECK_REPORT_DIR`, stdin `/dev/null`, in its own process group. A usage error exits 2
   with the message on stderr only: stdout is empty, nothing is created and the command does not run. Use a `--log-dir` outside the project
   (or in an ignored directory): `.gitignore` ignores `*.log` but neither the failures index nor the report directory, and
-  `scripts/council.sh:1678-1679` puts `git status --short` into the ratification diff.
+  `scripts/council.sh:2056-2057` puts `git status --short` into the ratification diff.
 - **The whole stdout is capped.** The final newline included, stdout is at most `--max-bytes` bytes of UTF-8 whatever the locale or
   `PYTHONIOENCODING`, and it never splits a code point. The mandatory lines are budgeted **before launch** in their worst case (every
   optional line present, 20-digit counters, the real absolute paths, 80-byte reasons, the pending line with its `--fallback-dir` disclosure, the final and emergency variants): when

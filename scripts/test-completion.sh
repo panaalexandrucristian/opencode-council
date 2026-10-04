@@ -2,9 +2,20 @@
 # Offline contract checks: load real functions, replacing only their external dependencies.
 set -o pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-scratch=$(mktemp -d /tmp/opencode-completion.XXXXXX) || exit 1
+scratch=$(mktemp -d /tmp/opencode-completion.XXXXXX) && scratch=$(cd "$scratch" && pwd -P) || exit 1
 export TMPDIR="$scratch"
 export PYTHONDONTWRITEBYTECODE=1  # every python3 invocation below must not dirty tracked ptools/__pycache__
+# Telemetry isolation, before any suite can launch council.sh: no real ledger, host seed or hardware/version
+# probe is ever touched. ioreg answers a fixed fake platform UUID; claude answers only --version; any network call
+# (curl) or OpenCode service start (opencode) that reaches PATH fails at once, so no suite can depend on a live service.
+export HOME="$scratch/home" COUNCIL_TELEMETRY_DIR="$scratch/telemetry-ledger"
+unset COUNCIL_TELEMETRY COUNCIL_HANDOVER_GATE COUNCIL_HANDOVER_GATE_TIMEOUT  # an operator's settings never reach a suite
+mkdir -p "$HOME" "$scratch/stubbin"
+printf '#!/bin/sh\necho "+-o J316sAP  <class IOPlatformExpertDevice>"\necho "    \\"IOPlatformUUID\\" = \\"0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D\\""\n' >"$scratch/stubbin/ioreg"
+printf '#!/bin/sh\n[ "$1" = --version ] && { echo "2.1.300 (Claude Code)"; exit 0; }\necho "unexpected claude call" >&2; exit 97\n' >"$scratch/stubbin/claude"
+printf '#!/bin/sh\necho "unexpected network call: curl" >&2; exit 99\n' >"$scratch/stubbin/curl"
+printf '#!/bin/sh\necho "unexpected OpenCode service call: opencode" >&2; exit 98\n' >"$scratch/stubbin/opencode"
+chmod +x "$scratch/stubbin/ioreg" "$scratch/stubbin/claude" "$scratch/stubbin/curl" "$scratch/stubbin/opencode"; export PATH="$scratch/stubbin:$PATH"
 : >"$scratch/passed"
 trap '[ "$BASH_SUBSHELL" -ne 0 ] || rm -rf "$scratch"' EXIT
 curl() { echo "unexpected network call" >&2; return 99; }
@@ -66,6 +77,31 @@ result_tests() (
   body='{"data":[]}'; check 1 'result empty messages' '[outcome] unavailable' show_result ses_fixture
   body="$(response succeeded reply)$(response succeeded reply)"; check 1 'result multiple objects' '' show_result ses_fixture
   body=$(response succeeded reply); api_rc=1; check 1 'result fetch failure preserves text' reply show_result ses_fixture
+  # the internal evidence channel (OC_RESULT_EVIDENCE): the same output and status; only the adapter's structured block of a
+  # successfully fetched, valid page is published, behind its marker; never the reply text
+  ev="$scratch/channel"; same() {  # want -> show_result with the channel gives the same stdout, stderr and status as without
+    local a b; a=$(show_result ses_fixture 2>&1; echo "rc=$?"); b=$(OC_RESULT_EVIDENCE=$ev show_result ses_fixture 2>&1; echo "rc=$?")
+    [ "$a" = "$b" ] || { printf 'without: %s\nwith: %s\n' "$a" "$b"; return 1; }; [[ $b == *"rc=$1" ]]
+  }
+  chan() { if [ -e "$ev" ]; then cat "$ev"; else echo absent; fi; ls "$scratch" | grep -c 'channel\.tmp\|^tmp\.'; return 0; }   # + leftover temp files
+  api_rc=0; body=$(response failed "$(printf 'Partial reply.\n\n[error] quota exceeded SECRETREPLY')" '{"message":"You exceeded your current quota"}')
+  rm -f "$ev"; check 0 'result channel: a failed turn keeps its output and status' '' same 1
+  check 0 'result channel: the structured errors and the outcome, behind the marker, never the reply' $'oc-result-evidence 1\n[error] You exceeded your current quota\n[outcome] failed\n0' chan
+  body=$(response succeeded reply); rm -f "$ev"; check 0 'result channel: a succeeded turn keeps its output and status' '' same 0
+  check 0 'result channel: a succeeded turn publishes the marker alone' $'oc-result-evidence 1\n0' chan
+  body=$(response failed reply '{"message":"You exceeded your current quota"}'); api_rc=1; rm -f "$ev"
+  check 0 'result channel: a failed fetch still prints its usable body with status 1' '' same 1
+  check 0 'result channel: a failed fetch publishes nothing' $'absent\n0' chan
+  api_rc=0
+  for body in '' '{' '{"data":{}}' "$(response failed reply)$(response failed reply)"; do
+    rm -f "$ev"; check 0 "result channel: malformed [${body:0:12}] keeps its output and status" '' same 1
+    check 0 "result channel: malformed [${body:0:12}] publishes nothing" $'absent\n0' chan
+  done
+  body=$(response failed reply '{"message":"You exceeded your current quota"}')
+  ev="$scratch/no-such-dir/channel"; check 0 'result channel: an unwritable channel changes neither output, stderr nor status' '' same 1
+  ev="$scratch/channel"; rm -f "$ev"
+  (mktemp() { return 1; }; check 0 'result channel: no private page file: the ordinary pipeline, nothing published' '' same 1) || exit 1
+  check 0 'result channel: after a mktemp failure no channel exists' $'absent\n0' chan
 )
 cli_tests() (
   load oc.sh; resolve() { :; }; send_prompt() { :; }; create_session() { echo ses_fixture; }
@@ -107,6 +143,7 @@ gate_tests() (
   check 0 'handover gate: timeout leaves the failed checkpoint' failed jq -r .status "$ST"
   check 0 'handover gate: timeout stops the calls still in flight before exiting' stopped cat "$RUN/stopped"
   check 0 'handover gate: do_handover gates the delivered note before retiring the session' '' sh -c 'sed -n "/^do_handover()/,/^}/p" "$1" | grep -q "^  handover_gate \"\$note\"$"' _ "$HERE/council.sh"
+  check 0 'handover gate: replace_member gates the replacement note' '' sh -c 'sed -n "/^replace_member()/,/^}/p" "$1" | grep -q "^  handover_gate \"\$note\" "' _ "$HERE/council.sh"
 )
 orphan_tests() (
   load council.sh; RUN="$scratch/orphan"; ST="$RUN/state.json"; N=1; DIR=$scratch; MAXT=3; TIMEOUT=2; MAP_PREPASS=0
@@ -1249,6 +1286,8 @@ case "$1" in
 esac
 SH
   chmod +x "$fake_resume_oc"; export RESUME_CALLS="$resume_calls"; : >"$resume_calls"
+  # council.sh always runs the oc.sh beside it, so the real resume dispatcher runs from a copy whose oc.sh is the fake
+  resume_home="$scratch/resume-home"; mkdir -p "$resume_home"; cp -R "$HERE/." "$resume_home/"; cp "$fake_resume_oc" "$resume_home/oc.sh"
   make_answer_run() {
     local target=$1 type=$2 run_dir="$scratch/resume-$1-$2"
     mkdir -p "$run_dir/posts"; RUN="$run_dir"; ST="$RUN/state.json"
@@ -1259,7 +1298,7 @@ SH
     fi
     printf '{"pending":true}\n' >"$RUN/questions.json"
   }
-  resume_real_answer() { OC="$fake_resume_oc" "$HERE/council.sh" resume --run-dir "$RUN" --answer "scope answer"; }
+  resume_real_answer() { "$resume_home/council.sh" resume --run-dir "$RUN" --answer "scope answer"; }
   make_answer_run mapped mapped
   check 0 'mapped original task answer resolves through real resume dispatch' '' resume_real_answer
   check 0 'mapped original answer is stored once and scope becomes unknown' true jq -e '.answers|length==1' "$ST"
@@ -1267,7 +1306,7 @@ SH
   check 0 'mapped answer clears pending state only after persistence' null jq -r '.pending_questions // "null"' "$ST"
   printf '{"q1":"inherited scope answer"}\n' >"$scratch/inherited-answers.json"
   make_answer_run child-a mapped
-  check 0 'split child --answers resolves through real resume dispatch' '' env OC="$fake_resume_oc" "$HERE/council.sh" resume --run-dir "$RUN" --answers "$scratch/inherited-answers.json"
+  check 0 'split child --answers resolves through real resume dispatch' '' "$resume_home/council.sh" resume --run-dir "$RUN" --answers "$scratch/inherited-answers.json"
   check 0 'split child answer invalidates parent seed applicability' 'unknown after scope-changing answers' jq -r '.map_prepasses.parent.scope_applicability' "$ST"
   for legacy in codemap no-codemap; do
     make_answer_run legacy "$legacy"
@@ -1292,7 +1331,7 @@ case "$*" in *state.json) exit 1 ;; esac
 exec "$REAL_MV" "$@"
 SH
   chmod +x "$failbin/mv"; export REAL_MV="$real_mv"
-  failed_answer_write() { env PATH="$failbin:$PATH" OC="$fake_resume_oc" "$HERE/council.sh" resume --run-dir "$RUN" --answer "do not continue" 2>&1; }
+  failed_answer_write() { env PATH="$failbin:$PATH" "$resume_home/council.sh" resume --run-dir "$RUN" --answer "do not continue" 2>&1; }
   check 4 'failed answer state write exits at the durable checkpoint' 'could not persist answers' failed_answer_write
   check 0 'failed answer write preserves pending state and durable question file' '' test -s "$RUN/questions.json"
   check 0 'failed answer write leaves answers and pending state unchanged' true jq -e '.answers==[] and .pending_questions[0].id=="q1"' "$ST"
@@ -1513,18 +1552,41 @@ write_fake_oc() {
 F=${FAKE_OC_DIR:?}; cmd=$1; shift
 echo "$cmd $*" >>"$F/calls.log"
 case "$cmd" in
-  ensure) exit 0 ;;
-  new) n=$(( $(cat "$F/sessions" 2>/dev/null || echo 0) + 1 )); echo $n >"$F/sessions"; printf '%s\0' "$@" >"$F/new-args-$n"; echo "ses_fake$n" ;;
+  ensure) [ -f "$F/ensure-json" ] && cat "$F/ensure-json"; exit 0 ;;
+  new) [ -f "$F/new-fail-once" ] && { rm -f "$F/new-fail-once"; echo "oc: session creation failed" >&2; exit 1; }   # telemetry control
+    n=$(( $(cat "$F/sessions" 2>/dev/null || echo 0) + 1 )); echo $n >"$F/sessions"; printf '%s\0' "$@" >"$F/new-args-$n"; echo "ses_fake$n" ;;
   prompt) sid=$1; while [ $# -gt 0 ]; do [ "$1" = --file ] && cp "$2" "$F/$sid.prompt"; shift; done ;;
   interrupt) exit 0 ;;
   wait) [ -f "$F/$1.prompt" ] || exit 1  # a session that was never prompted has no completed reply
+    [ -x "$F/wait-hook" ] && "$F/wait-hook" "$1"   # telemetry control: runs before the caller's result retrieval
+    [ -f "$F/wait-sleep" ] && sleep "$(cat "$F/wait-sleep")"
+    [ -f "$F/mapper-wait-fail" ] && grep -q 'Locate candidate source' "$F/$1.prompt" 2>/dev/null && { echo "oc: SECRETMAPPROVIDER You exceeded your current quota" >&2; exit 1; }
     [ -f "$F/mapper-timeout" ] && grep -q 'Locate candidate source' "$F/$1.prompt" 2>/dev/null && exit 2; exit 0 ;;
   result) p="$F/$1.prompt"
     [ -x "$F/result-hook" ] && "$F/result-hook" "$p"
     cr=""; [ -s "$F/code-reads" ] && grep -Eq -- "$(cat "$F/code-reads-pattern")" "$p" && cr=",\"code_reads\":$(cat "$F/code-reads")"
-    if [ -s "$F/fail-results" ] && ! grep -q '=== HANDOVER ===' "$p" && grep -Eq -- "$(cat "$F/fail-pattern" 2>/dev/null || echo .)" "$p"; then n=$(cat "$F/fail-results"); echo $((n-1)) >"$F/fail-results"; [ "$n" -gt 0 ] && { echo "[error] injected failure"; exit 1; }; fi
+    rpage=""   # telemetry control: a result through the real oc.sh show_result over a stubbed message page (one logged fetch)
+    if [ -s "$F/fail-results" ] && ! grep -q '=== HANDOVER ===' "$p" && grep -Eq -- "$(cat "$F/fail-pattern" 2>/dev/null || echo .)" "$p"; then n=$(cat "$F/fail-results"); echo $((n-1)) >"$F/fail-results"
+      [ "$n" -gt 0 ] && { if [ -f "$F/member-result-page" ]; then rpage="$F/member-result-page"; elif [ -f "$F/fail-output" ]; then cat "$F/fail-output"; exit 1; else echo "[error] injected failure"; exit 1; fi; }; fi
+    [ -z "$rpage" ] && [ -f "$F/mapper-result-page" ] && grep -q 'Locate candidate source' "$p" && rpage="$F/mapper-result-page"
+    [ -z "$rpage" ] && [ -f "$F/member-ok-page" ] && grep -Eq -- "$(cat "$F/fail-pattern" 2>/dev/null || echo .)" "$p" && rpage="$F/member-ok-page"
+    if [ -n "$rpage" ]; then
+      eval "$(sed '/^# .* commands /,$d' "$(cat "$F/real-oc")")"
+      api() { echo "$1 $2" >>"$F/result-api.log"; cat "$rpage"; return "$(cat "$F/api-rc" 2>/dev/null || echo 0)"; }
+      [ -f "$F/drop-channel" ] && unset OC_RESULT_EVIDENCE
+      [ -f "$F/unwritable-channel" ] && [ -n "${OC_RESULT_EVIDENCE-}" ] && OC_RESULT_EVIDENCE="$F/no-such-dir/channel"
+      show_result "$1"; rc=$?
+      # corrupt-channel controls act after show_result published, so they reach the consumer
+      [ -n "${OC_RESULT_EVIDENCE-}" ] && [ -f "$F/garbage-channel" ] && cp "$F/garbage-channel" "$OC_RESULT_EVIDENCE"
+      [ -n "${OC_RESULT_EVIDENCE-}" ] && [ -f "$F/unreadable-channel" ] && [ -e "$OC_RESULT_EVIDENCE" ] && chmod 000 "$OC_RESULT_EVIDENCE"
+      exit $rc; fi
+    # telemetry controls (unused elsewhere): one reply without a tail / one empty reply / a member-authored prefix
+    if [ -s "$F/bad-tail-once" ] && grep -Eq -- "$(cat "$F/bad-tail-once")" "$p"; then rm -f "$F/bad-tail-once"; echo "A reply without its JSON tail."; exit 0; fi
+    if [ -s "$F/empty-once" ] && grep -Eq -- "$(cat "$F/empty-once")" "$p"; then rm -f "$F/empty-once"; echo "(no text output in this turn)"; exit 0; fi
+    grep -q 'Locate candidate source' "$p" || { [ -f "$F/result-prefix" ] && cat "$F/result-prefix"; }
     if grep -q 'Locate candidate source' "$p"; then cat "$F/mapper-response"
     elif grep -q '=== HANDOVER ===' "$p"; then echo "Handover note for the successor."
+    elif [ -f "$F/deliberation-disagree" ] && grep -q 'round [2-9] of' "$p"; then printf 'Dissent.\n```json\n{"vote":"disagree","reason":"no","proposal":"Another plan.","questions":[]}\n```\n'
     elif grep -q -- '— EXECUTION ===' "$p"; then printf 'Executed.\n```json\n{"vote":"done","report":"did it","questions":[]}\n```\n'
     elif grep -q -- 'FIXES REQUESTED' "$p"; then printf 'Fixed.\n```json\n{"vote":"done","report":"fixed","questions":[]}\n```\n'
     elif grep -q 'RATIFICATION' "$p" && [ -f "$F/disagree-once" ] && grep -q "$(cat "$F/disagree-once")" "$p"; then rm -f "$F/disagree-once"; printf 'Dissent.\n```json\n{"vote":"disagree","reason":"needs a fix","proposal":"1. apply the fix","questions":[]}\n```\n'
@@ -1538,14 +1600,14 @@ case "$cmd" in
     else printf 'Agree.\n```json\n{"vote":"agree","reason":"same","proposal":null,"questions":[]%s}\n```\n' "$cr"; fi ;;
   api) case "$2" in
       /api/model*) echo '{"data":[{"enabled":true,"providerID":"p","id":"m","variants":[{"id":"medium"}],"limit":{"context":10000}},{"enabled":true,"providerID":"google","id":"gemini-3.8-flash","variants":[{"id":"medium"}],"limit":{"context":10000}}]}' ;;
-      */message*) echo '{"data":[{"type":"assistant","tokens":{"input":6000,"output":10,"reasoning":0,"cache":{"read":0,"write":0}}}]}' ;;
+      */message*) if [ -f "$F/message-page" ]; then cat "$F/message-page"; else echo '{"data":[{"type":"assistant","tokens":{"input":6000,"output":10,"reasoning":0,"cache":{"read":0,"write":0}}}]}'; fi ;;
       /api/session/*) sid=${2#/api/session/}
         if grep -q 'Locate candidate source' "$F/$sid.prompt" 2>/dev/null && [ -f "$F/mapper-session-usage" ]; then
           [ -s "$F/mapper-session-usage" ] || exit 1; cat "$F/mapper-session-usage"; exit 0; fi
         echo '{"data":{"tokens":{"input":6000,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0.01}}' ;;
       *) echo '{"data":{"tokens":{"input":6000,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0.01}}' ;;
     esac ;;
-  messages) echo '{"data":[]}' ;;
+  messages) if [ -f "$F/messages-page" ]; then cat "$F/messages-page"; else echo '{"data":[]}'; fi ;;
   *) exit 90 ;;
 esac
 SH
@@ -1569,6 +1631,12 @@ new = ("(5) open items, pending questions and answers from the user; (6) the del
 if s.count(old) != 1: sys.exit("approve_handover_prompt: anchor not found")
 open(p, "w", encoding="utf-8").write(s.replace(old, new))
 PY
+}
+strip_telemetry_artifacts() {  # output prefix of run_impl -> the same run without the authorized telemetry files and .telemetry
+  rm -f "$1.run/telemetry.jsonl" "$1.run/telemetry.shipped"
+  if [ -f "$1.run/state.json" ] && jq -e 'has("telemetry")' "$1.run/state.json" >/dev/null 2>&1; then
+    jq 'del(.telemetry)' "$1.run/state.json" >"$1.run/state.json.tm" && mv "$1.run/state.json.tm" "$1.run/state.json"
+  fi
 }
 legacy_differential_tests() (
   D="$scratch/legacy-diff"; mkdir -p "$D/base" "$D/proj"
@@ -1617,6 +1685,7 @@ PY2
   }
   same_outputs() {  # label -> compare every artifact and every step's exit/stdout/stderr of the two implementations
     local b="$D/out-$1-base" c="$D/out-$1-cur" n=1
+    strip_telemetry_artifacts "$b"; strip_telemetry_artifacts "$c"   # first: it rewrites state.json in jq's own format, as the run wrote it
     python3 "$D/cmp.py" "$b.run" "$c.run" || return 1
     cmp "$b.status" "$c.status" && cmp "$b.report" "$c.report" && cmp "$b.fo/calls.log" "$c.fo/calls.log" || return 1
     while [ -f "$b.step$n.rc" ]; do
@@ -2645,5 +2714,620 @@ PY2
   check 0 'D2 recovered session: nothing was captured and the mapper was prompted once' 'true 1' sh -c 'printf "%s %s" "$(jq -e ".capture_statuses==[]" "$1")" "$(grep -c "^prompt ses_fake1 " "$2")"' _ "$P/.council-run/map/$mk/coverage.json" "$D/fo-rescan-recovered/calls.log"
   check 0 'D2 recovered session: the task continues to completion after keep' '' keep rescan-recovered "$P"
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests; do "$suite" || exit 1; done
+# ---------------------------------------------------------------- telemetry ----
+# Content-free telemetry (scripts/council_telemetry.py) through real council.sh processes run by /bin/bash
+# (macOS bash 3.2), the offline OpenCode adapter above and an offline claude. tq.py evaluates one Python
+# expression over JSON-lines files: E = all parsed records, F[i] = the records of file i, BAD = unparsable lines.
+TM_UUID=0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D
+tm_host() { printf '%s' "council-telemetry-v1:$1" | shasum -a 256 | cut -c1-16; }
+modes() { python3 -c 'import os,sys; print(" ".join(oct(os.stat(p).st_mode & 0o777)[2:] for p in sys.argv[1:]))' "$@"; }
+write_tm_tools() {  # dir -> tq.py and fake-claude/claude
+  mkdir -p "$1/fake-claude"
+  cat >"$1/tq.py" <<'PY'
+import json, sys
+files, expr = sys.argv[1:-1], sys.argv[-1]
+E, F, BAD = [], [], 0
+for f in files:
+    F.append([])
+    for line in open(f, encoding="utf-8").read().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            BAD += 1
+            continue
+        E.append(rec); F[-1].append(rec)
+def ev(name, **kw):
+    return [e for e in E if e.get("ev") == name and all(e.get(k) == v for k, v in kw.items())]
+r = eval(expr)
+print(r if isinstance(r, str) else json.dumps(r, sort_keys=True))
+PY
+  cat >"$1/fake-claude/claude" <<'SH'
+#!/bin/bash
+# Offline claude -p: the reply depends only on the prompt on stdin; FAKE_CL_DIR holds one-shot controls.
+[ "$1" = --version ] && { echo "2.1.300 (Claude Code)"; exit 0; }
+F=${FAKE_CL_DIR:?}; p=$(cat); echo "claude $*" >>"$F/calls.log"
+if [ -f "$F/leave-once" ]; then rm -f "$F/leave-once"; sleep 40 & echo $! >>"$F/pids"; fi
+[ -f "$F/sleep" ] && { echo $$ >>"$F/pids"; sleep "$(cat "$F/sleep")"; }
+if [ -f "$F/no-json-once" ]; then rm -f "$F/no-json-once"; echo "SECRETCLIERR invalid authentication (401)" >&2; exit 1; fi
+err=false
+if [ -f "$F/error-once" ]; then rm -f "$F/error-once"; err=true; text="SECRETCLERROR You exceeded your current quota"
+else case "$p" in
+  *"=== HANDOVER ==="*) text="Handover note SECRETNOTE." ;;
+  *"— EXECUTION ==="*) text=$'Executed.\n```json\n{"vote":"done","report":"did it","questions":[]}\n```' ;;
+  *"FIXES REQUESTED"*) text=$'Fixed.\n```json\n{"vote":"done","report":"fixed","questions":[]}\n```' ;;
+  *RATIFICATION*) text=$'Ratified.\n```json\n{"vote":"agree","reason":"ok","proposal":null,"questions":[]}\n```' ;;
+  *"round 1 of"*) text=$'Plan SECRETCLAUDEPOST.\n```json\n{"vote":"propose","proposal":"Claude plan.","questions":[]}\n```' ;;
+  *) text=$'Agree.\n```json\n{"vote":"agree","reason":"same","proposal":null,"questions":[]}\n```' ;;
+esac; fi
+jq -n --arg t "$text" --argjson e "$err" '{type:"result",is_error:$e,result:$t,duration_ms:1500,total_cost_usd:0.02,
+  usage:{input_tokens:5000,output_tokens:20,cache_read_input_tokens:900,cache_creation_input_tokens:100},
+  modelUsage:{"claude-opus-5-5":{inputTokens:5000,outputTokens:20,cacheReadInputTokens:900,cacheCreationInputTokens:100,contextWindow:100000}}}'
+SH
+  chmod +x "$1/fake-claude/claude"
+}
+# One recorded lifecycle across both adapters: start (task 1 planned, executed, ratified; handovers; the
+# task-2 question) then resume to completion. Every assertion reads only the telemetry files.
+telemetry_process_tests() (
+  D="$scratch/telemetry"; P="$D/proj-SECRETPATH"; L="$D/ledger"; R="$D/run"; TQ="$D/tq.py"
+  mkdir -p "$D/impl" "$P" "$D/fo" "$D/fc"
+  cp -R "$HERE" "$HERE/../.claude-plugin" "$D/impl/" || exit 1; write_fake_oc "$D/impl/scripts/oc.sh"; write_tm_tools "$D"
+  export FAKE_CL_DIR="$D/fc" PATH="$D/fake-claude:$PATH"
+  printf '{"url":"http://127.0.0.1:1","version":"1.14.2","pid":1,"started":false}\n' >"$D/fo/ensure-json"
+  touch "$D/fo/ask-once"
+  jq -n --arg d "$P" '{dir:$d,max_rounds:2,timeout_s:30,handover_at:0.5,executor:"SECRETEXEC",style:"caveman",
+      members:[{id:"SECRETEXEC",kind:"opencode",model:"p/m",effort:"medium",mode:"edit"},
+               {id:"SECRETREADER",kind:"claude",model:"claude-opus-5-5",effort:"high",mode:"read",handover_at:0.9}],
+      tasks:[{id:"SECRETTASKID1",text:"SECRETTASKTEXT build it",execute:true},{id:"SECRETTASKID2",text:"second task SECRETTASKTEXT2"}]}' >"$D/cfg.json"
+  step() { local label=$1; shift; ( cd "$D" && COUNCIL_TELEMETRY_DIR="$L" FAKE_OC_DIR="$D/fo" /bin/bash "$D/impl/scripts/council.sh" "$@" >"$D/$label.out" 2>"$D/$label.err" ); }
+  q() { python3 "$TQ" "$@"; }
+  host=$(tm_host "$TM_UUID"); LG="$L/$host.jsonl"; T="$R/telemetry.jsonl"
+  check 4 'telemetry: a recorded start (OpenCode and Claude members) ratifies task 1 and pauses at the task-2 question' '' step start start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'telemetry: the run dir holds telemetry.jsonl and telemetry.shipped, both 0600' '600 600' modes "$T" "$R/telemetry.shipped"
+  check 0 'telemetry: a healthy run prints no telemetry warning' '' sh -c '! grep -q "telemetry:" "$1"' _ "$D/start.err"
+  check 0 'telemetry: every local line parses with schema 1 and the full envelope' true q "$T" 'BAD==0 and len(E)>20 and all(e.get("schema")==1 and {"ev","host","run","inv","seq","ts"}<=set(e) and type(e["ts"])==int for e in E)'
+  check 0 'telemetry: host is the salted hardware hash, run a uuid4 hex, inv 1' true q "$T" "all(e['host']=='$host' and len(e['run'])==32 and int(e['run'],16)>=0 and e['inv']==1 for e in E) and len(set(e['run'] for e in E))==1"
+  check 0 'telemetry: seq strictly increases' true q "$T" '[e["seq"] for e in E]==sorted(set(e["seq"] for e in E)) and E[0]["seq"]>=1'
+  sv=$(jq -r .version "$HERE/../.claude-plugin/plugin.json")   # the shipped version the fixture copied
+  check 0 'telemetry: run_start records the configuration dimensions and the versions the run already measured' true q "$T" '(lambda s: [s["command"],s["status"],s["skill_version"],s["claude_version"],s["opencode_version"],s["members"],s["max_rounds"],s["tasks"],s["timeout_s"],s["max_turns"],s["handover_at"],s["style"],s["executor_present"],s["map_code"],s["history"],s["gap"]]==["start","created","'"$sv"'","2.1.300","1.14.2",2,2,2,30,30,0.5,"caveman",True,False,"full",False])(ev("run_start")[0])'
+  check 0 'telemetry: one member event per member; indices, never ids; the handover override is visible' true q "$T" '[[m["member_index"],m["kind"],m["mode"],m["executor"],m["model"],m["effort"],m["gen"],m["handover_at"],m["handover_override"]] for m in ev("member")]==[[0,"opencode","edit",True,"p/m","medium",1,0.5,False],[1,"claude","read",False,"claude-opus-5-5","high",1,0.9,True]]'
+  check 0 'telemetry: every call_start has exactly one call_end, linked by call_seq' true q "$T" 'sorted(e["seq"] for e in ev("call_start"))==sorted(e["call_seq"] for e in ev("call_end")) and len(ev("call_end"))>=9'
+  check 0 'telemetry: every call of the healthy run ended ok with a launch-to-completion duration' true q "$T" 'all(e["outcome"]=="ok" and "failure_class" not in e and type(e["duration_s"])==int for e in ev("call_end"))'
+  check 0 'telemetry: attempt counts every launch per (member, step, round) across tasks and generations' true q "$T" 'all(c["attempt"]==1+len([p for p in ev("call_start") if p["seq"]<c["seq"] and [p.get("member_index"),p["step"],p["round"]]==[c.get("member_index"),c["step"],c["round"]]]) for c in ev("call_start")) and [[c["task_index"],c["attempt"]] for c in ev("call_start",member_index=0,step="plan",round=1)]==[[0,1],[1,2]] and len(set(c["gen"] for c in ev("call_start",member_index=0)))>=2'
+  check 0 'telemetry: call ends keep the exit evidence the run observed' true q "$T" 'all(e["wait_exit_code"]==0 and e["result_exit_code"]==0 for e in ev("call_end") if e["kind"]=="opencode") and all(e["exit_code"]==0 for e in ev("call_end") if e["kind"]=="claude")'
+  check 0 'telemetry: steps are the approved enum' true q "$T" 'sorted(set(e["step"] for e in ev("call_start")))==["exec","handover","plan","ratify"]'
+  check 0 'telemetry: Claude calls carry per-call usage, provider duration and the cumulative-cost delta' true q "$T" '[[e["tokens"],e["cost_usd"],e["provider_duration_s"],e["ctx_used"],e["ctx_limit"]] for e in ev("call_end") if e["kind"]=="claude"][:2]==[[{"input":5000,"output":20,"cache_read":900,"cache_write":100,"reasoning":None,"total":6020},0.02,1.5,6020,100000],[{"input":5000,"output":20,"cache_read":900,"cache_write":100,"reasoning":None,"total":6020},0.0,1.5,6020,100000]]'
+  check 0 'telemetry: OpenCode totals are session deltas from a known zero baseline; components unknown without a turn boundary' true q "$T" '[[e["tokens"]["total"],e["tokens"]["input"],e["cost_usd"],e["ctx_used"],e["ctx_limit"],"provider_duration_s" in e] for e in ev("call_end") if e["kind"]=="opencode"][:2]==[[6010,None,0.01,6010,10000,False],[0,None,0.0,6010,10000,False]]'
+  check 0 'telemetry: votes count the accepted tails of every step' true q "$T" '[[v["task_index"],v["step"],v["round"],v["vote_propose"],v["vote_agree"],v["vote_question"],v["vote_done"],v["failed_members"],v["converted"],v["replay"]] for v in ev("votes")]==[[0,"plan",1,2,0,0,0,0,0,False],[0,"plan",2,0,2,0,0,0,0,False],[0,"exec",1,0,0,0,1,0,0,False],[0,"ratify",1,0,2,0,0,0,0,False],[1,"plan",1,1,0,1,0,0,0,False]]'
+  check 0 'telemetry: consensus and ratification are separate milestones of task 0' true q "$T" '[[o["task_index"],o["split_child"],o["milestone"],o["round"]] for o in ev("outcome")]==[[0,False,"consensus",2],[0,False,"ratified",1]]'
+  check 0 'telemetry: the exit-4 checkpoint counts member question ids' true q "$T" '[[x["count"],x["source"],x["task_index"]] for x in ev("questions")]==[[1,"member",1]]'
+  check 0 'telemetry: a threshold handover records context before the note, both stages, the link and the note outcome' true q "$T" '(lambda h: [h[0]["stage"],h[0]["type"],h[0]["member_index"],h[0]["ctx_used"],h[0]["ctx_limit"],h[0]["gen"],h[1]["stage"],h[1]["handover_seq"]==h[0]["seq"],h[1]["note_outcome"],h[1]["new_gen"],"ctx_used" in h[1]]==["start","threshold",0,6010,10000,1,"end",True,"ok",2,False])(ev("handover"))'
+  check 0 'telemetry: the gate is recorded as disabled for every handover' true q "$T" '[[g["result"],g["wait_s"],g["handover_seq"]] for g in ev("gate")]==[["disabled",0,h["seq"]] for h in ev("handover",stage="start")]'
+  check 0 'telemetry: run_end keeps the exit code and the checkpoint position' true q "$T" '(lambda r: [r["exit_code"],r["status"],r["task_index"],r["step"],r["round"],r["opencode_version"],r["claude_version"],type(r["duration_s"])==int]==[4,"questions",1,"plan",1,"1.14.2","2.1.300",True])(ev("run_end")[0]) and E[-1]["ev"]=="run_end"'
+  check 0 'telemetry: the ledger dir is 0700 and <host>.jsonl is 0600' '700 600' modes "$L" "$LG"
+  check 0 'telemetry: the ledger holds every local event once, in order, plus one run_summary' true q "$T" "$LG" '[e for e in F[1] if e["ev"]!="run_summary"]==F[0] and len([e for e in F[1] if e["ev"]=="run_summary"])==1 and BAD==0'
+  check 0 'telemetry: the summary has its own seq, covers the last event and counts the calls' true q "$T" "$LG" '(lambda s: s["seq"] not in [e["seq"] for e in F[0]] and s["seq"]>s["last_event_seq"]==F[0][-1]["seq"] and [s["inv"],s["exit_code"],s["status"],s["history"],s["gap"],s["calls"],s["ok"],s["failed"],s["killed"],s["incomplete"],s["questions"],s["consensus"],s["ratified"]]==[1,4,"questions","full",False,len([e for e in F[0] if e["ev"]=="call_start"]),len([e for e in F[0] if e["ev"]=="call_start"]),0,0,0,1,1,1])([e for e in F[1] if e["ev"]=="run_summary"][0])'
+  check 0 'telemetry: the cursor is the byte size of the shipped local file' '' sh -c 'test "$(cat "$1/telemetry.shipped")" = "$(wc -c <"$1/telemetry.jsonl" | tr -d " ")"' _ "$R"
+  check 0 'telemetry: state.json holds only .telemetry {run, inv, seq}, seq = the reserved summary seq' true bash -c 'jq -e --slurpfile s <(grep run_summary "$2") --slurpfile e <(head -1 "$3") ".telemetry|keys==[\"inv\",\"run\",\"seq\"] and .inv==1 and .run==\$e[0].run and .seq==\$s[0].seq" "$1"' _ "$R/state.json" "$LG" "$T"
+  secrets() {
+    local s; for s in SECRETEXEC SECRETREADER SECRETTASKID SECRETTASKTEXT SECRETPATH SECRETNOTE SECRETCLAUDEPOST ses_fake 'Deterministic plan' 'Handover note' 'Claude plan' "$TM_UUID" "$(hostname -s)" "$(id -un)" "$(jq -r '.members[1].session' "$R/state.json")" "$D"; do
+      if grep -F -q -- "$s" "$@"; then echo "leaked: $s"; return 1; fi
+    done
+  }
+  check 0 'telemetry privacy: no id, task text, post, note, path, session, hostname, user or hardware UUID in the run file or ledger' '' secrets "$T" "$LG"
+  check 0 'telemetry: resume answers the question and finishes the run' '' step resume resume --run-dir "$R" --answer Hello
+  check 0 'telemetry: the resume is invocation 2 of the same run: gap-flagged, full history, no fresh Claude version claimed' true q "$T" '(lambda s: [s["inv"],s["command"],s["gap"],s["history"],s["status"],s["run"]==ev("run_start")[0]["run"],s["claude_version"]]==[2,"resume",True,"full","questions",True,None])(ev("run_start")[1])'
+  check 0 'telemetry: the resume relaunch continues the attempt count of its member, step and round' true q "$T" '[[c["inv"],c["task_index"],c["attempt"]] for c in ev("call_start",member_index=0,step="plan",round=1)]==[[1,0,1],[1,1,2],[2,1,3]]'
+  check 0 'telemetry: resumed events continue above the reserved summary seq; no seq is reused' true q "$T" "$LG" '(lambda s1: len(set(e["seq"] for e in F[0]))==len(F[0]) and min(e["seq"] for e in F[0] if e["inv"]==2)>s1["seq"])([e for e in F[1] if e["ev"]=="run_summary"][0])'
+  check 0 'telemetry: the ledger holds each event exactly once and two snapshots with distinct seqs' true q "$T" "$LG" '[e for e in F[1] if e["ev"]!="run_summary"]==F[0] and [[s["inv"],s["exit_code"]] for s in F[1] if s["ev"]=="run_summary"]==[[1,4],[2,0]] and len(set(e["seq"] for e in F[1]))==len(F[1])'
+  check 0 'telemetry: after a resume the first call of each session has an unknown cost delta (no trusted baseline); the Claude per-call usage stays known' true q "$T" 'sorted([e["kind"],e["cost_usd"],e["tokens"]["total"]] for e in ev("call_end") if e["inv"]==2 and e["step"]=="plan" and e["round"]==1)==[["claude",None,6020],["opencode",None,None]]'
+  check 0 'telemetry: the latest snapshot covers the whole run: three milestones, done' true q "$LG" '(lambda s: [s["status"],s["consensus"],s["ratified"],s["questions"],s["inv"]])(ev("run_summary")[-1])==["done",2,1,1,2]'
+  check 0 'telemetry privacy: still nothing private after the resume' '' secrets "$T" "$LG"
+  RP="$D/impl/scripts/ptools/telemetry_report.py"
+  check 0 'telemetry report: one run, two invocations, per host and for all hosts' 'runs: 1' python3 "$RP" "$L"
+  check 0 'telemetry report: the host section is present' "=== Host $host ===" python3 "$RP" "$L"
+  check 0 'telemetry report: no invalid records' 'invalid values: 0' python3 "$RP" "$L"
+  check 0 'telemetry report: the run dir and the ledger together count every call once' '' sh -c 'test "$(python3 "$1" "$2" | grep -A3 "^Calls by model")" = "$(python3 "$1" "$2" "$3" | grep -A3 "^Calls by model")"' _ "$RP" "$L" "$R"
+)
+# Faults, exit codes, opt-out, host identity, provenance and the mapper through real processes (two
+# OpenCode members, one task unless stated). The opt-out run gives each case's reference exit code.
+telemetry_fault_tests() (
+  D="$scratch/telemetry-faults"; mkdir -p "$D/impl" "$D/proj"; TQ="$D/tq.py"
+  cp -R "$HERE" "$D/impl/" || exit 1; write_fake_oc "$D/impl/scripts/oc.sh"; write_tm_tools "$D"; write_fault_bin "$D/bin"
+  mkdir -p "$D/probebin" "$D/noioreg"
+  printf '#!/bin/sh\necho probed >>"$IOREG_LOG"; exit 1\n' >"$D/probebin/ioreg"; printf '#!/bin/sh\nexit 1\n' >"$D/noioreg/ioreg"
+  chmod +x "$D/probebin/ioreg" "$D/noioreg/ioreg"
+  jq -n --arg d "$D/proj" '{dir:$d,max_rounds:2,timeout_s:30,handover_at:0.9,executor:null,members:[{id:"A",kind:"opencode",model:"p/m",effort:"medium",mode:"read"},{id:"B",kind:"opencode",model:"p/m",effort:"medium",mode:"read"}],tasks:[{id:"only",text:"investigate"}]}' >"$D/cfg.json"
+  host=$(tm_host "$TM_UUID")
+  fcase() { C="$D/case-$1"; F="$C/fo"; R="$C/run"; L="$C/ledger"; LG="$L/$host.jsonl"; T="$R/telemetry.jsonl"; rm -rf "$C"; mkdir -p "$F"; }
+  run() {  # label [VAR=value ...] -- council.sh args
+    local label=$1; shift; local -a envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+    ( cd "$D" && env PATH="$D/bin:$PATH" FAKE_OC_DIR="$F" FAIL_FLAG="$C/flag" COUNCIL_TELEMETRY_DIR="$L" "${envs[@]}" /bin/bash "${IMPL:-$D/impl}/scripts/council.sh" "$@" >"$C/$label.out" 2>"$C/$label.err" )
+  }
+  q() { python3 "$TQ" "$@"; }
+  warnings() { grep -c 'telemetry:' "$1"; }
+  # ---- opt-out: nothing at all, not even the identity probe ----
+  fcase optout
+  check 0 'opt-out: COUNCIL_TELEMETRY=0 completes with exit 0' '' run start COUNCIL_TELEMETRY=0 "PATH=$D/probebin:$D/bin:$PATH" IOREG_LOG="$C/ioreg.log" HOME="$C/home" -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'opt-out: no telemetry file, cursor, ledger, host seed, state metadata or identity probe' '' sh -c '! test -e "$1/telemetry.jsonl" && ! test -e "$1/telemetry.shipped" && ! test -e "$2" && ! test -e "$3/home" && ! test -e "$3/ioreg.log" && jq -e "has(\"telemetry\")|not" "$1/state.json" >/dev/null' _ "$R" "$L" "$C"
+  check 0 'opt-out: no telemetry message' '' sh -c '! grep -q "telemetry:" "$1"' _ "$C/start.err"
+  # ---- a recorded run with the same config: same exit code ----
+  fcase ok; OK="$C"
+  check 0 'recorded run: the same config completes with exit 0' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'recorded run: run_end and the summary record exit 0' true q "$LG" 'ev("run_end")[0]["exit_code"]==0 and ev("run_summary")[0]["exit_code"]==0 and ev("run_summary")[0]["status"]=="done"'
+  check 0 'recorded run: a finished task is one consensus milestone' true q "$T" '[o["milestone"] for o in ev("outcome")]==["consensus"]'
+  # ---- opt-out on a run that already has telemetry: nothing changes ----
+  fcase optout-old; cp -Rp "$OK/run" "$R"; cp -Rp "$OK/ledger" "$L"
+  sum() { cksum "$1/telemetry.jsonl" "$1/telemetry.shipped" "$2/$host.jsonl"; jq -c .telemetry "$1/state.json"; }
+  before=$(sum "$R" "$L")
+  check 1 'opt-out on a recorded run: resume of the finished run keeps exit 1' '' run again COUNCIL_TELEMETRY=0 -- resume --run-dir "$R"
+  check 0 'opt-out on a recorded run: telemetry file, cursor, ledger and .telemetry are untouched' "$before" sum "$R" "$L"
+  # ---- write failures never change the exit code; one approved warning; retried next invocation ----
+  fcase symlink; mkdir -p "$C/real"; ln -s "$C/real" "$L"
+  check 0 'ledger symlink: the run completes with the unchanged exit 0' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'ledger symlink: the approved warning names only ELOOP' 'council: telemetry: write failed (ELOOP); telemetry off for this invocation' cat "$C/start.err"
+  check 0 'ledger symlink: exactly one warning' 1 warnings "$C/start.err"
+  check 0 'ledger symlink: nothing was written through the link and the cursor did not advance' '' sh -c '! ls "$1"/* >/dev/null 2>&1 && ! test -e "$2/telemetry.shipped"' _ "$C/real" "$R"
+  rm "$L"
+  check 1 'ledger symlink: the next invocation (resume of the finished run) keeps exit 1' '' run again -- resume --run-dir "$R"
+  check 0 'ledger symlink: the next invocation exports the earlier unshipped events too' true q "$T" "$LG" '[e for e in F[1] if e["ev"]!="run_summary"]==F[0] and [s["inv"] for s in F[1] if s["ev"]=="run_summary"]==[2] and [e["inv"] for e in F[0] if e["ev"]=="run_start"]==[1,2]'
+  fcase readonly; mkdir -p "$L"; chmod 500 "$L"
+  check 0 'unwritable ledger: exit 0 unchanged' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  chmod 700 "$L"
+  check 0 'unwritable ledger: one approved warning naming EACCES' 'council: telemetry: write failed (EACCES); telemetry off for this invocation' cat "$C/start.err"
+  check 0 'unwritable ledger: exactly one warning' 1 warnings "$C/start.err"
+  fcase localdir; cp -Rp "$OK/run" "$R"; rm -f "$T"; mkdir "$T"
+  check 1 'unwritable event file: resume of the finished run keeps exit 1' '' run again -- resume --run-dir "$R"
+  check 0 'unwritable event file: one approved warning naming EISDIR' 'council: telemetry: write failed (EISDIR); telemetry off for this invocation' cat "$C/again.err"
+  check 0 'unwritable event file: exactly one warning and no export after it' '1 absent' sh -c 'printf "%s %s" "$(grep -c telemetry: "$1")" "$(test -e "$2" && echo present || echo absent)"' _ "$C/again.err" "$L"
+  fcase lock; mkdir -p "$L"
+  python3 -c 'import fcntl,os,sys,time; fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600); fcntl.lockf(fd,fcntl.LOCK_EX); open(sys.argv[2],"w").close(); time.sleep(60)' "$LG" "$C/locked" &
+  holder=$!; while [ ! -e "$C/locked" ]; do sleep 0.1; done
+  check 0 'ledger lock held by another process: exit 0 unchanged' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  kill "$holder"; wait "$holder" 2>/dev/null
+  check 0 'ledger lock timeout: the approved warning names ETIMEDOUT' 'council: telemetry: write failed (ETIMEDOUT); telemetry off for this invocation' cat "$C/start.err"
+  check 0 'ledger lock timeout: nothing appended, cursor not advanced' '0 absent' sh -c 'printf "%s %s" "$(wc -c <"$1" | tr -d " ")" "$(test -e "$2/telemetry.shipped" && echo present || echo absent)"' _ "$LG" "$R"
+  check 1 'ledger lock released: the next invocation keeps its exit code' '' run again -- resume --run-dir "$R"
+  check 0 'ledger lock released: every event of both invocations is exported once' true q "$T" "$LG" '[e for e in F[1] if e["ev"]!="run_summary"]==F[0]'
+  rm -rf "$D/impl-nohelper"; cp -R "$D/impl" "$D/impl-nohelper"; rm -f "$D/impl-nohelper/scripts/council_telemetry.py"
+  fcase nohelper
+  IMPL="$D/impl-nohelper"; check 0 'missing telemetry helper: the run still completes with exit 0' '' run start -- start --config "$D/cfg.json" --run-dir "$R"; unset IMPL
+  check 0 'missing telemetry helper: one approved warning naming ENOENT' 'council: telemetry: write failed (ENOENT); telemetry off for this invocation' cat "$C/start.err"
+  check 0 'missing telemetry helper: exactly one warning' 1 warnings "$C/start.err"
+  # ---- every exit path of start/resume exports ----
+  fcase initial
+  check 1 'initial state failure: start still exits 1' '' run start 'FAIL_MV_GLOB=*/state.json' FAIL_MV_COUNT=1 -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'initial state failure: the existing diagnostic, and the run dir is still removed' 'could not persist initial run state; no model call made' sh -c 'test ! -e "$2" && cat "$1"' _ "$C/start.err" "$R"
+  check 0 'initial state failure: run_start, run_end exit 1 and a summary were exported before the cleanup' true q "$LG" '[e["ev"] for e in E if e["ev"] in ("run_start","run_end","run_summary")]==["run_start","run_end","run_summary"] and ev("run_end")[0]["exit_code"]==1 and ev("run_end")[0]["status"]=="created"'
+  fcase codemap; cp -Rp "$OK/run" "$R"
+  jq '.status="failed" | .codemap_version=2 | .codemap_pending={task:"only",step:"r1"}' "$R/state.json" >"$R/s.tmp" && mv "$R/s.tmp" "$R/state.json"
+  check 2 'load_state checkpoint (unsupported codemap version): resume still exits 2' '' run again -- resume --run-dir "$R"
+  check 0 'load_state checkpoint: the invocation is recorded and exported with exit 2' true q "$LG" '[[e["ev"],e["inv"]] for e in E if e["ev"] in ("run_start","run_end","run_summary")][-3:]==[["run_start",2],["run_end",2],["run_summary",2]] and ev("run_end")[-1]["exit_code"]==2'
+  fcase unresolved; touch "$F/deliberation-disagree"
+  check 5 'unresolved task: exit 5 unchanged' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'unresolved task: the milestone and the summary record it' true q "$T" "$LG" '[o["milestone"] for o in F[0] if o["ev"]=="outcome"]==["unresolved"] and [s["exit_code"] for s in F[1] if s["ev"]=="run_summary"]==[5] and [s["unresolved"] for s in F[1] if s["ev"]=="run_summary"]==[1]'
+  fcase term; echo 4 >"$F/wait-sleep"
+  sigrun() {  # config signal ready [VAR=value ...] -> exit status of a start that gets the signal once ready holds
+    # ready: "wait" (an adapter wait has begun) or a glob that must match an existing file
+    python3 - "$D/impl/scripts/council.sh" "$R" "$F" "$L" "$C" "$@" <<'PY'
+import glob, os, signal, subprocess, sys, time
+sh, run, fo, ledger, case, cfg, sig, ready = sys.argv[1:9]
+env = dict(os.environ, FAKE_OC_DIR=fo, COUNCIL_TELEMETRY_DIR=ledger, FAIL_FLAG=case + "/flag")
+env["PATH"] = os.path.dirname(os.path.dirname(os.path.dirname(sh))) + "/bin:" + env["PATH"]
+for kv in sys.argv[9:]:
+    k, v = kv.split("=", 1)
+    env[k] = v
+def child():
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, signal.SIG_DFL)
+def is_ready():
+    if ready == "wait":
+        return os.path.exists(fo + "/calls.log") and "\nwait " in "\n" + open(fo + "/calls.log").read()
+    return bool(glob.glob(ready))
+p = subprocess.Popen(["/bin/bash", sh, "start", "--config", cfg, "--run-dir", run], env=env, preexec_fn=child,
+                     stdout=open(case + "/sig.out", "w"), stderr=open(case + "/sig.err", "w"))
+deadline = time.time() + 60
+while time.time() < deadline and not is_ready() and p.poll() is None:
+    time.sleep(0.1)
+time.sleep(0.5); p.send_signal(getattr(signal, sig)); sys.exit(p.wait())
+PY
+  }
+  check 143 'SIGTERM during a call: the orchestrator still exits 143' '' sigrun "$D/cfg.json" SIGTERM wait
+  check 0 'SIGTERM: run_end and the summary record exit 143' true q "$LG" 'ev("run_end")[0]["exit_code"]==143 and ev("run_summary")[0]["exit_code"]==143'
+  check 0 'SIGTERM: the interrupted OpenCode calls stay incomplete (no invented end) and are counted as such' true q "$T" "$LG" 'len([e for e in F[0] if e["ev"]=="call_start"])==2 and not [e for e in F[0] if e["ev"]=="call_end"] and [s["incomplete"] for s in F[1] if s["ev"]=="run_summary"]==[2]'
+  for sg in SIGINT:130 SIGHUP:129; do
+    fcase "${sg%%:*}"; echo 4 >"$F/wait-sleep"
+    check "${sg##*:}" "${sg%%:*} during a call: the orchestrator still exits ${sg##*:}" '' sigrun "$D/cfg.json" "${sg%%:*}" wait
+    check 0 "${sg%%:*}: run_end, the summary and the incomplete calls record it" true q "$T" "$LG" "[e['exit_code'] for e in F[0] if e['ev']=='run_end']==[${sg##*:}] and [[s['exit_code'],s['incomplete']] for s in F[1] if s['ev']=='run_summary']==[[${sg##*:},2]]"
+  done
+  # ---- a signal while the version is probed, after the run-dir leaf exists and before state.json ----
+  fcase probe; mkdir -p "$C/slowbin"
+  printf '#!/bin/sh\n[ "$1" = --version ] && { : >"$SLOW_MARK"; sleep 3; echo "2.1.300 (Claude Code)"; exit 0; }\nexit 97\n' >"$C/slowbin/claude"; chmod +x "$C/slowbin/claude"
+  check 143 'SIGTERM during the claude version probe: start still exits 143' '' sigrun "$D/cfg.json" SIGTERM "$C/probing" "PATH=$C/slowbin:$D/bin:$PATH" SLOW_MARK="$C/probing"
+  check 0 'version probe signal: no state was published, so nothing was resumable' '' test ! -e "$R/state.json"
+  check 0 'version probe signal: one run_start, one run_end (143, created) and one summary were exported' true q "$LG" '[e["ev"] for e in E]==["run_start","member","member","run_end","run_summary"] and (lambda r: [r["exit_code"],r["status"]])(ev("run_end")[0])==[143,"created"] and ev("run_start")[0]["claude_version"] is None and ev("run_summary")[0]["exit_code"]==143'
+  # ---- a signal while the host identity is initialized (the ioreg probe blocks), on start and on resume ----
+  mkdir -p "$D/slowioreg"
+  printf '#!/bin/sh\necho $$ >"$IOREG_MARK.tmp"; mv "$IOREG_MARK.tmp" "$IOREG_MARK"; sleep 3\necho "+-o J316sAP  <class IOPlatformExpertDevice>"\necho "    \\"IOPlatformUUID\\" = \\"%s\\""\n' "$TM_UUID" >"$D/slowioreg/ioreg"; chmod +x "$D/slowioreg/ioreg"
+  isig() {  # want signal council-args... -> 0 when the run's exit status is want (negative: killed by that signal)
+    local got; got=$(PATH="$D/slowioreg:$D/bin:$PATH" FAKE_OC_DIR="$F" COUNCIL_TELEMETRY_DIR="$L" FAIL_FLAG="$C/flag" IOREG_MARK="$C/identity" \
+      python3 - "$D/impl/scripts/council.sh" "$C" "${@:2}" <<'PY'
+import os, signal, subprocess, sys, time
+sh, case, sig = sys.argv[1:4]
+def child():
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, signal.SIG_DFL)
+p = subprocess.Popen(["/bin/bash", sh] + sys.argv[4:], preexec_fn=child, stdout=open(case + "/sig.out", "w"), stderr=open(case + "/sig.err", "w"))
+deadline = time.time() + 60
+while time.time() < deadline and not os.path.exists(case + "/identity") and p.poll() is None:
+    time.sleep(0.05)
+time.sleep(0.5); p.send_signal(getattr(signal, sig)); print(p.wait())
+PY
+)
+    [ "$got" = "$1" ] || { echo "exit status $got"; return 1; }
+  }
+  for sg in SIGTERM:15 SIGINT:2 SIGHUP:1; do
+    s=${sg%%:*}; n=${sg##*:}
+    fcase "init-$s"
+    check 0 "$s during the start's identity step: start still exits $((128 + n))" '' isig $((128 + n)) "$s" start --config "$D/cfg.json" --run-dir "$R"
+    check 0 "$s during the start's identity step: one valid run_start, run_end ($((128 + n)), created) and run_summary were exported" true q "$LG" "[e['ev'] for e in E if e['ev'] in ('run_start','run_end','run_summary')]==['run_start','run_end','run_summary'] and all(e['host']=='$host' and len(e['run'])==32 and e['inv']==1 for e in E) and [ev('run_end')[0]['exit_code'],ev('run_end')[0]['status'],ev('run_summary')[0]['exit_code']]==[$((128 + n)),'created',$((128 + n))]"
+    check 0 "$s during the start's identity step: no telemetry warning" '' sh -c '! grep -q "telemetry:" "$1"' _ "$C/sig.err"
+    fcase "resume-init-$s"; cp -Rp "$OK/run" "$R"
+    check 0 "$s during the resume's identity step: resume is still ended by the signal itself ($s has no handler yet)" '' isig "-$n" "$s" resume --run-dir "$R"
+    check 0 "$s during the resume's identity step: one valid run_start, run_end ($((128 + n))) and run_summary of invocation 2 were exported" true q "$LG" "[e['ev'] for e in E if e['ev'] in ('run_start','run_end','run_summary')]==['run_start','run_end','run_summary'] and all(e['host']=='$host' and e['inv']==2 for e in E) and len(set(e['run'] for e in E))==1 and [ev('run_end')[0]['exit_code'],ev('run_summary')[0]['exit_code']]==[$((128 + n)),$((128 + n))]"
+    check 0 "$s during the resume's identity step: no telemetry warning" '' sh -c '! grep -q "telemetry:" "$1"' _ "$C/sig.err"
+  done
+  # the same signals sent to the council's whole process group (a terminal's ^C, a closed terminal, a group kill): the
+  # initialization helpers run in that group too, yet nothing is lost, no warning, every process and the probe are gone
+  gsig() {  # want signal impl ready council-args... -> 0 when a group signal sent once ready exists gives exit status want
+    local got; got=$(PATH="$D/slowioreg:$D/bin:$PATH" FAKE_OC_DIR="$F" COUNCIL_TELEMETRY_DIR="$L" FAIL_FLAG="$C/flag" IOREG_MARK="$C/identity" \
+      python3 - "$3/scripts/council.sh" "$C" "$2" "$4" "${@:5}" <<'PY'
+import os, signal, subprocess, sys, time
+sh, case, sig, ready = sys.argv[1:5]
+def child():
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, signal.SIG_DFL)
+p = subprocess.Popen(["/bin/bash", sh] + sys.argv[5:], preexec_fn=child, start_new_session=True,
+                     stdout=open(case + "/sig.out", "w"), stderr=open(case + "/sig.err", "w"))
+def gone(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+def reap(why):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    p.wait(); print(why); sys.exit(0)
+deadline = time.time() + 60
+while time.time() < deadline and not os.path.exists(ready) and p.poll() is None:
+    time.sleep(0.05)
+if not os.path.exists(ready) or p.poll() is not None:
+    reap("not ready")
+time.sleep(0.5)
+os.killpg(p.pid, getattr(signal, sig))
+try:
+    rc = p.wait(timeout=60)
+except subprocess.TimeoutExpired:
+    reap("no exit")
+groups = [p.pid] + ([int(open(case + "/identity").read())] if os.path.exists(case + "/identity") else [])
+deadline = time.time() + 15
+while time.time() < deadline and not all(gone(g) for g in groups):
+    time.sleep(0.1)
+print(rc if all(gone(g) for g in groups) else "survivor")
+PY
+)
+    [ "$got" = "$1" ] || { echo "result $got"; return 1; }
+  }
+  for sg in SIGTERM:15 SIGINT:2 SIGHUP:1; do
+    s=${sg%%:*}; n=${sg##*:}
+    fcase "group-init-$s"
+    check 0 "group $s during the start's identity step: start still exits $((128 + n)); no council process or probe survives" '' gsig $((128 + n)) "$s" "$D/impl" "$C/identity" start --config "$D/cfg.json" --run-dir "$R"
+    check 0 "group $s during the start's identity step: one valid run_start, run_end ($((128 + n)), created) and run_summary were exported" true q "$LG" "[e['ev'] for e in E if e['ev'] in ('run_start','run_end','run_summary')]==['run_start','run_end','run_summary'] and all(e['host']=='$host' and len(e['run'])==32 and e['inv']==1 for e in E) and len(set(e['run'] for e in E))==1 and [ev('run_end')[0]['exit_code'],ev('run_end')[0]['status'],ev('run_summary')[0]['exit_code']]==[$((128 + n)),'created',$((128 + n))]"
+    check 0 "group $s during the start's identity step: no telemetry warning" '' sh -c '! grep -q "telemetry:" "$1"' _ "$C/sig.err"
+    fcase "group-resume-init-$s"; cp -Rp "$OK/run" "$R"
+    check 0 "group $s during the resume's identity step: resume is still ended by the signal itself; nothing survives" '' gsig "-$n" "$s" "$D/impl" "$C/identity" resume --run-dir "$R"
+    check 0 "group $s during the resume's identity step: one valid run_start, run_end ($((128 + n))) and run_summary of invocation 2 were exported" true q "$LG" "[e['ev'] for e in E if e['ev'] in ('run_start','run_end','run_summary')]==['run_start','run_end','run_summary'] and all(e['host']=='$host' and e['inv']==2 for e in E) and len(set(e['run'] for e in E))==1 and [ev('run_end')[0]['exit_code'],ev('run_summary')[0]['exit_code']]==[$((128 + n)),$((128 + n))]"
+    check 0 "group $s during the resume's identity step: no telemetry warning" '' sh -c '! grep -q "telemetry:" "$1"' _ "$C/sig.err"
+  done
+  # a completed helper is never replayed: a wrapper logs each helper subcommand and blocks inside resume or begin while the
+  # group gets the signal; durable resume bookkeeping and run_start happen once (invocation 2, not 3)
+  rm -rf "$D/impl-wrap"; cp -R "$D/impl" "$D/impl-wrap"; mv "$D/impl-wrap/scripts/council_telemetry.py" "$D/impl-wrap/scripts/council_telemetry_real.py"
+  cat >"$D/impl-wrap/scripts/council_telemetry.py" <<'PY'
+import os, sys, time
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+with open(os.environ["TM_WRAP_LOG"], "a") as f:
+    f.write(sub + "\n")
+if sub == os.environ.get("TM_SLOW_SUB"):
+    open(os.environ["TM_SLOW_MARK"], "w").close(); time.sleep(2)
+if sub == os.environ.get("TM_EXIT_SUB"):
+    sys.exit(143)
+os.execv(sys.executable, [sys.executable, "-B", os.path.join(os.path.dirname(os.path.abspath(__file__)), "council_telemetry_real.py")] + sys.argv[1:])
+PY
+  wsig() { local sub=$1; shift; TM_WRAP_LOG="$C/wrap.log" TM_SLOW_SUB=$sub TM_SLOW_MARK="$C/slow" gsig "$@"; }
+  for sub in resume begin; do for sg in SIGTERM:15 SIGINT:2 SIGHUP:1; do
+    s=${sg%%:*}; n=${sg##*:}
+    fcase "group-$sub-$s"; cp -Rp "$OK/run" "$R"
+    check 0 "group $s inside the resume's $sub helper: resume is still ended by the signal itself" '' wsig "$sub" "-$n" "$s" "$D/impl-wrap" "$C/slow" resume --run-dir "$R"
+    check 0 "group $s inside the resume's $sub helper: resume and begin each ran once, never replayed" '1 1' sh -c 'printf "%s %s" "$(grep -cx resume "$1")" "$(grep -cx begin "$1")"' _ "$C/wrap.log"
+    check 0 "group $s inside the resume's $sub helper: the durable invocation is 2, exported once with exit $((128 + n))" true q "$LG" "[[e['ev'],e['inv']] for e in E if e['ev'] in ('run_start','run_end','run_summary')]==[['run_start',2],['run_end',2],['run_summary',2]] and [ev('run_end')[0]['exit_code'],ev('run_summary')[0]['exit_code']]==[$((128 + n)),$((128 + n))]"
+    check 0 "group $s inside the resume's $sub helper: state.json records invocation 2" '' jq -e '.telemetry.inv==2' "$R/state.json"
+    check 0 "group $s inside the resume's $sub helper: no telemetry warning" '' sh -c '! grep -q "telemetry:" "$1"' _ "$C/sig.err"
+  done; done
+  # a helper status that looks like a signal, with no signal held, is a genuine failure: not rerun, the one approved warning
+  fcase wrap-exit
+  IMPL="$D/impl-wrap"; check 0 'helper exit 143 without a held signal: the run still completes with exit 0' '' run start TM_WRAP_LOG="$C/wrap.log" TM_EXIT_SUB=init -- start --config "$D/cfg.json" --run-dir "$R"; unset IMPL
+  check 0 'helper exit 143 without a held signal: init ran once, not rerun' 1 grep -cx init "$C/wrap.log"
+  check 0 'helper exit 143 without a held signal: one approved warning naming EIO' 'council: telemetry: write failed (EIO); telemetry off for this invocation' cat "$C/start.err"
+  check 0 'helper exit 143 without a held signal: exactly one warning' 1 warnings "$C/start.err"
+  # ---- the handover gate: released, timed out, interrupted ----
+  # a build task: plan r1 and r2 are each member's first two calls, so both hand over before exec/ratify
+  jq '.handover_at=0.5 | .executor="A" | .members[0].mode="edit" | .tasks[0].execute=true' "$D/cfg.json" >"$D/cfg-ho.json"
+  fcase gate-released
+  ( while [ ! -e "$C/stop" ]; do for f in "$R"/raw/*.pending; do [ -e "$f" ] && rm -f "$f"; done; sleep 0.3; done ) & releaser=$!
+  check 0 'gate released: a gated run whose notes are released completes with exit 0' '' run start COUNCIL_HANDOVER_GATE=1 -- start --config "$D/cfg-ho.json" --run-dir "$R"
+  : >"$C/stop"; wait "$releaser"
+  check 0 'gate released: each handover has one released gate record with a measured wait' true q "$T" 'len(ev("gate"))==len(ev("handover",stage="start"))>=1 and all(g["result"]=="released" and type(g["wait_s"])==int and "interrupted" not in g for g in ev("gate")) and [g["handover_seq"] for g in ev("gate")]==[h["seq"] for h in ev("handover",stage="start")]'
+  fcase gate-timeout
+  check 2 'gate timeout: an unreleased note stops the run with the failed checkpoint (exit 2)' '' run start COUNCIL_HANDOVER_GATE=1 COUNCIL_HANDOVER_GATE_TIMEOUT=1 -- start --config "$D/cfg-ho.json" --run-dir "$R"
+  check 0 'gate timeout: one timeout gate record, then run_end 2' true q "$T" '[[g["result"],g["wait_s"]>=1] for g in ev("gate")]==[["timeout",True]] and ev("run_end")[0]["exit_code"]==2'
+  fcase gate-interrupted
+  check 143 'gate interrupted: SIGTERM while a note waits for release exits 143' '' sigrun "$D/cfg-ho.json" SIGTERM "$R/raw/*.pending" COUNCIL_HANDOVER_GATE=1
+  check 0 'gate interrupted: the wait is recorded as interrupted, linked to its handover, before run_end' true q "$T" '(lambda g: [g["interrupted"],g["result"],g["handover_seq"]==ev("handover",stage="start")[0]["seq"],type(g["wait_s"])==int])(ev("gate")[0])==[True,None,True,True] and len(ev("gate"))==1 and E[-1]["ev"]=="run_end" and E[-1]["exit_code"]==143'
+  # ---- a user replacement ----
+  fcase replace; echo investigate >"$F/ask-once"
+  check 4 'replace: a member question pauses the run' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'replace: resume answers, replaces member A and completes' '' run again -- resume --run-dir "$R" --answer yes --replace A=opencode:p/m:medium
+  check 0 'replace: a replace event and both type-replace handover stages, linked, with the generation change' true q "$T" '(lambda r, h: [r["member_index"],r["old_kind"],r["old_model"],r["old_effort"],[x["stage"] for x in h],[x["type"] for x in h],[x["step"] for x in h],h[1]["handover_seq"]==h[0]["seq"],h[1]["gen"],h[1]["new_gen"]])(ev("replace")[0],ev("handover"))==[0,"opencode","p/m","medium",["start","end"],["replace","replace"],["replace","replace"],True,1,2] and len(ev("replace"))==1'
+  # ---- a turn without an assistant message: the current context is unknown ----
+  fcase noctx; printf '%s\n' '{"data":[{"type":"user"}]}' >"$F/message-page"
+  check 0 'missing current context: the run completes' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'missing current context: ctx_used and the token components are null, the session delta stays known' true q "$T" 'len(ev("call_end"))>=2 and all(e["ctx_used"] is None and e["tokens"]["input"] is None and e["tokens"]["output"] is None for e in ev("call_end")) and ev("call_end")[0]["tokens"]["total"]==6010'
+  # ---- state metadata that cannot be written safely ----
+  fcase metadata; cp -Rp "$OK/run" "$R"; mv "$R/state.json" "$C/state-real.json"; ln -s "$C/state-real.json" "$R/state.json"
+  meta_before=$(cksum "$T" "$C/state-real.json")
+  check 1 'unwritable state metadata: resume of the finished run keeps exit 1' '' run again -- resume --run-dir "$R"
+  check 0 'unwritable state metadata: one approved warning naming ELOOP' 'council: telemetry: write failed (ELOOP); telemetry off for this invocation' cat "$C/again.err"
+  check 0 'unwritable state metadata: exactly one warning; nothing recorded, the state target untouched' "1 $meta_before" sh -c 'printf "%s %s" "$(grep -c telemetry: "$1")" "$(cksum "$2" "$3")"' _ "$C/again.err" "$T" "$C/state-real.json"
+  rm "$R/state.json"; mv "$C/state-real.json" "$R/state.json"
+  check 1 'unwritable state metadata: the next invocation keeps exit 1' '' run again2 -- resume --run-dir "$R"
+  check 0 'unwritable state metadata: the next invocation records as invocation 2' true q "$T" '[s["inv"] for s in ev("run_start")]==[1,2]'
+  # ---- failure classes come only from provider-origin evidence ----
+  fcase quota; echo 2 >"$F/fail-results"; echo 'round 2 of|could not be used' >"$F/fail-pattern"
+  printf '%s\n' '{"data":[{"type":"assistant","error":{"message":"SECRETPROVIDER You exceeded your current quota"},"tokens":{"input":7,"output":1,"reasoning":0,"cache":{"read":2,"write":3}}},{"type":"user"}]}' >"$F/message-page"
+  check 2 'quota: a member that fails twice still checkpoints with exit 2' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'quota: both failed attempts are classified quota from the structured provider error' true q "$T" '[[e["failure_class"],e["attempt"],e["outcome"]] for e in ev("call_end",step="plan",round=2,member_index=0)]==[["quota",1,"failed"],["quota",2,"failed"]]'
+  check 0 'quota: one retry with the primary class of the failed attempt' true q "$T" '[[r["failure_class"],r["member_index"],r["round"]] for r in ev("retry")]==[["quota",0,2]]'
+  check 0 'quota: the round-2 votes count only the accepted tail and the failed member' true q "$T" '[[v["vote_agree"],v["failed_members"]] for v in ev("votes",round=2)]==[[1,1]]'
+  check 0 'quota: components are summed from a complete turn boundary' true q "$T" 'ev("call_end",round=1,member_index=0)[0]["tokens"]=={"input":7,"output":1,"reasoning":0,"cache_read":2,"cache_write":3,"total":6010}'
+  check 0 'quota: no provider text reaches telemetry' '' sh -c '! grep -q -e SECRETPROVIDER -e "exceeded your current" -e "injected failure" "$1" "$2"' _ "$T" "$LG"
+  rm -f "$F/fail-results" "$F/fail-pattern"
+  check 0 'quota: resume completes the run' '' run again -- resume --run-dir "$R"
+  check 0 'quota: attempts continue across invocations (resume relaunch is attempt 3)' true q "$T" '[e["attempt"] for e in ev("call_start",step="plan",round=2,member_index=0)]==[1,2,3]'
+  check 0 'quota: the checkpointed post of member 1 is reused, not relaunched' true q "$T" '[[r["member_index"],r["step"],r["round"],r["inv"]] for r in ev("reused")]==[[1,"plan",2,2]] and len(ev("call_start",step="plan",round=2,member_index=1))==1'
+  check 0 'quota: the replayed round-2 votes are flagged replay' true q "$T" '[v["replay"] for v in ev("votes",round=2)]==[False,True]'
+  fcase auth; echo 1 >"$F/fail-results"; echo 'round 1 of' >"$F/fail-pattern"
+  printf '%s\n' '{"data":[{"type":"assistant","error":{"message":"Invalid authentication credentials"},"tokens":{"input":7,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}},{"type":"user"}]}' >"$F/message-page"
+  check 0 'auth: a failed first attempt is retried and the run completes' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'auth: the failed attempt is auth, the retry ends ok' true q "$T" '[[e["outcome"],e.get("failure_class"),e["attempt"]] for e in ev("call_end",step="plan",round=1,member_index=0)]==[["failed","auth",1],["ok",None,2]] and [r["failure_class"] for r in ev("retry")]==["auth"]'
+  fcase literal; printf '[error] quota exceeded: SECRETLITERAL api key 401\n' >"$F/result-prefix"
+  check 0 'member-authored error text: the run completes' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'member-authored error text: every call stays ok and unclassified' true q "$T" 'all(e["outcome"]=="ok" and "failure_class" not in e for e in ev("call_end")) and not ev("retry")'
+  # a failed result through the real oc.sh show_result over a stubbed page: only the structured errors and outcome of the page
+  # that very result fetched (published by show_result on its private channel) are evidence; never the reply text, never a
+  # separately fetched page's reply used as a boundary, never an unprovable, stale or failed-fetch channel
+  tpage() { jq -cn --arg t "$1" --arg o "$2" --argjson e "${3:-null}" '{data:[{type:"idle",outcome:$o},{type:"assistant",content:[{type:"text",text:$t}],error:$e,tokens:{input:7,output:1,reasoning:0,cache:{read:0,write:0}}},{type:"user"}]}'; }
+  rcase() {  # label result-text outcome error-json|null separate-page-text [control ...] -> member 0's first plan attempt fails
+    fcase "$1"; echo 1 >"$F/fail-results"; echo 'round 1 of' >"$F/fail-pattern"; echo "$HERE/oc.sh" >"$F/real-oc"
+    tpage "$2" "$3" "$4" >"$F/member-result-page"; tpage "$5" "$3" >"$F/message-page"
+    local c; shift 5; for c in "$@"; do case "$c" in api-rc=*) echo "${c#*=}" >"$F/api-rc";; *) touch "$F/$c";; esac; done
+  }
+  rcheck() {  # label class [leftover] -> the run completes; the failed end and the retry carry class; one fetch; nothing leaks
+    check 0 "provenance $1: the run completes after the retry" '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+    check 0 "provenance $1: the failed end and the retry are $2" true q "$T" "[[e['outcome'],e.get('failure_class'),e['attempt'],e['result_exit_code']] for e in ev('call_end',step='plan',round=1,member_index=0)]==[['failed','$2',1,1],['ok',None,2,0]] and [r['failure_class'] for r in ev('retry')]==['$2']"
+    check 0 "provenance $1: the failed result fetched its page once, no other result fetch" '' test "$(wc -l <"$F/result-api.log")" -eq 1
+    check 0 "provenance $1: no reply or provider text reaches telemetry" '' sh -c '! grep -q -e SECRET -e "exceeded your current" -e "quota exceeded" -e "Invalid authentication" -e "Partial reply" "$1" "$2"' _ "$T" "$LG"
+    [ -n "${3:-}" ] || check 0 "provenance $1: no evidence channel file is left" '' sh -c '! ls "$1"/raw/*.oc-evidence* >/dev/null 2>&1' _ "$R"
+  }
+  q_err='{"message":"SECRETQ You exceeded your current quota"}'; a_err='{"message":"SECRETA Invalid authentication credentials"}'
+  rcase prefix-quota "$(printf 'Partial reply.\n\n[error] quota exceeded SECRETPFX (member-authored example)')" failed null 'Partial reply.'
+  rcheck prefix-quota cli_error
+  rcase prefix-auth "$(printf 'Partial reply.\n\n[error] Invalid authentication credentials SECRETPFXA')" failed null 'Partial reply.'
+  rcheck prefix-auth cli_error
+  rcase markers "$(printf 'Reply line.\n[error] quota exceeded SECRETEMB\n\n[outcome] failed\n\n[error] Invalid authentication credentials SECRETEMB')" failed null 'Unrelated reply.'
+  rcheck markers cli_error
+  rcase genuine-quota 'Partial reply.' failed "$q_err" 'Partial reply, later.'; rcheck genuine-quota quota
+  rcase genuine-auth 'Partial reply.' succeeded "$a_err" 'Another reply.'; rcheck genuine-auth auth
+  rcase api-failed 'Partial reply.' failed "$q_err" 'Partial reply, later.' api-rc=1; rcheck api-failed cli_error
+  rcase malformed 'Partial reply.' failed "$q_err" 'Partial reply.'; echo '{' >"$F/member-result-page"; rcheck malformed cli_error
+  rcase dropped 'Partial reply.' failed "$q_err" 'Partial reply, later.' drop-channel; rcheck dropped cli_error
+  rcase unwritable 'Partial reply.' failed "$q_err" 'Partial reply, later.' unwritable-channel; rcheck unwritable cli_error
+  rcase unreadable 'Partial reply.' failed "$q_err" 'Partial reply, later.' unreadable-channel; rcheck unreadable cli_error
+  rcase unmarked 'Partial reply.' failed "$q_err" 'Partial reply, later.'; printf '[error] You exceeded your current quota SECRETGARB\n' >"$F/garbage-channel"
+  rcheck unmarked cli_error
+  # a marked quota file left at the channel path that cannot be removed: no channel for this result, the old file is never read
+  rcase stale 'Partial reply.' failed null 'Partial reply.'
+  cat >"$F/wait-hook" <<HOOK
+#!/bin/sh
+for e in "$R"/raw/*.err; do v="\${e%.err}.oc-evidence"; [ -e "\$v" ] || { printf 'oc-result-evidence 1\n[error] You exceeded your current quota SECRETSTALE\n' >"\$v"; chflags uchg "\$v"; }; done
+HOOK
+  chmod +x "$F/wait-hook"
+  rcheck stale cli_error leftover
+  check 0 'provenance stale: the unremovable channel file is still the planted one' '' sh -c 'for v in "$1"/raw/*.oc-evidence; do grep -q SECRETSTALE "$v" || exit 1; done' _ "$R"
+  chflags nouchg "$R"/raw/*.oc-evidence 2>/dev/null
+  # a succeeded reply that only contains error-looking text: ok, unclassified, no retry
+  fcase ok-text; echo 'round 1 of' >"$F/fail-pattern"; echo "$HERE/oc.sh" >"$F/real-oc"
+  tpage "$(printf 'Plan.\n[error] quota exceeded SECRETOK\n[outcome] failed\n```json\n{"vote":"propose","proposal":"Deterministic plan.","questions":[]}\n```')" succeeded >"$F/member-ok-page"
+  check 0 'provenance ok-text: the run completes' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'provenance ok-text: every call stays ok and unclassified, no retry' true q "$T" 'all(e["outcome"]=="ok" and "failure_class" not in e for e in ev("call_end")) and not ev("retry")'
+  check 0 'provenance ok-text: both round-1 replies came through the real show_result, one fetch each' '' test "$(wc -l <"$F/result-api.log")" -eq 2
+  check 0 'provenance ok-text: no evidence channel file is left' '' sh -c '! ls "$1"/raw/*.oc-evidence* >/dev/null 2>&1' _ "$R"
+  fcase tails; echo 'round 1 of' >"$F/bad-tail-once"; echo 'round 2 of' >"$F/empty-once"
+  check 0 'unusable replies: the run completes after the retries' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'unusable replies: no_valid_json_tail and empty_output, each retried once' true q "$T" '[[e["step"],e["round"],e["failure_class"]] for e in ev("call_end",outcome="failed")]==[["plan",1,"no_valid_json_tail"],["plan",2,"empty_output"]] and [r["failure_class"] for r in ev("retry")]==["no_valid_json_tail","empty_output"]'
+  # ---- question sources and contract checkpoints ----
+  fcase contract; touch "$F/ask-once"; echo investigate >"$F/ask-once"
+  check 4 'contract checkpoint: a member question pauses the run first' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  jq '.status="running" | .phase="exec"' "$R/state.json" >"$R/s.tmp" && mv "$R/s.tmp" "$R/state.json"
+  check 4 'contract checkpoint: an execute:false task in an execution phase pauses with exit 4' '' run again -- resume --run-dir "$R"
+  check 0 'contract checkpoint: question sources member then contract' true q "$T" '[[x["source"],x["count"]] for x in ev("questions")]==[["member",1],["contract",1]]'
+  jq --arg d "$D/proj" '.map_code=true | .map_prepass={}' "$D/cfg.json" >"$D/cfg-proposal.json"
+  fcase mapper-confirm
+  check 4 'mapper confirmation: start pauses for the mapper tuple' '' run start -- start --config "$D/cfg-proposal.json" --run-dir "$R"
+  check 0 'mapper confirmation: the question source is mapper' true q "$T" '[[x["source"],x["count"]] for x in ev("questions")]==[["mapper",1]] and ev("run_start")[0]["map_code"] is True'
+  # ---- the mapper pre-pass ----
+  jq '.map_code=true | .map_prepass={kind:"opencode",model:"p/m",effort:"medium"}' "$D/cfg.json" >"$D/cfg-map.json"
+  printf '%s\n' "{\"candidates\":[{\"path\":\"a.py\",\"lines\":[1,2]},{\"path\":\"../escape\"}],\"unresolved\":[],\"stopped_reason\":\"done\"}" >"$D/mapper-response"
+  printf 'one\ntwo\n' >"$D/proj/a.py"
+  fcase mapper; cp "$D/mapper-response" "$F/"
+  check 4 'mapper: start reaches the map review' '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
+  check 0 'mapper: the mapper launch is one call with step map and no member' true q "$T" '[[c["step"],"member_index" in c,c["model"],c["effort"],c["attempt"]] for c in ev("call_start")]==[["map",False,"p/m","medium",1]] and [[e["outcome"],e["call_seq"]==ev("call_start")[0]["seq"]] for e in ev("call_end")]==[["ok",True]]'
+  check 0 'mapper: one terminal record with proposed, validated, captured and repair counts' true q "$T" '(lambda m: [m["status"],m["proposed_count"],m["validated_count"],m["captured_count"],m["capture_total"],m["repairs_count"],m["repaired"],m["mapper_seq"]==ev("call_start")[0]["seq"],m["tokens"]["total"],m["cost_usd"]])(ev("mapper")[0])==["partial",2,1,1,1,0,False,True,6010,0.01]'
+  printf '{"action":"keep"}\n' >"$C/keep.json"
+  check 0 'mapper: keep continues the task to completion' '' run keep -- resume --run-dir "$R" --map-decision "$C/keep.json"
+  check 0 'mapper: the review decision is recorded without content' true q "$T" '[[r["action"],type(r["review_s"]) in (int,float)] for r in ev("mapper_review")]==[["keep",True]]'
+  check 0 'mapper: the operation has its own start identity and a terminal record at stage done' true q "$T" '(lambda s, m: [m["op_seq"]==s["seq"],m["stage"],s["task_index"],s["model"]])(ev("mapper_start")[0],ev("mapper")[0])==[True,"done",0,"p/m"] and len(ev("mapper_start"))==1'
+  fcase mapper-orphan; cp "$D/mapper-response" "$F/"; echo 4 >"$F/wait-sleep"
+  check 143 'mapper recovery: SIGTERM while the mapper call runs' '' sigrun "$D/cfg-map.json" SIGTERM wait
+  rm -f "$F/wait-sleep"
+  check 0 'mapper recovery: the interrupted operation and its call stay open, nothing invented' true q "$T" 'len(ev("mapper_start"))==1 and len(ev("call_start",step="map"))==1 and not ev("call_end") and not ev("mapper")'
+  check 4 'mapper recovery: resume recovers the completed reply and reaches the map review' '' run again -- resume --run-dir "$R"
+  check 0 'mapper recovery: one end linked to the original dispatch and one terminal record linked to its operation' true q "$T" '[[e["call_seq"]==ev("call_start")[0]["seq"],e["inv"],e["outcome"]] for e in ev("call_end")]==[[True,2,"ok"]] and [[m["op_seq"]==ev("mapper_start")[0]["seq"],m["mapper_seq"]==ev("call_start")[0]["seq"],m["stage"],m["status"],m["inv"]] for m in ev("mapper")]==[[True,True,"done","partial",2]] and len(ev("call_start"))==1'
+  check 0 'mapper recovery: the latest summary counts the one paid call and its spend once' true q "$LG" '(lambda s: [s["calls"],s["ok"],s["incomplete"],s["tokens_known"],s["cost_usd_known"]])(ev("run_summary")[-1])==[1,1,0,6010,0.01]'
+  fcase mapper-session; touch "$F/new-fail-once"
+  check 4 'mapper session failure: start reaches the map review' '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
+  check 0 'mapper session failure: one terminal record at stage session, no call invented' true q "$T" '[[m["status"],m["stage"],m["op_seq"]==ev("mapper_start")[0]["seq"],m["mapper_seq"]] for m in ev("mapper")]==[["unavailable","session",True,None]] and not ev("call_start") and not ev("call_end")'
+  fcase mapper-prepare
+  check 2 'mapper preparation checkpoint failure: start stops with exit 2' '' run start FAIL_STATE_JQ='any(.map_prepasses[]?; .status=="preparing")' -- start --config "$D/cfg-map.json" --run-dir "$R"
+  check 0 'mapper preparation checkpoint failure: one aborted terminal record at stage prepare, no call' true q "$T" '[[m["status"],m["stage"],m["op_seq"]==ev("mapper_start")[0]["seq"]] for m in ev("mapper")]==[["aborted","prepare",True]] and not ev("call_start")'
+  fcase mapper-timeout; cp "$D/mapper-response" "$F/"; touch "$F/mapper-timeout"
+  check 4 'mapper timeout: start reaches the map review' '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
+  check 0 'mapper timeout: a timeout event linked to the mapper call, a failed timeout end and an unavailable map at stage wait' true q "$T" '(lambda c: [[t["call_seq"]==c["seq"],t["timeout_s"],t["step"]] for t in ev("timeout")]==[[True,120,"map"]] and [[e["outcome"],e["failure_class"]] for e in ev("call_end")]==[["failed","timeout"]] and [[m["status"],m["stage"]] for m in ev("mapper")]==[["unavailable","wait"]])(ev("call_start")[0])'
+  check 0 'mapper timeout: the summary counts the timeout' true q "$LG" 'ev("run_summary")[0]["timeouts"]==1'
+  fcase mapper-provider; cp "$D/mapper-response" "$F/"; touch "$F/mapper-wait-fail"
+  check 4 'mapper provider error: start reaches the map review' '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
+  check 0 'mapper provider error: classified quota from the adapter diagnostics, no text kept' true q "$T" '[[e["outcome"],e["failure_class"]] for e in ev("call_end")]==[["failed","quota"]]'
+  check 0 'mapper provider error: no provider text reaches telemetry' '' sh -c '! grep -q -e SECRETMAPPROVIDER -e "exceeded your current" "$1" "$2"' _ "$T" "$LG"
+  # a failed mapper result through the real oc.sh show_result, with empty adapter stderr: the structured assistant error of the
+  # mapper messages, or the adapter block after the reply text those messages hold; never the mapper's own text
+  mcase() {  # label result-page-text messages-text outcome error-json|null -> a mapper case whose result fails
+    fcase "$1"; cp "$D/mapper-response" "$F/"; echo "$HERE/oc.sh" >"$F/real-oc"
+    tpage "$2" "$4" "$5" >"$F/mapper-result-page"; tpage "$3" "$4" "$( [ "$1" = map-structured ] && echo "$5" || echo null)" | jq -c '.data|=reverse' >"$F/messages-page"
+  }
+  mtext=$(printf 'Mapper text.\n\n[error] rate limit SECRETMAPM'); ptext=$(printf 'Mapper partial.\n\n[error] quota exceeded SECRETMAPP (mapper-authored)')
+  mleft() { test -z "$(find "$R" \( -name '*result-evidence*' -o -name '*result-recovery-evidence*' \) -print)"; }
+  mlink() { q "$T" 'len(ev("call_start"))==1 and len(ev("mapper_start"))==1 and [[m["op_seq"]==ev("mapper_start")[0]["seq"],m["mapper_seq"]==ev("call_start")[0]["seq"]] for m in ev("mapper")]==[[True,True]] and [e["call_seq"] for e in ev("call_end")]==[ev("call_start")[0]["seq"]]'; }
+  for spec in 'map-structured|Mapper partial.|Mapper partial, later.|{"message":"SECRETMAPQ You exceeded your current quota"}|quota' \
+              'map-channel-auth|Mapper partial.|Mapper partial, later.|{"message":"SECRETMAPA Invalid authentication credentials"}|auth' \
+              'map-channel-quota|Mapper partial.|Unrelated mapper text.|{"message":"SECRETMAPQ You exceeded your current quota"}|quota' \
+              'map-prefix|-|Mapper partial.|null|cli_error' \
+              'map-member|-|-|null|cli_error'; do
+    IFS='|' read -r lbl rt mt er want <<<"$spec"
+    [ "$lbl" = map-member ] && { rt=$mtext; mt=$mtext; }; [ "$lbl" = map-prefix ] && rt=$ptext
+    mcase "$lbl" "$rt" "$mt" failed "$er"
+    check 4 "mapper result failure ($lbl): start reaches the map review" '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
+    check 0 "mapper result failure ($lbl): the failed end is $want and the map unavailable at stage wait" true q "$T" "[[e['outcome'],e['failure_class']] for e in ev('call_end')]==[['failed','$want']] and [[m['status'],m['stage']] for m in ev('mapper')]==[['unavailable','wait']]"
+    check 0 "mapper result failure ($lbl): one paid call, one operation, the terminal record linked to both" true mlink
+    check 0 "mapper result failure ($lbl): one result fetch" '' sh -c 'test "$(wc -l <"$1")" -eq 1' _ "$F/result-api.log"
+    check 0 "mapper result failure ($lbl): no evidence channel file left" '' mleft
+    check 0 "mapper result failure ($lbl): no provider or mapper text reaches telemetry" '' sh -c '! grep -q -e SECRETMAP -e "exceeded your current" -e "Invalid authentication" -e "rate limit" "$1" "$2"' _ "$T" "$LG"
+  done
+  for spec in 'map-recover-auth|Mapper partial.|Mapper partial, later.|{"message":"SECRETMAPA Invalid authentication credentials"}|auth' \
+              'map-recover-prefix|-|Mapper partial.|null|cli_error'; do
+    IFS='|' read -r lbl rt mt er want <<<"$spec"; [ "$lbl" = map-recover-prefix ] && rt=$ptext
+    mcase "$lbl" "$rt" "$mt" failed "$er"
+    mv "$F/mapper-result-page" "$C/page"; echo 4 >"$F/wait-sleep"
+    check 143 "mapper recovery result failure ($lbl): SIGTERM while the mapper call runs" '' sigrun "$D/cfg-map.json" SIGTERM wait
+    rm -f "$F/wait-sleep"; mv "$C/page" "$F/mapper-result-page"
+    check 4 "mapper recovery result failure ($lbl): resume reaches the map review" '' run again -- resume --run-dir "$R"
+    check 0 "mapper recovery result failure ($lbl): the recovered end is $want, the map unavailable at stage recover" true q "$T" "[[e['outcome'],e['failure_class'],e['inv']] for e in ev('call_end')]==[['failed','$want',2]] and [[m['status'],m['stage'],m['inv']] for m in ev('mapper')]==[['unavailable','recover',2]]"
+    check 0 "mapper recovery result failure ($lbl): linked to the original dispatch and operation, no relaunch" true mlink
+    check 0 "mapper recovery result failure ($lbl): one result fetch" '' sh -c 'test "$(wc -l <"$1")" -eq 1' _ "$F/result-api.log"
+    check 0 "mapper recovery result failure ($lbl): no evidence channel file left" '' mleft
+    check 0 "mapper recovery result failure ($lbl): no provider or mapper text reaches telemetry" '' sh -c '! grep -q -e SECRETMAP -e "exceeded your current" -e "quota exceeded" -e "Invalid authentication" "$1" "$2"' _ "$T" "$LG"
+  done
+  # a failure while the failure archive itself is written: exactly one aborted terminal record at the current stage
+  mcase map-archive 'Mapper partial.' 'Mapper partial.' failed '{"message":"provider error"}'
+  printf '#!/bin/sh\nmkdir -p "%s"\n' "$R/map/$(printf only | shasum -a 256 | cut -c1-16)/coverage.json.tmp" >"$F/result-hook"; chmod +x "$F/result-hook"
+  check 2 'mapper archive failure: an unwritable coverage artifact stops with the failed checkpoint (exit 2)' '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
+  check 0 'mapper archive failure: the observed call ends once and the operation has exactly one terminal record, aborted at stage wait' true q "$T" '[[e["outcome"],e["failure_class"]] for e in ev("call_end")]==[["failed","cli_error"]] and [[m["status"],m["stage"],m["op_seq"]==ev("mapper_start")[0]["seq"]] for m in ev("mapper")]==[["aborted","wait",True]]'
+  check 0 'mapper archive failure: the result evidence channel was already removed' '' mleft
+  # ---- host identity ----
+  fcase seed; mkdir -p "$C/home"
+  check 0 'no hardware UUID: the run completes' '' run start "PATH=$D/noioreg:$D/bin:$PATH" HOME="$C/home" -- start --config "$D/cfg.json" --run-dir "$R"
+  seedf="$C/home/.config/council-telemetry/host-seed"
+  check 0 'no hardware UUID: a 0600 random seed in a 0700 ~/.config/council-telemetry, outside the ledger' '700 600' modes "$(dirname "$seedf")" "$seedf"
+  check 0 'no hardware UUID: the seed is 128 random bits in hex' '' grep -Eqx '[0-9a-f]{32}' "$seedf"
+  shost=$(tm_host "$(cat "$seedf")")
+  check 0 'no hardware UUID: host = the salted seed hash, also the ledger name' true q "$C/ledger/$shost.jsonl" "all(e['host']=='$shost' for e in E) and len(E)>5"
+  R="$C/run2"
+  check 0 'no hardware UUID: a second run reuses the same seed' '' run start2 "PATH=$D/noioreg:$D/bin:$PATH" HOME="$C/home" -- start --config "$D/cfg.json" --run-dir "$R"
+  check 0 'no hardware UUID: same host for the second run' true q "$R/telemetry.jsonl" "all(e['host']=='$shost' for e in E)"
+  # ---- a legacy run dir starts recording with partial history ----
+  fcase legacy; cp -Rp "$OK/run" "$R"; rm -f "$T" "$R/telemetry.shipped"
+  jq 'del(.telemetry)' "$R/state.json" >"$R/s.tmp" && mv "$R/s.tmp" "$R/state.json"
+  check 1 'legacy run: resume of the finished run keeps exit 1' '' run again -- resume --run-dir "$R"
+  check 0 'legacy run: the first recorded invocation is inv 1 with partial history and a gap flag' true q "$T" '[[s["inv"],s["history"],s["gap"],s["command"]] for s in ev("run_start")]==[[1,"partial",True,"resume"]]'
+  check 0 'legacy run: a new identity is persisted' true jq -e '.telemetry.inv==1 and (.telemetry.run|test("^[0-9a-f]{32}$"))' "$R/state.json"
+)
+# Loaded functions under /bin/bash: trap ownership in bash 3.2, Claude timeout/leftover/stale cleanup.
+telemetry_unit_tests() (
+  D="$scratch/telemetry-unit"; mkdir -p "$D/fc"; write_tm_tools "$D"; TQ="$D/tq.py"; host=$(tm_host "$TM_UUID")
+  q() { python3 "$TQ" "$@"; }
+  mkrun() {  # dir kind -> a minimal resumable run
+    mkdir -p "$1/raw" "$1/prompts" "$1/posts"; printf 'prompt\n' >"$1/prompts/p.md"
+    jq -n --arg d "$D" --arg k "$2" '{status:"running",phase:"plan",round:1,task_idx:0,task_id:"t",config:{dir:$d,max_rounds:2,timeout_s:30,handover_at:0.5,executor:null,max_turns:3,tasks:[{id:"t",text:"x",execute:false}],members:[]},
+      members:[{id:"A",kind:$k,model:"fake",effort:"high",permission_mode:"plan",mode:"read",session:null,fresh:false,gen:1,calls:0,session_calls:0,ctx_used:0,ctx_limit:1000,session_tokens:0,session_cost:0,retired:[],inflight:null}],
+      last_votes:[],notices:[],answers:[],results:[],log:[]}' >"$1/state.json"
+  }
+  drive() {  # run-dir script -> runs the script in a fresh /bin/bash main shell with council.sh loaded and telemetry armed
+    COUNCIL_TELEMETRY_DIR="$D/ledger" FAKE_CL_DIR="$D/fc" PATH="$D/fake-claude:$PATH" /bin/bash -c '
+      HERE=$(cd "$(dirname "$0")" && pwd)
+      load() { eval "$(sed "/^# .* commands /,\$d" "$HERE/$1")"; }; load council.sh
+      RUN=$1; DIR=$2; N=1; MAXT=3; TIMEOUT=2; MAP_PREPASS=0; CODEMAP=0; MAXR=2; render_transcript() { :; }; fixture_prompt() { echo fixture; }
+      tm_arm_resume; load_state; TIMEOUT=2
+      eval "$3"' "$HERE/council.sh" "$1" "$D" "$2"
+  }
+  mkrun "$D/own" opencode
+  check 3 'trap ownership (bash 3.2): subshells, command substitutions and subshell EXIT traps never finalize; the main shell keeps exit 3' '' drive "$D/own" '( exit 7 ); x=$(exit 5); y=$( ( trap "echo sub" EXIT; exit 6 ) ); sub() ( trap ":" EXIT; exit 0 ); sub; exit 3'
+  check 0 'trap ownership: exactly one run_end (exit 3) and one export' true q "$D/own/telemetry.jsonl" "$D/ledger/$host.jsonl" '[e["exit_code"] for e in F[0] if e["ev"]=="run_end"]==[3] and [e["exit_code"] for e in F[1] if e["ev"]=="run_summary"]==[3]'
+  mkrun "$D/cto" claude; echo 30 >"$D/fc/sleep"
+  check 1 'claude timeout: a call killed at its deadline (twice) fails the step' '' drive "$D/cto" 'run_step r1 fixture_prompt "{\"id\":\"t\"}" 1'
+  rm -f "$D/fc/sleep"
+  check 0 'claude timeout: both attempts end killed with failure class timeout' true q "$D/cto/telemetry.jsonl" '[[e["outcome"],e["failure_class"],e["attempt"]] for e in ev("call_end")]==[["killed","timeout",1],["killed","timeout",2]]'
+  check 0 'claude timeout: timeout and kill_group (stopped) events per attempt, a retry between them' true q "$D/cto/telemetry.jsonl" '[e["ev"] for e in E if e["ev"] in ("call_start","timeout","kill_group","call_end","retry")]==["call_start","timeout","kill_group","call_end","retry","call_start","timeout","kill_group","call_end"] and all(k["result"]=="stopped" and k["reason"]=="timeout" for k in ev("kill_group"))'
+  check 0 'claude timeout: no pid or process group in telemetry' true q "$D/cto/telemetry.jsonl" 'not any(k in e for e in E for k in ("pid","pgid","pids"))'
+  mkrun "$D/left" claude; : >"$D/fc/leave-once"
+  check 0 'claude leftover: a call that answers but leaves processes in its group is accepted' '' drive "$D/left" 'run_step r1 fixture_prompt "{\"id\":\"t\"}" 1'
+  check 0 'claude leftover: the call stays ok; the cleanup is a separate kill_group event' true q "$D/left/telemetry.jsonl" '[e["outcome"] for e in ev("call_end")]==["ok"] and [[k["reason"],k["result"],k["call_seq"]==ev("call_start")[0]["seq"]] for k in ev("kill_group")]==[["leftover","stopped",True]]'
+  mkrun "$D/stale" claude; echo 30 >"$D/fc/sleep"
+  check 0 'stale call: an orchestrator launches a call and exits without collecting it' '' drive "$D/stale" 'TM_STEP=plan; TM_ROUND=1; launch 0 "$RUN/prompts/p.md" t-r1; sleep 1; exit 0'
+  rm -f "$D/fc/sleep"
+  check 0 'stale call: resume stops it' '' drive "$D/stale" 'trap_calls; reap_stale_calls'
+  check 0 'stale call: one killed end for the original launch, a stale kill_group, nothing invented' true q "$D/stale/telemetry.jsonl" '[[e["outcome"],e["call_seq"]==ev("call_start")[0]["seq"],e["inv"]] for e in ev("call_end")]==[["killed",True,2]] and [[k["reason"],k["result"],k["call_seq"]==ev("call_start")[0]["seq"]] for k in ev("kill_group")]==[["stale","stopped",True]] and len(ev("call_start"))==1'
+  mkrun "$D/stale-gen" claude; echo 30 >"$D/fc/sleep"
+  check 0 'stale call of another generation: an orchestrator launches a call and exits' '' drive "$D/stale-gen" 'TM_STEP=plan; TM_ROUND=1; launch 0 "$RUN/prompts/p.md" t-r1; sleep 1; exit 0'
+  rm -f "$D/fc/sleep"; jq '.members[0].gen=2' "$D/stale-gen/state.json" >"$D/stale-gen/s.tmp" && mv "$D/stale-gen/s.tmp" "$D/stale-gen/state.json"
+  check 0 'stale call of another generation: resume stops it' '' drive "$D/stale-gen" 'trap_calls; reap_stale_calls'
+  check 0 'stale call of another generation: the kill is recorded but the generation-1 call is not closed by generation-2 cleanup' true q "$D/stale-gen/telemetry.jsonl" 'not ev("call_end") and [[k["reason"],k.get("call_seq")] for k in ev("kill_group")]==[["stale",None]]'
+  mkrun "$D/surv" claude; echo 30 >"$D/fc/sleep"
+  check 1 'surviving group: a timed-out call whose group survives SIGKILL fails the step without a retry' '' drive "$D/surv" 'kill_group() { TM_KG=survived; return 1; }; run_step r1 fixture_prompt "{\"id\":\"t\"}" 1'
+  rm -f "$D/fc/sleep"; for p in $(cat "$D/fc/pids" 2>/dev/null); do kill -KILL -- "-$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done; rm -f "$D/fc/pids"
+  check 0 'surviving group: timeout, a survived kill_group and one failed group_survived end, no retry' true q "$D/surv/telemetry.jsonl" '[e["ev"] for e in E if e["ev"] in ("call_start","timeout","kill_group","call_end","retry")]==["call_start","timeout","kill_group","call_end"] and [[e["outcome"],e["failure_class"],e["exit_code"]] for e in ev("call_end")]==[["failed","group_survived",None]] and ev("kill_group")[0]["result"]=="survived"'
+  mkrun "$D/codemap" opencode
+  cm_stub='python3() { if [ "$2" = validate ]; then echo "{\"guard_status\":\"changed\"}"; return 0; fi; command python3 "$@"; }'
+  check 1 'stale replay in the run: a changed guarded source fails the step' '' drive "$D/codemap" "$cm_stub; CODEMAP=1; CODEMAP_STEP=1; TM_STEP=plan; TM_ROUND=1; codemap_finish_step t r1"
+  jq '.codemap_version=1 | .codemap_pending={task:"t",step:"r1"}' "$D/codemap/state.json" >"$D/codemap/s.tmp" && mv "$D/codemap/s.tmp" "$D/codemap/state.json"
+  check 0 'stale replay on resume: a guarded source changed while checkpointed' '' drive "$D/codemap" "$cm_stub; codemap_resume_check"
+  check 0 'stale replay: both hooks are recorded with their step, round and task' true q "$D/codemap/telemetry.jsonl" '[[s["where"],s["step"],s["round"],s["task_index"]] for s in ev("stale_replay")]==[["in_run","plan",1,0],["resume","plan",1,0]]'
+  check 0 'split failure: an invalid approved split contract checkpoints' '' drive "$D/codemap" 'checkpoint_split_invalid t "baseline drift SECRETSPLIT"'
+  check 0 'split failure: one split_failed event for the task, no contract text' true q "$D/codemap/telemetry.jsonl" '[[s["task_index"],s["inv"]] for s in ev("split_failed")]==[[0,3]] and "SECRETSPLIT" not in open("'"$D/codemap/telemetry.jsonl"'").read()'
+)
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests telemetry_process_tests telemetry_fault_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

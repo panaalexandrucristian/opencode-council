@@ -236,19 +236,40 @@ wait_idle() {  # sid ; returns 0 idle, 2 timeout, 3 blocked on permission, 1 err
   return 2
 }
 
-show_result() {  # sid -> available text; 0 only for a succeeded turn without assistant errors
-  api GET "/api/session/$1/message?order=desc&limit=40" | jq -rs '
-    (if length==1 and (.[0]|type)=="object" and (.[0].data|type)=="array"
+# the current turn of one message page (newest first): its reply text, its structured assistant errors and its outcome
+RESULT_TURN='(if length==1 and (.[0]|type)=="object" and (.[0].data|type)=="array"
      then .[0].data else error("invalid message response") end) as $m
     | ($m | map(.type=="user") | index(true)) as $u
     | ($m | if $u == null then . else .[:$u] end | reverse) as $turn
     | ($turn | map(select(.type=="assistant") | .content[]? | select(.type=="text") | .text) | join("\n")) as $text
     | ($turn | map(select(.type=="assistant" and .error != null) | (.error.message // "(unspecified error)"))) as $errs
-    | ($turn | map(select(.type=="idle") | .outcome) | last) as $outcome
+    | ($turn | map(select(.type=="idle") | .outcome) | last) as $outcome'
+RESULT_TEXT='
     | (if $text == "" then "(no text output in this turn)" else $text end),
       (if ($errs|length) > 0 then "\n[error] " + ($errs|join("; ")) else empty end),
       (if $outcome != "succeeded" then "\n[outcome] " + ($outcome // "unavailable") else empty end),
-      (if ($errs|length)>0 or $outcome != "succeeded" then null | halt_error(1) else empty end)' || return 1
+      (if ($errs|length)>0 or $outcome != "succeeded" then null | halt_error(1) else empty end)'
+RESULT_EVIDENCE='
+    | "oc-result-evidence 1",
+      (if ($errs|length) > 0 then "[error] " + ($errs|join("; ")) else empty end),
+      (if $outcome != "succeeded" then "[outcome] " + ($outcome // "unavailable") else empty end)'
+show_result() {  # sid -> available text; 0 only for a succeeded turn without assistant errors
+  # OC_RESULT_EVIDENCE=<file> (internal, set by council.sh telemetry): the page is fetched once into a private file and,
+  # only when that fetch succeeded and the page is valid, the adapter's own block of that same page (the marker line, the
+  # structured assistant errors and a non-succeeded outcome; never reply text) is published to <file>. Output, stderr
+  # and status are those of the ordinary pipeline; a channel that cannot be written is simply not published.
+  local page arc rc ev=${OC_RESULT_EVIDENCE-}
+  if [ -z "$ev" ] || ! page=$(mktemp 2>/dev/null); then
+    api GET "/api/session/$1/message?order=desc&limit=40" | jq -rs "$RESULT_TURN$RESULT_TEXT" || return 1
+    return 0
+  fi
+  api GET "/api/session/$1/message?order=desc&limit=40" >"$page"; arc=$?
+  jq -rs "$RESULT_TURN$RESULT_TEXT" <"$page"; rc=$?
+  if [ $arc -eq 0 ]; then
+    ( umask 077; jq -rs "$RESULT_TURN$RESULT_EVIDENCE" <"$page" >"$ev.tmp" && mv -f "$ev.tmp" "$ev" ) 2>/dev/null
+  fi
+  rm -f "$page" "$ev.tmp" 2>/dev/null
+  [ $arc -eq 0 ] && [ $rc -eq 0 ] || return 1
 }
 
 # -------------------------------------------------------------- commands ----
