@@ -24,8 +24,9 @@
 #   "members": [ {"id":"A","kind":"opencode","model":"openai/gpt-6-astra","effort":"high","mode":"read","handover_at":0.35},
 #                {"id":"B","kind":"claude","model":"sonnet","effort":"high","mode":"read"} ]
 # }
-# mode read -> opencode agent "plan" / claude --permission-mode plan; mode edit -> "build" / acceptEdits.
-# Only the executor may be mode edit. effort -> OpenCode model variant / claude --effort.
+# Every member runs with permissions bypassed: OpenCode sessions get an allow-all ruleset and auto-approval (--auto),
+# claude runs with --permission-mode bypassPermissions. mode read -> opencode agent "plan" / claude without the edit
+# tools (--disallowedTools); mode edit -> "build" / all tools. Only the executor may be mode edit. effort -> OpenCode model variant / claude --effort.
 #
 # Protocol: round 1 every member posts a complete proposal. From round 2 the candidate is the current position of
 # a rotating proposer (member (r-2) mod N); everyone sees the others' previous posts and votes agree/disagree
@@ -1239,7 +1240,7 @@ validate_config() {  # $1 = config file -> prints normalised config json
       | .max_turns = (.max_turns // 30)
       | .style = (.style // "normal")
       | .members |= [ .[] | {style: $s, handover_at: $h} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
-                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "normal"' "$1")" --argjson h "$(jq -r '.handover_at' "$1")" "$1"
+                                 else {permission_mode:"bypassPermissions"} end) ]' --arg s "$(jq -r '.style // "normal"' "$1")" --argjson h "$(jq -r '.handover_at' "$1")" "$1"
 }
 
 check_opencode_models() {  # $1 = normalised config json -> validates model + variant against the live server; prints ctx limits json
@@ -1333,7 +1334,7 @@ cost_note() {  # config only; measured comparisons, never a dollar forecast or a
 # --------------------------------------------------------------- adapters ----
 # member call = launch (async) + collect (blocking). Raw reply -> $RUN/raw/<tag>-<id>.md ; tokens -> state.
 oc_new_session() {  # idx -> prints ses_...
-  local i=$1 sid; sid=$("$OC" new --dir "$DIR" --model "$(mget $i model)" --variant "$(mget $i effort)" --agent "$(mget $i agent)" \
+  local i=$1 sid; sid=$("$OC" new --dir "$DIR" --model "$(mget $i model)" --variant "$(mget $i effort)" --agent "$(mget $i agent)" --auto \
         --title "Council $(mid $i) g$(mget $i gen) ($(mget $i model))") || return 1
   printf '%s' "$sid"
 }
@@ -1416,14 +1417,14 @@ launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inf
   tm_call_start $i; TM_LI=$i
   if [ "$kind" = opencode ]; then
     if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(oc_new_session $i) || return 1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s'; TM_NEW[$i]=1; fi
-    "$OC" prompt "$sid" --file "$pf" --no-wait >/dev/null || return 1
+    "$OC" prompt "$sid" --file "$pf" --no-wait --auto >/dev/null || return 1
     sts --argjson i $i --arg t "$tag" '.members[$i].inflight={tag:$t}'
   else
-    local args=(-p --output-format json --model "$(mget $i model)" --effort "$(mget $i effort)" --permission-mode "$(mget $i permission_mode)" --max-turns "$MAXT")
+    local args=(-p --output-format json --model "$(mget $i model)" --effort "$(mget $i effort)" --permission-mode bypassPermissions --max-turns "$MAXT")
     if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(cl_new_session); args+=(--session-id "$sid"); TM_NEW[$i]=1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s|.members[$i].cl_started=false'
     else args+=(--resume "$sid"); fi
     if [ "$(mget $i mode)" = read ]; then args+=(--disallowedTools "Edit Write MultiEdit NotebookEdit")
-    else args+=(--allowedTools "Bash Edit Write MultiEdit NotebookEdit"); fi   # headless: nobody can answer a permission prompt
+    fi   # permissions are bypassed (headless: nobody can answer a prompt); a read member only loses the edit tools
     # every attempt (first, automatic retry, each resume) has its own raw file: <tag>-<id>-a<N>.json, N = first free number
     local n=1 out; while [ -e "$RUN/raw/$tag-$(mid $i)-a$n.json" ]; do n=$((n+1)); done; out="$RUN/raw/$tag-$(mid $i)-a$n.json"
     # own session, so its own process group (pgid = $! = claude itself after the execs); no controlling terminal
@@ -1444,7 +1445,7 @@ collect() {  # idx -> raw text in $RUN/raw/<tag>-<id>.md ; returns 0 ok / 1 fail
   kind=$(mget $i kind); sid=$(mget $i session); id=$(mid $i); tag=$(st ".members[$i].inflight.tag")
   out="$RUN/raw/$tag-$id.md"
   if [ "$kind" = opencode ]; then
-    "$OC" wait "$sid" --timeout "$TIMEOUT" >/dev/null 2>"$RUN/raw/$tag-$id.err"; rc=$?
+    "$OC" wait "$sid" --timeout "$TIMEOUT" --auto >/dev/null 2>"$RUN/raw/$tag-$id.err"; rc=$?
     local wait_rc=$rc
     if [ $rc -eq 2 ]; then tm timeout --member $i call_seq="${TM_CS[$i]:-}" timeout_s="$TIMEOUT"; "$OC" interrupt "$sid" >/dev/null 2>&1; log "member $id: timeout after ${TIMEOUT}s (interrupted)"; fi
     tm_result "$RUN/raw/$tag-$id.oc-evidence" "$sid" >"$out" 2>&1; local result_rc=$?; TM_REV=$TM_RESULT_EV
@@ -1977,7 +1978,7 @@ replace_member() {  # "ID=kind:model:effort" -> new session for that member, han
   local mode; mode=$(mget $i mode); local ctx=null extra
   case "$kind" in
     claude)   echo "$effort" | grep -qxE 'low|medium|high|xhigh|max' || die "--replace: claude effort must be low|medium|high|xhigh|max"
-              extra=$(jq -cn --arg pm "$( [ "$mode" = edit ] && echo acceptEdits || echo plan )" '{permission_mode:$pm, agent:null}') ;;
+              extra=$(jq -cn '{permission_mode:"bypassPermissions", agent:null}') ;;
     opencode) local mj; mj=$("$OC" api GET "/api/model?location%5Bdirectory%5D=$(jq -rn --arg d "$DIR" '$d|@uri')" | jq -c --arg m "$model" '.data[] | select(.enabled and (.providerID+"/"+.id)==$m)')
               [ -n "$mj" ] || die "--replace: OpenCode model not enabled: $model"
               jq -e --arg e "$effort" '([.variants[]?.id] | index($e)) != null or ($e=="default" and ([.variants[]?]|length)==0)' <<<"$mj" >/dev/null || die "--replace: effort '$effort' is not a variant of $model (valid: $(jq -r '[.variants[]?.id]|join("|")' <<<"$mj"))"

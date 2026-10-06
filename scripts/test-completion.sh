@@ -1632,6 +1632,23 @@ if s.count(old) != 1: sys.exit("approve_handover_prompt: anchor not found")
 open(p, "w", encoding="utf-8").write(s.replace(old, new))
 PY
 }
+approve_bypass_permissions() {  # council.sh copy -> members run with permissions bypassed (OpenCode --auto, claude bypassPermissions)
+  python3 - "$1" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+for old, new in [
+    ('else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]\'', 'else {permission_mode:"bypassPermissions"} end) ]\''),
+    ('--agent "$(mget $i agent)" \\\n', '--agent "$(mget $i agent)" --auto \\\n'),
+    ('"$OC" prompt "$sid" --file "$pf" --no-wait >/dev/null', '"$OC" prompt "$sid" --file "$pf" --no-wait --auto >/dev/null'),
+    ('"$OC" wait "$sid" --timeout "$TIMEOUT" >/dev/null', '"$OC" wait "$sid" --timeout "$TIMEOUT" --auto >/dev/null'),
+    ("extra=$(jq -cn --arg pm \"$( [ \"$mode\" = edit ] && echo acceptEdits || echo plan )\" '{permission_mode:$pm, agent:null}')",
+     "extra=$(jq -cn '{permission_mode:\"bypassPermissions\", agent:null}')"),
+]:
+    if s.count(old) != 1: sys.exit("approve_bypass_permissions: anchor not found: " + old)
+    s = s.replace(old, new)
+open(p, "w", encoding="utf-8").write(s)
+PY
+}
 strip_telemetry_artifacts() {  # output prefix of run_impl -> the same run without the authorized telemetry files and .telemetry
   rm -f "$1.run/telemetry.jsonl" "$1.run/telemetry.shipped"
   if [ -f "$1.run/state.json" ] && jq -e 'has("telemetry")' "$1.run/state.json" >/dev/null 2>&1; then
@@ -1642,6 +1659,7 @@ legacy_differential_tests() (
   D="$scratch/legacy-diff"; mkdir -p "$D/base" "$D/proj"
   git -C "$HERE/.." archive 97f4c70 scripts | tar -x -C "$D/base" || exit 1
   approve_handover_prompt "$D/base/scripts/council.sh" || exit 1
+  approve_bypass_permissions "$D/base/scripts/council.sh" || exit 1
   mkdir -p "$D/cur"; cp -R "$HERE" "$D/cur/" || exit 1
   write_fake_oc "$D/fake-oc"
   mkdir -p "$D/bin"; real_date=$(command -v date)

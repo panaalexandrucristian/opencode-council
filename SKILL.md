@@ -95,7 +95,7 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | how many sessions, how many OpenCode vs Claude Code | `members[]` (`kind`: `opencode` \| `claude`) | ≥ 2 members, unique ids (A, B, C…) |
 | which model each one uses | `members[].model` | OpenCode: `provider/id` from `oc.sh models`; Claude: `opus`, `sonnet`, `haiku`, `fable` or a full id |
 | what effort each one uses | `members[].effort` | OpenCode = the model's **variant** (validated live: Astra low\|medium\|high\|xhigh\|max, Gemini low\|medium\|high, Kimi K3 low\|high\|max; models without variants take `"default"`); Claude = `--effort` low\|medium\|high\|xhigh\|max |
-| who may edit files | `executor` + that member's `mode: "edit"` | exactly one executor or `null` (read-only council). read → OpenCode agent `plan` / Claude `--permission-mode plan`; edit → `build` / `acceptEdits` |
+| who may edit files | `executor` + that member's `mode: "edit"` | exactly one executor or `null` (read-only council). All members run with permissions bypassed (OpenCode: allow-all ruleset + `--auto`; Claude: `--permission-mode bypassPermissions`). read → OpenCode agent `plan` / Claude without Edit/Write/MultiEdit/NotebookEdit; edit → `build` / all tools |
 | project directory | `dir` | absolute; the sessions inspect/edit it |
 | the tasks | `tasks[]` | strings, or `{"id","text","execute":true}` for a build task (plan → executor implements → council ratifies the diff) |
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |

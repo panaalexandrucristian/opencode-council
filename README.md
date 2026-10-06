@@ -187,6 +187,14 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **0.13.0** — council members run with permissions bypassed. Claude Code members start with
+  `--permission-mode bypassPermissions` (previously `plan` for read members and `acceptEdits` for the executor),
+  also on `resume` of older runs and on `--replace`. OpenCode members pass `--auto` to `oc.sh new`/`prompt`/`wait`, so
+  `OPENCODE_AUTO=false` no longer turns auto-approval off for them (sessions already got an allow-all ruleset).
+  Roles are unchanged: read members keep the OpenCode agent `plan` and, for Claude, lose
+  Edit/Write/MultiEdit/NotebookEdit; they can still run any shell command. The code-map mapper keeps its ask-before,
+  deny-by-default rules. The legacy differential test applies the same change to its 97f4c70 base.
+  test-completion.sh: 1780 checks; test_ptools.py: 779 cases.
 - **0.12.1** — tests only; no behaviour change. The held-signal rerun path of the telemetry arming shield
   (`tm_call`, `tm_clock`, `tm_held_rerun`) is now driven deterministically: a stubbed helper and `date` exit with the
   held signal's status (143/130/129), exactly as a capture shell killed before its `trap ''` does. The new suite checks one and two reruns,
