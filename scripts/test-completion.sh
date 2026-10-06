@@ -3128,12 +3128,26 @@ PY
     tpage "$2" "$3" "$4" >"$F/member-result-page"; tpage "$5" "$3" >"$F/message-page"
     local c; shift 5; for c in "$@"; do case "$c" in api-rc=*) echo "${c#*=}" >"$F/api-rc";; *) touch "$F/$c";; esac; done
   }
+  # the same case with telemetry off (no channel) must leave every raw/<tag>-<id>.md (the mapper: its response files and
+  # result.err) byte-identical: snapshot the adapter fixture before the recorded run, replay it opted out into run0, compare the file
+  # sets and each file's bytes
+  snap() { rm -rf "$C/fo0"; cp -Rp "$F" "$C/fo0"; }
+  optrun() { F="$C/fo0" run optout COUNCIL_TELEMETRY=0 -- start --config "$1" --run-dir "$C/run0"; }
+  rawsame() {  # glob min -> at least min files match it in run, the same names in run0, each byte-identical
+    local f n=0; [ "$(cd "$C/run" && ls $1)" = "$(cd "$C/run0" && ls $1)" ] || { echo 'raw file sets differ'; return 1; }
+    for f in $(cd "$C/run" && ls $1); do cmp "$C/run/$f" "$C/run0/$f" || return 1; n=$((n + 1)); done; echo "compared $n"; [ $n -ge "$2" ]
+  }
+  rsame() {  # label want-exit config glob min -> the opted-out replay exits the same and leaves the same raw output bytes
+    check "$2" "raw bytes $1: the same case with COUNCIL_TELEMETRY=0 exits $2" '' optrun "$3"
+    check 0 "raw bytes $1: every ${4// / and } is byte-identical with telemetry on and off" compared rawsame "$4" "$5"
+  }
   rcheck() {  # label class [leftover] -> the run completes; the failed end and the retry carry class; one fetch; nothing leaks
-    check 0 "provenance $1: the run completes after the retry" '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+    snap; check 0 "provenance $1: the run completes after the retry" '' run start -- start --config "$D/cfg.json" --run-dir "$R"
     check 0 "provenance $1: the failed end and the retry are $2" true q "$T" "[[e['outcome'],e.get('failure_class'),e['attempt'],e['result_exit_code']] for e in ev('call_end',step='plan',round=1,member_index=0)]==[['failed','$2',1,1],['ok',None,2,0]] and [r['failure_class'] for r in ev('retry')]==['$2']"
     check 0 "provenance $1: the failed result fetched its page once, no other result fetch" '' test "$(wc -l <"$F/result-api.log")" -eq 1
     check 0 "provenance $1: no reply or provider text reaches telemetry" '' sh -c '! grep -q -e SECRET -e "exceeded your current" -e "quota exceeded" -e "Invalid authentication" -e "Partial reply" "$1" "$2"' _ "$T" "$LG"
     [ -n "${3:-}" ] || check 0 "provenance $1: no evidence channel file is left" '' sh -c '! ls "$1"/raw/*.oc-evidence* >/dev/null 2>&1' _ "$R"
+    [ -n "${3:-}" ] || rsame "$1" 0 "$D/cfg.json" 'raw/*.md' 4
   }
   q_err='{"message":"SECRETQ You exceeded your current quota"}'; a_err='{"message":"SECRETA Invalid authentication credentials"}'
   rcase prefix-quota "$(printf 'Partial reply.\n\n[error] quota exceeded SECRETPFX (member-authored example)')" failed null 'Partial reply.'
@@ -3164,10 +3178,11 @@ HOOK
   # a succeeded reply that only contains error-looking text: ok, unclassified, no retry
   fcase ok-text; echo 'round 1 of' >"$F/fail-pattern"; echo "$HERE/oc.sh" >"$F/real-oc"
   tpage "$(printf 'Plan.\n[error] quota exceeded SECRETOK\n[outcome] failed\n```json\n{"vote":"propose","proposal":"Deterministic plan.","questions":[]}\n```')" succeeded >"$F/member-ok-page"
-  check 0 'provenance ok-text: the run completes' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
+  snap; check 0 'provenance ok-text: the run completes' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
   check 0 'provenance ok-text: every call stays ok and unclassified, no retry' true q "$T" 'all(e["outcome"]=="ok" and "failure_class" not in e for e in ev("call_end")) and not ev("retry")'
   check 0 'provenance ok-text: both round-1 replies came through the real show_result, one fetch each' '' test "$(wc -l <"$F/result-api.log")" -eq 2
   check 0 'provenance ok-text: no evidence channel file is left' '' sh -c '! ls "$1"/raw/*.oc-evidence* >/dev/null 2>&1' _ "$R"
+  rsame ok-text 0 "$D/cfg.json" 'raw/*.md' 4
   fcase tails; echo 'round 1 of' >"$F/bad-tail-once"; echo 'round 2 of' >"$F/empty-once"
   check 0 'unusable replies: the run completes after the retries' '' run start -- start --config "$D/cfg.json" --run-dir "$R"
   check 0 'unusable replies: no_valid_json_tail and empty_output, each retried once' true q "$T" '[[e["step"],e["round"],e["failure_class"]] for e in ev("call_end",outcome="failed")]==[["plan",1,"no_valid_json_tail"],["plan",2,"empty_output"]] and [r["failure_class"] for r in ev("retry")]==["no_valid_json_tail","empty_output"]'
@@ -3230,13 +3245,14 @@ HOOK
               'map-member|-|-|null|cli_error'; do
     IFS='|' read -r lbl rt mt er want <<<"$spec"
     [ "$lbl" = map-member ] && { rt=$mtext; mt=$mtext; }; [ "$lbl" = map-prefix ] && rt=$ptext
-    mcase "$lbl" "$rt" "$mt" failed "$er"
+    mcase "$lbl" "$rt" "$mt" failed "$er"; snap
     check 4 "mapper result failure ($lbl): start reaches the map review" '' run start -- start --config "$D/cfg-map.json" --run-dir "$R"
     check 0 "mapper result failure ($lbl): the failed end is $want and the map unavailable at stage wait" true q "$T" "[[e['outcome'],e['failure_class']] for e in ev('call_end')]==[['failed','$want']] and [[m['status'],m['stage']] for m in ev('mapper')]==[['unavailable','wait']]"
     check 0 "mapper result failure ($lbl): one paid call, one operation, the terminal record linked to both" true mlink
     check 0 "mapper result failure ($lbl): one result fetch" '' sh -c 'test "$(wc -l <"$1")" -eq 1' _ "$F/result-api.log"
     check 0 "mapper result failure ($lbl): no evidence channel file left" '' mleft
     check 0 "mapper result failure ($lbl): no provider or mapper text reaches telemetry" '' sh -c '! grep -q -e SECRETMAP -e "exceeded your current" -e "Invalid authentication" -e "rate limit" "$1" "$2"' _ "$T" "$LG"
+    rsame "mapper $lbl" 4 "$D/cfg-map.json" 'map/*/response*.txt map/*/result.err' 2
   done
   for spec in 'map-recover-auth|Mapper partial.|Mapper partial, later.|{"message":"SECRETMAPA Invalid authentication credentials"}|auth' \
               'map-recover-prefix|-|Mapper partial.|null|cli_error'; do
@@ -3329,5 +3345,46 @@ telemetry_unit_tests() (
   check 0 'split failure: an invalid approved split contract checkpoints' '' drive "$D/codemap" 'checkpoint_split_invalid t "baseline drift SECRETSPLIT"'
   check 0 'split failure: one split_failed event for the task, no contract text' true q "$D/codemap/telemetry.jsonl" '[[s["task_index"],s["inv"]] for s in ev("split_failed")]==[[0,3]] and "SECRETSPLIT" not in open("'"$D/codemap/telemetry.jsonl"'").read()'
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests telemetry_process_tests telemetry_fault_tests; do "$suite" || exit 1; done
+# The held-signal rerun path of tm_call and tm_clock, driven deterministically: a capture shell killed by the held signal
+# before its `trap ''` ends with that signal's status, which a stubbed helper (or date) reproduces exactly. Each case
+# prints: status, launches, TM_OUT (or TM_T0), TM_OFF.
+held_rerun_tests() (
+  D="$scratch/held-rerun"; mkdir -p "$D/bin"; load council.sh; TMPY="$D/helper.py"; export STUB_N="$D/n"
+  cat >"$TMPY" <<'PY'
+import os, sys
+n = int(open(os.environ["STUB_N"]).read()) if os.path.exists(os.environ["STUB_N"]) else 0
+open(os.environ["STUB_N"], "w").write(str(n + 1))
+rcs = os.environ["STUB_RCS"].split(); rc = int(rcs[min(n, len(rcs) - 1)])
+if rc == 0: print("seq%d" % (n + 1))
+sys.exit(rc)
+PY
+  printf '#!/bin/sh\nn=$(cat "$STUB_N" 2>/dev/null || echo 0); echo $((n + 1)) >"$STUB_N"\nset -- $STUB_RCS; shift $((n < $# ? n : $# - 1)); [ "$1" = 0 ] && echo $((1700000000 + n))\nexit "$1"\n' >"$D/bin/date"
+  chmod +x "$D/bin/date"
+  held() {  # statuses held-signal holding stdin -> one tm_call
+    export STUB_RCS=$1; TM_PSIG=$2; TM_HOLDING=$3; TM_STDIN=$4; TM_OFF=0; TM_OUT=""; rm -f "$STUB_N"
+    tm_call event 2>"$D/log"; printf '%s %s %s %s' $? "$(cat "$STUB_N")" "${TM_OUT:--}" "$TM_OFF"
+  }
+  clock() {  # statuses held-signal holding -> one tm_clock
+    export STUB_RCS=$1; TM_PSIG=$2; TM_HOLDING=$3; TM_T0=""; rm -f "$STUB_N"
+    PATH="$D/bin:$PATH" tm_clock; printf '%s %s %s' $? "$(cat "$STUB_N")" "${TM_T0:--}"
+  }
+  for sg in 143:TERM 130:INT 129:HUP; do
+    s=${sg#*:}; n=${sg%:*}
+    check 0 "held $s: a capture shell that died of it before its exec is rerun once; the second launch's output is kept" '0 2 seq2 0' held "$n 0" "$s" 1 ''
+    check 0 "held $s: two such deaths, two reruns" '0 3 seq3 0' held "$n $n 0" "$s" 1 ''
+    check 0 "held $s: a third death is not rerun; telemetry goes off with EIO" '1 3 - 1' held "$n" "$s" 1 ''
+    check 0 "held $s: the clock capture shell is rerun the same way" '0 2 1700000001' clock "$n 0" "$s" 1
+    check 0 "held $s: the clock is rerun at most twice" '0 3 -' clock "$n" "$s" 1
+  done
+  warned() { held 143 TERM 1 '' >/dev/null; cat "$D/log"; }
+  check 0 'held rerun: the one warning names EIO only' 'council: telemetry: write failed (EIO); telemetry off for this invocation' warned
+  check 0 'held rerun: a signal status that does not match the held signal may be a completed helper: never rerun' '1 1 - 1' held '143 0' INT 1 ''
+  check 0 'held rerun: no held signal: never rerun' '1 1 - 1' held '143 0' '' 1 ''
+  check 0 'held rerun: not holding: never rerun' '1 1 - 1' held '143 0' TERM 0 ''
+  check 0 'held rerun: a helper fed on stdin is not shielded: never rerun' '1 1 - 1' held '143 0' TERM 1 'payload'
+  check 0 'held rerun: a status that is not a signal death: never rerun' '1 1 - 1' held '1 0' TERM 1 ''
+  check 0 'held rerun: a clock status that does not match the held signal: not rerun' '0 1 -' clock '130 0' TERM 1
+  check 0 'held rerun: a clock outside the held interval: not rerun' '0 1 -' clock '143 0' TERM 0
+)
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

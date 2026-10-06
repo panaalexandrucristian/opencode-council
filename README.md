@@ -179,7 +179,7 @@ How it works:
   the Mac's platform UUID; never ids, task text, posts, notes, paths or names). `COUNCIL_TELEMETRY=0` turns it off;
   `COUNCIL_TELEMETRY_DIR` moves the ledger; `scripts/ptools/telemetry_report.py` reports offline over one or many
   Macs' ledgers. Details in SKILL.md, "Telemetry".
-- **Tests.** `bash scripts/test-completion.sh` — 1723 offline checks (no network, no model calls), including
+- **Tests.** `bash scripts/test-completion.sh` — 1780 offline checks (no network, no model calls), including
   `scripts/ptools/test_ptools.py` (779 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
@@ -187,6 +187,15 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **0.12.1** — tests only; no behaviour change. The held-signal rerun path of the telemetry arming shield
+  (`tm_call`, `tm_clock`, `tm_held_rerun`) is now driven deterministically: a stubbed helper and `date` exit with the
+  held signal's status (143/130/129), exactly as a capture shell killed before its `trap ''` does. The new suite checks one and two reruns,
+  the cap at two, the single `EIO` warning, and that a mismatched signal, no held signal, an un-held interval, a
+  helper fed on stdin or a non-signal status is never rerun. Every process case whose result goes through the real
+  `oc.sh show_result` is replayed with `COUNCIL_TELEMETRY=0`. Its `raw/*.md` (for the mapper,
+  `map/*/response*.txt` and `result.err`) must be byte-identical with telemetry on and off. Ledgers stay local;
+  aggregating several Macs remains the documented manual copy.
+  test-completion.sh: 1780 checks; test_ptools.py: 779 cases.
 - **0.12.0** — content-free telemetry. `start`/`resume` record run, call, failure-class, timeout, kill,
   retry, handover, gate, question, vote, outcome and mapper events in `D/telemetry.jsonl` through a
   new standard-library writer, `scripts/council_telemetry.py` (a per-event field registry: indices, enums, counts,

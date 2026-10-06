@@ -108,6 +108,38 @@ Then: `council.sh show --config council.json` → paste the roster to the user a
 config-only cost note with two measured comparisons and cost-reduction levers. Its warning
 is advisory; the measurements are not dollar predictions.
 
+**Choosing models: measured (2026-10-05).** When proposing a roster, start cheap, because the
+cheapest council solved hard but well-specified tasks perfectly. The test council was Claude Sonnet
+at `low` effort as executor plus `openai/gpt-6-luna-fast` at `low`, with `max_rounds` 3 and
+`map_code` false. Each task was graded against hidden tests that the members never saw:
+
+- **Spreadsheet engine:** about 1300 lines built from a strict spec (parser, coercions, static
+  cycles, inserting and deleting rows/columns with formula rewriting, a 5000-cell chain).
+  Result: 54/54 hidden tests and 300/300 random-operation fuzz sequences matching a reference
+  implementation. 8 min, 2.3M tokens, about $1.34 list price.
+- **Four algorithmic problems (contest level ~2000–2400, Python under time limits):** 100%.
+  3 min, about $0.40. On one problem Sonnet `low` found a better algorithm than the planned one.
+- **A real change in this repository (release 0.11.1, orphaned Claude calls):** process groups,
+  signal traps, a launch-window race and per-attempt raw files in bash. The council started from
+  0.11.0 with the release notes and the test interface. Result: the official `orphan_tests` passed
+  26/26 with 0 regressions in 1107 other checks. About 70 min, 8.3M tokens, about $2.45. The cheap
+  reviewer (Luna Fast `low`) missed the JSON tail 4 times (each fixed by the automatic retry) and
+  once asked to leave Plan mode.
+- **No leaks:** no access to the hidden tests appeared in any transcript.
+
+So for clear, well-specified coding tasks, including real multi-file changes in this repo, do not default to Opus or to more members. One
+cheap pair is already at the ceiling, and a stronger or larger council only adds cost.
+
+**Not yet measured:**
+- Whether Opus, or several Sonnets standing in for one Opus, helps on underspecified work, work
+  in a large unfamiliar codebase, or problems at the frontier of model ability. Escalate there,
+  and ideally measure it the same way: hidden tests plus a cheap pilot first.
+- These results are one run each (n=1).
+
+**Pricing note (OpenCode's GitHub Copilot prices):** `gpt-5.6-terra` costs $2/$12 per million
+input/output tokens and `gpt-6.1-sol` costs $2/$10, so Terra is older but not cheaper. The cheap
+OpenAI option is `gpt-6-luna` at $0.1/$0.5.
+
 When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:642`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:738,800`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
 
 The split contract file path is relative to the directory containing the map-decision JSON. A version-1 contract names `parent_id` and the exact contract `map_seed_id` printed at map review from `coverage.json`; the locator's `snapshot_id` is a distinct lookup identity and must not be substituted. It then supplies non-empty `subtasks`; every child declares unique `id`, complete `text`, boolean `execute`, and arrays `requires`, `modifies`, `deletes`, `creates`, `acceptance`, and `unresolved`. Existing-file declarations bind to `{ "path": "...", "sha256": "<64 lowercase hex>" }`; created paths must be absent. Each acceptance item requires a unique `id`, `description`, non-empty `argv`, integer `expected_exit`, and its own baseline/output paths. Shared reads are valid; sibling-output dependencies and overlapping writes are not. The validator is offline and failure returns to map review (exit 4); correct the contract or explicitly keep the parent task.
