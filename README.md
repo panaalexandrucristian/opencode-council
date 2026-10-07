@@ -181,12 +181,20 @@ How it works:
   Macs' ledgers. Details in SKILL.md, "Telemetry".
 - **Tests.** `bash scripts/test-completion.sh` — 1834 offline checks (no network, no model calls), including
   `scripts/ptools/test_ptools.py` (779 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
+  `-j N` runs up to N suites at once, each in its own fresh scratch; names after the options run only those suites
+  (`--list` prints them), e.g. `bash scripts/test-completion.sh -j 8` or `bash scripts/test-completion.sh verify_0140_tests`.
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
 ## Release notes
 
+- **0.14.1** — a faster test run. `scripts/test-completion.sh -j N` runs up to N suites at once, each in a child
+  process with its own scratch, HOME, stubs and ledger, slowest suites first; the per-suite counts add up to the same
+  1834 checks. Suite names as arguments run only those suites (`--list` prints them); `ptools_tests` reads the run
+  directory `dedup_tests` builds, so it always runs after it, in the same scratch. With no option the run is unchanged.
+  The two compiled `scripts/ptools/__pycache__/*.pyc` files are no longer tracked (`__pycache__/` was already ignored).
+  test-completion.sh: 1834 checks; test_ptools.py: 779 cases.
 - **0.14.0** — less waiting, tighter scope. Measured on the local telemetry ledger (27 councils, 525 calls, 10.6 h):
   plan rounds are 42% of the time, handovers 11% plus 0.7 h of gate waits, and 4.2 h passed between invocations waiting
   for answers to member questions. (1) **Parallel handovers:** `do_handover` is split into `handover_launch` and

@@ -616,5 +616,6 @@ handover framing, pre-launch attribution, recorded locator-delivery boundaries, 
 checkpoint on an unverifiable guard, and the stale archive/replay path. It also pins the COMPLETE
 execution, ratification and fix deliveries — fresh-session rules and predecessor-handover framing
 included — to SHA-256 baselines recovered from the pre-change commit `d62a356`, asserted with the
-map both enabled and disabled, so map content cannot leak into a non-deliberation prompt. Run it plus **separate** `/bin/bash -n` invocations for `oc.sh`, `council.sh`,
+map both enabled and disabled, so map content cannot leak into a non-deliberation prompt. `-j N` runs up to N suites in parallel (each in its own scratch, a failing suite's log printed whole); suite names
+as arguments run only those (`--list` prints them). Run it plus **separate** `/bin/bash -n` invocations for `oc.sh`, `council.sh`,
 and `test-completion.sh` after changes.

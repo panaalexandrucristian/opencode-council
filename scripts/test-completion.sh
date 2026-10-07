@@ -3580,5 +3580,56 @@ PY
   check 0 'held rerun: a clock status that does not match the held signal: not rerun' '0 1 -' clock '130 0' TERM 1
   check 0 'held rerun: a clock outside the held interval: not rerun' '0 1 -' clock '143 0' TERM 0
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests verify_0140_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests; do "$suite" || exit 1; done
+SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests verify_0140_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests"
+usage() {
+  echo "usage: test-completion.sh [-j N] [--list] [SUITE...]"
+  echo "  SUITE...  run only these suites (default: all, in the listed order)"
+  echo "  -j N      run up to N suites in parallel, each in its own fresh scratch (default 1: one shared scratch, in order)"
+  echo "  --list    print the suite names and exit"
+}
+jobs=1; selected=""; log_dir=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --list) printf '%s\n' $SUITES; exit 0 ;;
+    -j) [ $# -ge 2 ] || { usage >&2; exit 2; }; jobs=$2; shift 2 ;;
+    -j*) jobs=${1#-j}; shift ;;
+    --log-dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; log_dir=$2; shift 2 ;;  # internal: one parallel child
+    -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) for u in ${1//,/ }; do  # a comma-joined unit runs its suites in order, in one scratch
+         case " $SUITES " in *" $u "*) ;; *) echo "unknown suite: $u (see --list)" >&2; exit 2 ;; esac
+       done
+       selected="$selected $1"; shift ;;
+  esac
+done
+case $jobs in ''|*[!0-9]*|0) echo "-j wants a positive integer, got: $jobs" >&2; exit 2 ;; esac
+[ -n "$selected" ] && selected=${selected# } || selected=$SUITES
+case " $selected " in  # ptools_tests reads the run directory dedup_tests builds in the same scratch
+  *" dedup_tests "*) ;;
+  *" ptools_tests "*) echo "note: ptools_tests needs dedup_tests; running it first" >&2; selected="dedup_tests $selected" ;;
+esac
+if [ -n "$log_dir" ]; then  # a parallel child: one unit (suites joined by commas, run in order), its own log and time
+  exec >"$log_dir/$selected.log" 2>&1
+  t0=$(date +%s); rc=0; for suite in ${selected//,/ }; do "$suite" || { rc=1; break; }; done
+  echo "$(( $(date +%s) - t0 ))" >"$log_dir/$selected.secs"
+  [ "$rc" -eq 0 ] || exit 1
+elif [ "$jobs" -gt 1 ]; then  # every suite in a child process with its own scratch, HOME, stubs and ledger
+  mkdir "$scratch/logs" || exit 1
+  case " $selected " in *" ptools_tests "*) selected=$(echo " $selected " | sed 's/ dedup_tests / /; s/ ptools_tests / dedup_tests,ptools_tests /') ;; esac
+  slow=" dedup_tests,ptools_tests telemetry_fault_tests legacy_differential_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapped_lifecycle_process_tests "
+  launch=""; for u in $selected; do case $slow in *" $u "*) launch="$u $launch" ;; esac; done  # longest first
+  for u in $selected; do case $slow in *" $u "*) ;; *) launch="$launch $u" ;; esac; done
+  printf '%s\n' $launch | xargs -P "$jobs" -n 1 /bin/bash "$HERE/test-completion.sh" --log-dir "$scratch/logs"
+  total=0; failed=""
+  for suite in $selected; do
+    n=$(sed -n 's/^PASS \([0-9][0-9]*\) checks; 0 failures.*/\1/p' "$scratch/logs/$suite.log" 2>/dev/null)
+    if [ -z "$n" ]; then failed="$failed $suite"; continue; fi
+    total=$((total + n)); echo "PASS $suite: $n checks ($(cat "$scratch/logs/$suite.secs")s)"
+  done
+  for suite in $failed; do echo "==== FAIL $suite ===="; cat "$scratch/logs/$suite.log"; done
+  [ -z "$failed" ] || { echo "FAILED suites:$failed"; exit 1; }
+  echo "PASS $total checks; 0 failures (offline, no model calls)"; exit 0
+else
+  for suite in ${selected//,/ }; do "$suite" || exit 1; done
+fi
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"
