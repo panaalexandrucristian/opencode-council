@@ -448,16 +448,16 @@ for a in "$@"; do printf '%s\n' "$a"; done >"$FAKE_ARGV"
 printf '%s\n' '{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 SH
   chmod +x "$F/claude"; printf 'prompt\n' >"$RUN/prompts/p.md"
-  jq -n '{members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"read",permission_mode:"plan",session:null,fresh:false,calls:0,session_calls:0},
-                   {id:"B",kind:"claude",model:"m",effort:"high",mode:"edit",permission_mode:"acceptEdits",session:null,fresh:false,calls:0,session_calls:0}],last_votes:[]}' >"$ST"
+  jq -n '{members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"read",permission_mode:"bypassPermissions",session:null,fresh:false,calls:0,session_calls:0},
+                   {id:"B",kind:"claude",model:"m",effort:"high",mode:"edit",permission_mode:"bypassPermissions",session:null,fresh:false,calls:0,session_calls:0}],last_votes:[]}' >"$ST"
   run_cl() { FAKE_ARGV="$F/argv-$1" launch "$1" "$RUN/prompts/p.md" "t-$1" && FAKE_ARGV="$F/argv-$1" collect "$1"; }
   argv_has() { grep -A1 -x -- "$2" "$F/argv-$1" | sed -n 2p | grep -qx -- "$3"; }
-  check 0 'bypass: a read claude member launches and is collected' '' run_cl 0
-  check 0 'bypass: the read claude member runs with --permission-mode bypassPermissions (even with plan stored by an older run)' '' argv_has 0 --permission-mode bypassPermissions
-  check 0 'bypass: the read claude member still loses the edit tools' '' argv_has 0 --disallowedTools 'Edit Write MultiEdit NotebookEdit'
-  check 0 'bypass: an edit claude member launches and is collected' '' run_cl 1
-  check 0 'bypass: the edit claude member runs with --permission-mode bypassPermissions (even with acceptEdits stored)' '' argv_has 1 --permission-mode bypassPermissions
-  check 1 'bypass: the edit claude member keeps every tool' '' grep -qx -- --disallowedTools "$F/argv-1"
+  check 0 'claude no bypass: a read claude member launches and is collected' '' run_cl 0
+  check 0 'claude no bypass: the read member runs with --permission-mode plan (even with bypassPermissions stored by a 0.13/0.14 run)' '' argv_has 0 --permission-mode plan
+  check 0 'claude no bypass: the read member loses the edit tools' '' argv_has 0 --disallowedTools 'Edit Write MultiEdit NotebookEdit'
+  check 0 'claude no bypass: an edit claude member launches and is collected' '' run_cl 1
+  check 0 'claude no bypass: the edit member runs with --permission-mode acceptEdits (even with bypassPermissions stored)' '' argv_has 1 --permission-mode acceptEdits
+  check 0 'claude no bypass: the edit member is allowed Bash and the edit tools' '' argv_has 1 --allowedTools 'Bash Edit Write MultiEdit NotebookEdit'
   # c1: OpenCode members pass --auto to new, prompt and wait (a fake oc.sh records each call)
   cat >"$F/fake-oc" <<'SH'
 #!/bin/sh
@@ -473,9 +473,9 @@ SH
   check 0 'bypass: oc.sh new carries --auto for an OpenCode member' '' oc_line new '--agent plan --auto'
   check 0 'bypass: oc.sh prompt carries --auto' '' oc_line prompt '--no-wait --auto'
   check 0 'bypass: oc.sh wait carries --auto' '' oc_line wait '--auto'
-  # c1: a normalised config stores bypassPermissions for every claude member, read or edit
+  # a normalised config stores plan for a read claude member and acceptEdits for the edit one
   printf '%s' '{"dir":"/tmp","executor":"B","handover_at":0.5,"max_rounds":2,"timeout_s":30,"tasks":["x"],"members":[{"id":"A","kind":"claude","model":"sonnet","effort":"high","mode":"read"},{"id":"B","kind":"claude","model":"sonnet","effort":"high","mode":"edit"}]}' >"$RUN/cfg.json"
-  check 0 'bypass: validate_config stores permission_mode bypassPermissions for read and edit claude members' 'bypassPermissions bypassPermissions' sh -c 'jq -r "[.members[].permission_mode]|join(\" \")" <<<"$1"' _ "$(validate_config "$RUN/cfg.json")"
+  check 0 'claude no bypass: validate_config stores permission_mode plan / acceptEdits for read / edit claude members' 'plan acceptEdits' sh -c 'jq -r "[.members[].permission_mode]|join(\" \")" <<<"$1"' _ "$(validate_config "$RUN/cfg.json")"
   # c4/c5: the scope and question lines are in every deliberation prompt the members receive
   jq -n '{task_id:"t1",round:2,candidate:{id:"t1-c1",member:"A",text:"CAND"},answers:[],notices:[],fixes:[],results:[{task:"t1",text:"PLAN"}],
           members:[{id:"A",kind:"claude",mode:"read",fresh:false},{id:"B",kind:"claude",mode:"edit",fresh:false}],last_votes:[]}' >"$ST"
@@ -512,10 +512,10 @@ SH
   check 0 'handover: with the placeholder note' '(the previous session produced no handover note)' cat "$RUN/raw/handover-g1-A.md"
   # c9: the lines the baseline helpers patch into older commits are exactly the current lines
   local b97="$RUN/base-97f4c70.sh" bd6="$RUN/base-d62a356.sh"
-  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_handover_prompt "$b97" && approve_bypass_permissions "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" || exit 1
+  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_handover_prompt "$b97" && approve_opencode_auto "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" || exit 1
   same_line() { [ "$(grep -cF -- "$2" "$1")" = 1 ] && [ "$(grep -cF -- "$2" "$HERE/council.sh")" = 1 ] && [ "$(grep -F -- "$2" "$1")" = "$(grep -F -- "$2" "$HERE/council.sh")" ]; }
   for key in 'HARD RULE — scope (overrides' 'Clarify first (grilling).' 'Recommended: <answer> (<why>)' 'Vote "question" only for a choice' 'Judge the candidate only against the task' 'Check only what the plan and the task cover' \
-             'else {permission_mode:"bypassPermissions"} end) ]' '--no-wait --auto >/dev/null' '--timeout "$TIMEOUT" --auto >/dev/null' '{permission_mode:"bypassPermissions", agent:null}' \
+             'else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' '--no-wait --auto >/dev/null' '--timeout "$TIMEOUT" --auto >/dev/null' '{permission_mode:$pm, agent:null}' \
              'for i in $idxs; do needs_handover $i && ho="$ho $i"; done' 'for i in $ho; do handover_launch $i; done' '*" $i "*) ;; *) launch_member $i || return 1 ;; esac; done'; do
     check 0 "baseline 97f4c70 patched line equals the current line: $key" '' same_line "$b97" "$key"
   done
@@ -1751,19 +1751,16 @@ if s.count(old) != 1: sys.exit("approve_handover_prompt: anchor not found")
 open(p, "w", encoding="utf-8").write(s.replace(old, new))
 PY
 }
-approve_bypass_permissions() {  # council.sh copy -> members run with permissions bypassed (OpenCode --auto, claude bypassPermissions)
+approve_opencode_auto() {  # council.sh copy -> OpenCode members pass --auto to new, prompt and wait
   python3 - "$1" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p, encoding="utf-8").read()
 for old, new in [
-    ('else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]\'', 'else {permission_mode:"bypassPermissions"} end) ]\''),
     ('--agent "$(mget $i agent)" \\\n', '--agent "$(mget $i agent)" --auto \\\n'),
     ('"$OC" prompt "$sid" --file "$pf" --no-wait >/dev/null', '"$OC" prompt "$sid" --file "$pf" --no-wait --auto >/dev/null'),
     ('"$OC" wait "$sid" --timeout "$TIMEOUT" >/dev/null', '"$OC" wait "$sid" --timeout "$TIMEOUT" --auto >/dev/null'),
-    ("extra=$(jq -cn --arg pm \"$( [ \"$mode\" = edit ] && echo acceptEdits || echo plan )\" '{permission_mode:$pm, agent:null}')",
-     "extra=$(jq -cn '{permission_mode:\"bypassPermissions\", agent:null}')"),
 ]:
-    if s.count(old) != 1: sys.exit("approve_bypass_permissions: anchor not found: " + old)
+    if s.count(old) != 1: sys.exit("approve_opencode_auto: anchor not found: " + old)
     s = s.replace(old, new)
 open(p, "w", encoding="utf-8").write(s)
 PY
@@ -1833,7 +1830,7 @@ legacy_differential_tests() (
   D="$scratch/legacy-diff"; mkdir -p "$D/base" "$D/proj"
   git -C "$HERE/.." archive 97f4c70 scripts | tar -x -C "$D/base" || exit 1
   approve_handover_prompt "$D/base/scripts/council.sh" || exit 1
-  approve_bypass_permissions "$D/base/scripts/council.sh" || exit 1
+  approve_opencode_auto "$D/base/scripts/council.sh" || exit 1
   approve_scope_prompts "$D/base/scripts/council.sh" || exit 1
   approve_parallel_handover "$D/base/scripts/council.sh" || exit 1
   mkdir -p "$D/cur"; cp -R "$HERE" "$D/cur/" || exit 1

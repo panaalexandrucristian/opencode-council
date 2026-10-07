@@ -189,6 +189,12 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **0.15.0** — Claude Code members no longer bypass permissions (the Claude half of 0.13.0 undone). Read members run
+  with `--permission-mode plan` and without Edit/Write/MultiEdit/NotebookEdit; the executor runs with `acceptEdits` and
+  `--allowedTools "Bash Edit Write MultiEdit NotebookEdit"`, also on `--replace`. A run started by 0.13/0.14 that
+  stored `bypassPermissions` launches with the member's role mode on `resume`. OpenCode members keep `--auto`. The
+  97f4c70 baseline is patched only for the OpenCode `--auto` lines (`approve_opencode_auto`).
+  test-completion.sh: 1834 checks; test_ptools.py: 779 cases.
 - **0.14.1** — a faster test run. `scripts/test-completion.sh -j N` runs up to N suites at once, each in a child
   process with its own scratch, HOME, stubs and ledger, slowest suites first; the per-suite counts add up to the same
   1834 checks. Suite names as arguments run only those suites (`--list` prints them); `ptools_tests` reads the run
