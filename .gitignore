@@ -4,3 +4,4 @@
 /run*/
 /answers*.json
 __pycache__/
+/.handoff-verify/
