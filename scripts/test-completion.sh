@@ -142,7 +142,7 @@ gate_tests() (
   check 2 'handover gate: an unreleased note stops the run with exit 2 after the timeout' '' timed_out
   check 0 'handover gate: timeout leaves the failed checkpoint' failed jq -r .status "$ST"
   check 0 'handover gate: timeout stops the calls still in flight before exiting' stopped cat "$RUN/stopped"
-  check 0 'handover gate: do_handover gates the delivered note before retiring the session' '' sh -c 'sed -n "/^do_handover()/,/^}/p" "$1" | grep -q "^  handover_gate \"\$note\"$"' _ "$HERE/council.sh"
+  check 0 'handover gate: handover_finish gates the delivered note before retiring the session' '' sh -c 'sed -n "/^handover_finish()/,/^}/p" "$1" | grep -q "^  handover_gate \"\$note\"$"' _ "$HERE/council.sh"
   check 0 'handover gate: replace_member gates the replacement note' '' sh -c 'sed -n "/^replace_member()/,/^}/p" "$1" | grep -q "^  handover_gate \"\$note\" "' _ "$HERE/council.sh"
 )
 orphan_tests() (
@@ -394,6 +394,9 @@ style_tests() (
   check 0 'rules_text carries the member style' '6. Style — caveman' rules_text 0
   check 0 'rules_text omits the rule for a normal member' '' test -z "$(rules_text 1 | grep '6. Style')"
   check 0 'rules_text still states the tail rule for a styled member' 'MUST end with a JSON tail' rules_text 0
+  check 0 'rules_text states the HARD scope rule for every member' 'HARD RULE — scope (overrides everything below)' rules_text 1
+  scope_first() { rules_text 1 | grep -A1 '^Rules:$' | grep -q '^HARD RULE — scope'; }
+  check 0 'the scope rule sits inside the rules block, before rule 1' '' scope_first
 )
 handover_tests() (
   load council.sh; ST="$scratch/ho-state.json"; N=3; HANDOVER=0.5
@@ -412,6 +415,117 @@ handover_tests() (
   mk 1000 2000 2;  check 0 'absolute threshold ignores the context window' '' needs_handover 0
   mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
   mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
+
+  # run_step: every member past its threshold writes its note at once; the others start the step meanwhile, and each
+  # handed-over member is launched right after its own note is through the gate
+  RUN="$scratch/ho-run"; rm -rf "$RUN"; mkdir -p "$RUN"; ST="$RUN/state.json"; CODEMAP=0
+  jq -n '{reuse_posts:false,last_votes:[],notices:[],members:[{id:"A",gen:1,fresh:false},{id:"B",gen:1,fresh:false},{id:"C",gen:1,fresh:false}]}' >"$ST"
+  validate_child_launch() { :; }; tm() { :; }; tm_end() { :; }; render_transcript() { :; }
+  codemap_record_launch() { CODEMAP_LAUNCH_ID=x; }; codemap_record_launched() { :; }; codemap_append_locator() { :; }; codemap_stage_accepted() { :; }
+  fakegen() { echo prompt; }
+  needs_handover() { [ "$1" != 1 ]; }
+  handover_launch() { echo "HL $1" >>"$RUN/order"; }
+  handover_finish() { echo "HF $1" >>"$RUN/order"; }
+  launch() { echo "L $1" >>"$RUN/order"; }
+  stop_inflight() { echo "STOP $1" >>"$RUN/order"; }
+  collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r2-$(mid $1).md"; }
+  check 0 'parallel handovers: the step succeeds' '' run_step r2 fakegen '{"id":"t1"}' 2
+  check 0 'parallel handovers: both notes start, B starts meanwhile, A and C follow their own notes' 'HL 0 HL 2 L 1 HF 0 L 0 HF 2 L 2' sh -c 'tr "\n" " " <"$1"' _ "$RUN/order"
+  rm -f "$RUN/order"; handover_finish() { echo "HF $1" >>"$RUN/order"; [ "$1" != 0 ]; }
+  check 1 'parallel handovers: a note call left running fails the step' '' run_step r2 fakegen '{"id":"t1"}' 2
+  check 0 'parallel handovers: everything in flight is stopped and A is never launched beside it' 'HL 0 HL 2 L 1 HF 0 STOP handover' sh -c 'tr "\n" " " <"$1"' _ "$RUN/order"
+)
+# 0.14.0 claims, tested directly: bypassed permissions on the real launch/collect paths, the scope lines in every
+# deliberation prompt, the real handover_finish, and the lines the baseline helpers patch into older commits.
+verify_0140_tests() (
+  load council.sh; RUN="$scratch/v0140"; ST="$RUN/state.json"; N=2; DIR=$scratch; MAXT=3; TIMEOUT=20; MAP_PREPASS=0
+  F="$scratch/v0140-bin"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts" "$F"
+  export PATH="$F:$PATH"
+  # c1: a fake claude records its argv, one argument per line, and answers at once
+  cat >"$F/claude" <<'SH'
+#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >"$FAKE_ARGV"
+printf '%s\n' '{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+SH
+  chmod +x "$F/claude"; printf 'prompt\n' >"$RUN/prompts/p.md"
+  jq -n '{members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"read",permission_mode:"plan",session:null,fresh:false,calls:0,session_calls:0},
+                   {id:"B",kind:"claude",model:"m",effort:"high",mode:"edit",permission_mode:"acceptEdits",session:null,fresh:false,calls:0,session_calls:0}],last_votes:[]}' >"$ST"
+  run_cl() { FAKE_ARGV="$F/argv-$1" launch "$1" "$RUN/prompts/p.md" "t-$1" && FAKE_ARGV="$F/argv-$1" collect "$1"; }
+  argv_has() { grep -A1 -x -- "$2" "$F/argv-$1" | sed -n 2p | grep -qx -- "$3"; }
+  check 0 'bypass: a read claude member launches and is collected' '' run_cl 0
+  check 0 'bypass: the read claude member runs with --permission-mode bypassPermissions (even with plan stored by an older run)' '' argv_has 0 --permission-mode bypassPermissions
+  check 0 'bypass: the read claude member still loses the edit tools' '' argv_has 0 --disallowedTools 'Edit Write MultiEdit NotebookEdit'
+  check 0 'bypass: an edit claude member launches and is collected' '' run_cl 1
+  check 0 'bypass: the edit claude member runs with --permission-mode bypassPermissions (even with acceptEdits stored)' '' argv_has 1 --permission-mode bypassPermissions
+  check 1 'bypass: the edit claude member keeps every tool' '' grep -qx -- --disallowedTools "$F/argv-1"
+  # c1: OpenCode members pass --auto to new, prompt and wait (a fake oc.sh records each call)
+  cat >"$F/fake-oc" <<'SH'
+#!/bin/sh
+echo "$*" >>"$FAKE_OC_LOG"
+case "$1" in new) echo ses_fake1 ;; api) echo '{"data":[]}' ;; result) echo 'reply' ;; esac
+exit 0
+SH
+  chmod +x "$F/fake-oc"
+  jq -n '{members:[{id:"C",kind:"opencode",model:"p/m",effort:"high",mode:"read",agent:"plan",gen:1,session:null,fresh:false,calls:0,session_calls:0}],last_votes:[]}' >"$ST"
+  run_oc() { OC="$F/fake-oc" FAKE_OC_LOG="$F/oc.log" launch 0 "$RUN/prompts/p.md" t-oc && OC="$F/fake-oc" FAKE_OC_LOG="$F/oc.log" collect 0; }
+  oc_line() { grep "^$1 " "$F/oc.log" | grep -q -- "$2"; }
+  check 0 'bypass: an OpenCode member launches and is collected through oc.sh' '' run_oc
+  check 0 'bypass: oc.sh new carries --auto for an OpenCode member' '' oc_line new '--agent plan --auto'
+  check 0 'bypass: oc.sh prompt carries --auto' '' oc_line prompt '--no-wait --auto'
+  check 0 'bypass: oc.sh wait carries --auto' '' oc_line wait '--auto'
+  # c1: a normalised config stores bypassPermissions for every claude member, read or edit
+  printf '%s' '{"dir":"/tmp","executor":"B","handover_at":0.5,"max_rounds":2,"timeout_s":30,"tasks":["x"],"members":[{"id":"A","kind":"claude","model":"sonnet","effort":"high","mode":"read"},{"id":"B","kind":"claude","model":"sonnet","effort":"high","mode":"edit"}]}' >"$RUN/cfg.json"
+  check 0 'bypass: validate_config stores permission_mode bypassPermissions for read and edit claude members' 'bypassPermissions bypassPermissions' sh -c 'jq -r "[.members[].permission_mode]|join(\" \")" <<<"$1"' _ "$(validate_config "$RUN/cfg.json")"
+  # c4/c5: the scope and question lines are in every deliberation prompt the members receive
+  jq -n '{task_id:"t1",round:2,candidate:{id:"t1-c1",member:"A",text:"CAND"},answers:[],notices:[],fixes:[],results:[{task:"t1",text:"PLAN"}],
+          members:[{id:"A",kind:"claude",mode:"read",fresh:false},{id:"B",kind:"claude",mode:"edit",fresh:false}],last_votes:[]}' >"$ST"
+  EXEC=B; MAXR=4; CODEMAP=0
+  local t='{"id":"t1","text":"fixture task","execute":true}'
+  check 0 'scope: round 1 asks the whole frontier, numbered, with a recommended answer' 'Clarify first (grilling).' prompt_round1 0 "$t" 1
+  check 0 'scope: the round-1 question example carries a recommendation' 'Recommended: <answer> (<why>)' prompt_round1 0 "$t" 1
+  check 0 'scope: later rounds ask only what new information opened' 'Vote "question" only for a choice that new information' prompt_roundN_full 0 "$t" 2
+  check 0 'scope: later rounds judge the candidate only against the task' 'Judge the candidate only against the task (HARD RULE — scope)' prompt_roundN_full 0 "$t" 2
+  check 0 'scope: ratification checks only the plan and the task' 'Check only what the plan and the task cover (HARD RULE — scope)' prompt_ratify 0 "$t" 1
+  check 0 'scope: the first-contact rules carry the HARD scope rule' 'HARD RULE — scope (overrides everything below)' rules_text 1
+  # c6: the real handover_finish, after the real handover_launch, with the model calls faked
+  jq -n '{task_id:"t1",members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"read",gen:1,session:"old-sess",fresh:false,handover_note:null,ctx_used:900,ctx_limit:1000,session_tokens:5,session_cost:1,session_calls:3,retired:[]}],log:[]}' >"$ST"
+  N=1; TM_STEP=plan; TM_ROUND=1; HANDOVER=0.5
+  launch() { echo "launch $1 $3" >>"$F/ho.log"; }
+  collect() { echo "Note body." >"$RUN/raw/handover-g1-A.md"; echo "collect $1" >>"$F/ho.log"; }
+  handover_gate() { echo "gate $1" >>"$F/ho.log"; }
+  render_transcript() { :; }
+  ho_ok() { handover_launch 0 && handover_finish 0; }
+  check 0 'handover: the real handover_launch + handover_finish succeed' '' ho_ok
+  check 0 'handover: the note call is launched, collected, then gated in that order' "launch 0 handover-g1 collect 0 gate $RUN/raw/handover-g1-A.md" sh -c 'tr "\n" " " <"$1"' _ "$F/ho.log"
+  check 0 'handover: the member moves to generation 2 with a fresh session that reads the note' true jq -e --arg n "$RUN/raw/handover-g1-A.md" '.members[0] | .gen==2 and .session==null and .fresh==true and .handover_note==$n' "$ST"
+  check 0 'handover: the old session is retired with its totals and the counters restart' true jq -e '.members[0] | .retired==[{session:"old-sess",gen:1,tokens:5,cost:1}] and .ctx_used==0 and .session_tokens==0 and .session_cost==0 and .session_calls==0' "$ST"
+  check 0 'handover: the handover prompt was written for the old generation' '=== HANDOVER ===' cat "$RUN/prompts/handover-A-g1.md"
+  # a note call that left its process group running: no new generation, the caller stops
+  jq '.members[0] |= (.gen=1 | .session="old-sess" | .fresh=false | .handover_note=null)' "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"
+  collect() { CALL_LEFT_RUNNING=1; return 1; }
+  ho_left() { handover_launch 0; handover_finish 0; }
+  check 1 'handover: a note call that left processes running fails handover_finish' '' ho_left
+  check 0 'handover: and the member keeps its generation and session' true jq -e '.members[0] | .gen==1 and .session=="old-sess"' "$ST"
+  # a failed launch still retires the session with the fixed placeholder note
+  launch() { return 1; }; tm_launch_failed() { :; }; rm -f "$RUN/raw/handover-g1-A.md"
+  check 0 'handover: a failed note launch still opens the next generation' '' ho_ok
+  check 0 'handover: with the placeholder note' '(the previous session produced no handover note)' cat "$RUN/raw/handover-g1-A.md"
+  # c9: the lines the baseline helpers patch into older commits are exactly the current lines
+  local b97="$RUN/base-97f4c70.sh" bd6="$RUN/base-d62a356.sh"
+  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_handover_prompt "$b97" && approve_bypass_permissions "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" || exit 1
+  same_line() { [ "$(grep -cF -- "$2" "$1")" = 1 ] && [ "$(grep -cF -- "$2" "$HERE/council.sh")" = 1 ] && [ "$(grep -F -- "$2" "$1")" = "$(grep -F -- "$2" "$HERE/council.sh")" ]; }
+  for key in 'HARD RULE — scope (overrides' 'Clarify first (grilling).' 'Recommended: <answer> (<why>)' 'Vote "question" only for a choice' 'Judge the candidate only against the task' 'Check only what the plan and the task cover' \
+             'else {permission_mode:"bypassPermissions"} end) ]' '--no-wait --auto >/dev/null' '--timeout "$TIMEOUT" --auto >/dev/null' '{permission_mode:"bypassPermissions", agent:null}' \
+             'for i in $idxs; do needs_handover $i && ho="$ho $i"; done' 'for i in $ho; do handover_launch $i; done' '*" $i "*) ;; *) launch_member $i || return 1 ;; esac; done'; do
+    check 0 "baseline 97f4c70 patched line equals the current line: $key" '' same_line "$b97" "$key"
+  done
+  check 0 'baseline 97f4c70 patched: oc.sh new carries --auto as in the current code' '' sh -c 'grep -q -- "--agent \"\$(mget \$i agent)\" --auto" "$1" && grep -q -- "--agent \"\$(mget \$i agent)\" --auto" "$2"' _ "$b97" "$HERE/council.sh"
+  if git -C "$HERE/.." rev-parse --verify -q d62a356 >/dev/null 2>&1; then
+    git -C "$HERE/.." show d62a356:scripts/council.sh >"$bd6" && approve_scope_prompts "$bd6" || exit 1
+    for key in 'HARD RULE — scope (overrides' 'Clarify first (grilling).' 'Recommended: <answer> (<why>)' 'Vote "question" only for a choice' 'Judge the candidate only against the task' 'Check only what the plan and the task cover'; do
+      check 0 "baseline d62a356 patched line equals the current line: $key" '' same_line "$bd6" "$key"
+    done
+  fi
 )
 ptools_tests() (
   # the analysis tools are part of the skill: their own unittest suite must pass,
@@ -567,10 +681,11 @@ codemap_pipeline_tests() (
 # recovered from the immutable pre-change commit d62a356 with exactly the fixture built here (the
 # only environment-dependent text, the scratch path, is normalised away). They cover the COMPLETE
 # execution / ratification / fix prompt as delivered to a FRESH session — i.e. including the
-# rules block and the predecessor-handover framing — with the map enabled and disabled.
-BASELINE_EXEC=27a50eabb90cb446c025a420020d097459acbe52a036276ec154f9503a9bd71c
-BASELINE_RATIFY=5102c70d74878f06e2f9a048d48a8037eaeb128382613b1e68898573d8f9b7e1
-BASELINE_FIX=6e9542d66c9b572460123caa3b486e5a841f4a28c96f25d92168ebcfb049c4ac
+# rules block and the predecessor-handover framing — with the map enabled and disabled. Since 0.14.0 the baseline is
+# d62a356 with the HARD scope rule and the one-stop question wording applied (approve_scope_prompts), nothing else.
+BASELINE_EXEC=b538376b9f19546e43d8b65f0a2f6d8246bff726156c39a36e41e6d4146d06b8
+BASELINE_RATIFY=47456414ee463bbb04d20f3fff5fab523d2d4e827c3b420c3a090c65e03a9cf5
+BASELINE_FIX=076389a8672add955a459a056b448dfdc42a0cd208b6f7ed48dbeae152253fb6
 prompt_baseline_digests() (  # map(0|1) -> "<tag> <sha256>" per non-deliberation delivery
   local map=$1 base="$scratch/baseline-$1"
   load council.sh
@@ -628,11 +743,14 @@ codemap_baseline_tests() (
   # the same fixture, regenerated from the immutable commit itself, must produce those digests
   if git -C "$HERE/.." rev-parse --verify -q d62a356 >/dev/null 2>&1; then
     git -C "$HERE/.." show d62a356:scripts/council.sh >"$scratch/d62a356-council.sh"
+    approve_scope_prompts "$scratch/d62a356-council.sh" || exit 1
     cp "$HERE/oc.sh" "$scratch/oc.sh"; ln -sfn "$HERE/ptools" "$scratch/ptools"
     local recovered
     recovered=$( HERE_OVERRIDE=1; load() { eval "$(sed '/^# .* commands /,$d' "$scratch/d62a356-council.sh")"; }
                  prompt_baseline_digests 0 )
-    check 0 'the embedded digests really are the pre-change d62a356 bytes' "$BASELINE_EXEC" digest "$recovered" exec
+    check 0 'the embedded digests really are the pre-change d62a356 bytes (+ scope prompts)' "$BASELINE_EXEC" digest "$recovered" exec
+    check 0 'the embedded ratification digest is d62a356 (+ scope prompts)' "$BASELINE_RATIFY" digest "$recovered" x1
+    check 0 'the embedded fix digest is d62a356 (+ scope prompts)' "$BASELINE_FIX" digest "$recovered" fix1
   else
     echo "PASS (skipped) d62a356 is not present in this clone; the embedded digests stand alone"
     echo x >>"$scratch/passed"
@@ -974,6 +1092,7 @@ map_prepass_lifecycle_tests() (
   )
   git show 97f4c70:scripts/council.sh >"$scratch/baseline-council.sh" || exit 1
   approve_handover_prompt "$scratch/baseline-council.sh" || exit 1
+  approve_scope_prompts "$scratch/baseline-council.sh" || exit 1
   for map_choice in false omitted; do
     mkdir -p "$scratch/baseline-prompts-$map_choice" "$scratch/current-prompts-$map_choice"
     baseline_prompt_fixture "$scratch/baseline-council.sh" "$scratch/baseline-prompts-$map_choice" "$map_choice"
@@ -1649,6 +1768,61 @@ for old, new in [
 open(p, "w", encoding="utf-8").write(s)
 PY
 }
+approve_scope_prompts() {  # council.sh copy -> the HARD scope rule and the one-stop question wording, nothing else
+  python3 - "$1" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+SCOPE = ("HARD RULE — scope (overrides everything below): work ONLY on the council's current task as written. Read, inspect, analyse and propose only what that task needs; "
+         "do not review unrelated code, do not widen the task, do not add features, refactors, clean-ups or follow-up work it did not ask for, and do not open questions about anything outside it. "
+         "If you notice something outside the task, mention it in at most one line marked \"outside scope\" and never act on it or make your proposal or vote depend on it. "
+         "A proposal or disagreement that goes beyond the task is a failure.\n")
+R1 = "Other members do the same; next round you will see their proposals."
+for old, new in [
+    ("Rules:\n1. NEVER assume.", "Rules:\n" + SCOPE + "1. NEVER assume."),
+    (R1, R1 + "\nClarify first (grilling). Map the task as a decision tree: every decision it leaves open, and the decisions that hang off each one. "
+              "Facts are your job: settle every fact from the working directory yourself and never ask the user for one. Decisions are the user's. "
+              "The frontier is every open decision whose prerequisites are already settled: ask the WHOLE frontier in this one post, each question numbered, "
+              "with its options and your recommended answer. A question that depends on another question still open belongs to a later stop, not this one. "
+              "Propose only when the frontier is empty. After the user answers, recompute the frontier and ask only what those answers opened. "
+              "Stay inside the task (HARD RULE — scope): no questions about anything it does not need."),
+    ('{"vote": "question", "questions": ["<precise question for the user>"], "proposal": null}\n\\`\\`\\`\nTXT\n}\nprompt_roundN_full() {',
+     '{"vote": "question", "questions": ["Q1 — <short title>: <precise question, with its options>. Recommended: <answer> (<why>)"], "proposal": null}\n\\`\\`\\`\nTXT\n}\nprompt_roundN_full() {'),
+    ("- If you still lack information: vote \"question\".\n",
+     "- Vote \"question\" only for a choice that new information (an answer of the user or another member's post) opened; everything else had to be asked in round 1.\n"
+     "- Judge the candidate only against the task (HARD RULE — scope): never disagree over anything outside it.\n"),
+    ("Vote \"question\" if you need the user.\n",
+     "Vote \"question\" if you need the user.\nCheck only what the plan and the task cover (HARD RULE — scope): do not review unrelated code and never request fixes outside them.\n"),
+]:
+    if s.count(old) != 1: sys.exit("approve_scope_prompts: anchor not found: " + old)
+    s = s.replace(old, new)
+open(p, "w", encoding="utf-8").write(s)
+PY
+}
+approve_parallel_handover() {  # 97f4c70 council.sh copy -> 0.14.0 handover order: every note at once, the others start meanwhile
+  python3 - "$1" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+def sub(old, new):
+    global s
+    if s.count(old) != 1: sys.exit("approve_parallel_handover: anchor not found: " + old[:80])
+    s = s.replace(old, new)
+sub('  launch $i "$pf" "handover-g$(mget $i gen)" && collect $i\n',
+    '  HO_LAUNCHED[$i]=0; launch $i "$pf" "handover-g$(mget $i gen)" && HO_LAUNCHED[$i]=1\n}\n'
+    'handover_finish() {\n  local i=$1 id; id=$(mid $i)\n  [ "${HO_LAUNCHED[$i]}" = 1 ] && collect $i\n')
+sub("do_handover() {  # idx -> old session writes a note; new session created; note stored for the next prompt\n",
+    "HO_LAUNCHED=()\nhandover_launch() {\n")
+sub('  for i in $idxs; do\n    needs_handover $i && do_handover $i\n',
+    '  local ho=""\n  for i in $idxs; do needs_handover $i && ho="$ho $i"; done\n  for i in $ho; do handover_launch $i; done\n'
+    '  launch_member() {\n    local i=$1\n')
+sub("""sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'; continue""",
+    """sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'; return 0""")
+sub('    codemap_record_launched "$pf" "$tid" "$tag"\n  done\n  local fail=0',
+    '    codemap_record_launched "$pf" "$tid" "$tag"\n  }\n'
+    '  for i in $idxs; do case " $ho " in *" $i "*) ;; *) launch_member $i || return 1 ;; esac; done\n'
+    '  for i in $ho; do handover_finish $i; launch_member $i || return 1; done\n  local fail=0')
+open(p, "w", encoding="utf-8").write(s)
+PY
+}
 strip_telemetry_artifacts() {  # output prefix of run_impl -> the same run without the authorized telemetry files and .telemetry
   rm -f "$1.run/telemetry.jsonl" "$1.run/telemetry.shipped"
   if [ -f "$1.run/state.json" ] && jq -e 'has("telemetry")' "$1.run/state.json" >/dev/null 2>&1; then
@@ -1660,6 +1834,8 @@ legacy_differential_tests() (
   git -C "$HERE/.." archive 97f4c70 scripts | tar -x -C "$D/base" || exit 1
   approve_handover_prompt "$D/base/scripts/council.sh" || exit 1
   approve_bypass_permissions "$D/base/scripts/council.sh" || exit 1
+  approve_scope_prompts "$D/base/scripts/council.sh" || exit 1
+  approve_parallel_handover "$D/base/scripts/council.sh" || exit 1
   mkdir -p "$D/cur"; cp -R "$HERE" "$D/cur/" || exit 1
   write_fake_oc "$D/fake-oc"
   mkdir -p "$D/bin"; real_date=$(command -v date)
@@ -3404,5 +3580,5 @@ PY
   check 0 'held rerun: a clock status that does not match the held signal: not rerun' '0 1 -' clock '130 0' TERM 1
   check 0 'held rerun: a clock outside the held interval: not rerun' '0 1 -' clock '143 0' TERM 0
 )
-for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests; do "$suite" || exit 1; done
+for suite in api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests verify_0140_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests; do "$suite" || exit 1; done
 echo "PASS $(wc -l <"$scratch/passed" | tr -d ' ') checks; 0 failures (offline, no model calls)"

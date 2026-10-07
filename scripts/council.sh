@@ -1543,6 +1543,7 @@ Working directory: $DIR (inspect it with your tools whenever a claim can be veri
 Executor: $( [ -n "$EXEC" ] && echo "member $EXEC is the only member allowed to modify files; everyone else is read-only." || echo "none — this council is read-only." )
 
 Rules:
+HARD RULE — scope (overrides everything below): work ONLY on the council's current task as written. Read, inspect, analyse and propose only what that task needs; do not review unrelated code, do not widen the task, do not add features, refactors, clean-ups or follow-up work it did not ask for, and do not open questions about anything outside it. If you notice something outside the task, mention it in at most one line marked "outside scope" and never act on it or make your proposal or vote depend on it. A proposal or disagreement that goes beyond the task is a failure.
 1. NEVER assume. Before proposing, list every choice the task leaves open (exact wording/text, names, language, formats, edge-case behaviour, tools/versions) and every fact you need. For each one: if the working directory settles it, verify it there and cite the path; otherwise it is a question for the user — vote "question" with ALL your questions in one post. Do NOT pick a "reasonable default" for anything the user might care about — triviality is not a reason to skip the question (for a hello-world, the greeting text is a question). A made-up choice is a failure, a precise question is not. Every open item you list must be marked settled_by "task" (quote the task), "dir" (cite the path), "user" (quote the user's answer given to the council) or "ask" — anything marked "ask" is sent to the user automatically, and a proposal that still contains "ask" items is not accepted as a proposal.
 2. Verify before you claim. Check the code/files; say what you verified and what you could not.
 3. Engage with the other members by name: say what you agree/disagree with and why. Change your mind when they are right.
@@ -1568,12 +1569,13 @@ $(task_header "$2" 1)
 $(task_intro "$2")
 $(answers_block)
 Your job this round: (1) list EVERY choice the task leaves open and every fact you need, and for each say what settles it: "task" (quote it), "dir" (path you verified), "user" (an answer from the user, quoted) or "ask" (the user must decide); (2) if any item is "ask", vote "question" (or vote "propose" — the orchestrator turns "ask" items into questions anyway); otherwise give your complete proposed $( jq -e '.execute' <<<"$2" >/dev/null && echo plan || echo answer ). Other members do the same; next round you will see their proposals.
+Clarify first (grilling). Map the task as a decision tree: every decision it leaves open, and the decisions that hang off each one. Facts are your job: settle every fact from the working directory yourself and never ask the user for one. Decisions are the user's. The frontier is every open decision whose prerequisites are already settled: ask the WHOLE frontier in this one post, each question numbered, with its options and your recommended answer. A question that depends on another question still open belongs to a later stop, not this one. Propose only when the frontier is empty. After the user answers, recompute the frontier and ask only what those answers opened. Stay inside the task (HARD RULE — scope): no questions about anything it does not need.
 ${schema}JSON tail — exactly one of:
 \`\`\`json
 {"vote": "propose", "open": [{"item": "<open choice or needed fact>", "settled_by": "task|dir|user|ask", "where": "<quote from the task / file path / the user's answer, or the exact question for the user>"}], "proposal": "<your complete $( jq -e '.execute' <<<"$2" >/dev/null && echo plan || echo answer )>", "questions": []}
 \`\`\`
 \`\`\`json
-{"vote": "question", "questions": ["<precise question for the user>"], "proposal": null}
+{"vote": "question", "questions": ["Q1 — <short title>: <precise question, with its options>. Recommended: <answer> (<why>)"], "proposal": null}
 \`\`\`
 TXT
 }
@@ -1598,7 +1600,8 @@ TXT
 Your job this round: reply to the other members where you disagree (by name), then vote on the candidate.
 - If the candidate is acceptable to you AS WRITTEN: vote "agree" (no proposal needed). Consensus needs every member to agree.
 - Otherwise vote "disagree" and give a COMPLETE revised proposal (not a diff of the candidate — the full text), so it can become the next candidate.
-- If you still lack information: vote "question".
+- Vote "question" only for a choice that new information (an answer of the user or another member's post) opened; everything else had to be asked in round 1.
+- Judge the candidate only against the task (HARD RULE — scope): never disagree over anything outside it.
 ${schema}JSON tail — exactly one of:
 \`\`\`json
 {"vote": "agree", "reason": "<one line>", "proposal": null, "questions": []}
@@ -1776,6 +1779,7 @@ TXT
   answers_block
   cat <<TXT
 Vote "agree" if the implementation satisfies the plan and the task. Vote "disagree" with a proposal listing the CONCRETE fixes the executor must apply (file, change, why). Vote "question" if you need the user.
+Check only what the plan and the task cover (HARD RULE — scope): do not review unrelated code and never request fixes outside them.
 JSON tail — exactly one of:
 \`\`\`json
 {"vote": "agree", "reason": "<one line>", "proposal": null, "questions": []}
@@ -1849,19 +1853,28 @@ handover_gate() {  # note
   TM_GATE_T0=""; tm gate member_index="$TM_HO_MEMBER" handover_seq="$TM_HO" result=released wait_s=$(( $(date +%s) - t0 ))
   log "handover gate: released $note"
 }
-do_handover() {  # idx -> old session writes a note; new session created; note stored for the next prompt
+# A handover runs in two halves so run_step can write several members' notes at once: handover_launch starts the
+# old session's note, handover_finish collects it, holds it at the gate and opens the next generation.
+TM_HOS=(); HO_LAUNCHED=()   # per member: the seq of its handover start event; 1 when its note call was launched
+handover_launch() {  # idx -> starts the old session's handover note (a failed launch leaves an empty note to finish)
   local i=$1 id; id=$(mid $i)
   log "member $id: context $(st ".members[$i].ctx_used // 0") tokens ($(ctx_pct $i)%) reached its $(st ".members[$i] | (.handover_at // $HANDOVER) as \$h | if \$h > 1 then (\$h|tostring)+\" tokens\" else ((\$h*100|floor)|tostring)+\"%\" end") handover threshold — new session"
-  local tm_step=$TM_STEP ogen; ogen=$(mget $i gen)
+  local tm_step=$TM_STEP
   tm handover --member $i --task step="$tm_step" round="$TM_ROUND" type=threshold stage=start ctx_used="$(st ".members[$i].ctx_used // \"null\"")" ctx_limit="$(st ".members[$i].ctx_limit // \"null\"")"
-  TM_HO=$TM_LAST; TM_HO_MEMBER=$i; TM_LASTOUT=""
+  TM_HOS[$i]=$TM_LAST; HO_LAUNCHED[$i]=0
   local pf="$RUN/prompts/handover-$id-g$(mget $i gen).md"; prompt_handover $i >"$pf"
   append_historical_map_locator "$pf" "$(st .task_id)"
-  CALL_LEFT_RUNNING=0; TM_STEP=handover
-  if launch $i "$pf" "handover-g$(mget $i gen)"; then
-    collect $i; tm_end $i "$( [ $? -eq 0 ] && [ "$TM_EMPTY" != 1 ] && echo ok || echo fail)"
-  else tm_launch_failed $i; fi
+  TM_STEP=handover
+  if launch $i "$pf" "handover-g$(mget $i gen)"; then HO_LAUNCHED[$i]=1; else tm_launch_failed $i; fi
   TM_STEP=$tm_step
+}
+handover_finish() {  # idx -> 0 the member has a new session; 1 its note call left a process group running
+  local i=$1 id tm_step=$TM_STEP ogen; id=$(mid $i); ogen=$(mget $i gen)
+  TM_HO=${TM_HOS[$i]}; TM_HO_MEMBER=$i; TM_LASTOUT=""
+  CALL_LEFT_RUNNING=0
+  if [ "${HO_LAUNCHED[$i]}" = 1 ]; then
+    collect $i; tm_end $i "$( [ $? -eq 0 ] && [ "$TM_EMPTY" != 1 ] && echo ok || echo fail)"
+  else TM_LASTOUT=failed; fi
   [ "$CALL_LEFT_RUNNING" = 1 ] && return 1   # never open a new session beside a handover call that survived SIGKILL
   local note="$RUN/raw/handover-g$(mget $i gen)-$id.md"; [ -s "$note" ] || echo "(the previous session produced no handover note)" >"$note"
   handover_gate "$note"
@@ -1870,9 +1883,10 @@ do_handover() {  # idx -> old session writes a note; new session created; note s
     '.members[$i] |= (.retired += [{session:.session, gen:.gen, tokens:.session_tokens, cost:.session_cost}] | .gen+=1 | .session=null | .fresh=true | .handover_note=$note | .ctx_used=0 | .session_tokens=0 | .session_cost=0 | .session_calls=0)
      | .log += ["\($now) member \(.members[$i].id) g\(.members[$i].gen): handover from \($old)"]' --arg now "$(now)"
   tm handover --member $i --task step="$tm_step" round="$TM_ROUND" type=threshold stage=end handover_seq="$TM_HO" gen=$ogen new_gen="$(mget $i gen)" note_outcome="$TM_LASTOUT"
-  TM_HO=""; TM_HO_MEMBER=""
+  TM_HO=""; TM_HO_MEMBER=""; TM_HOS[$i]=""; HO_LAUNCHED[$i]=""
   render_transcript
 }
+do_handover() { handover_launch $1; handover_finish $1; }   # idx -> one member alone
 
 # run one deliberation step for all members: $1 = tag (r<N> / x<N> / exec), $2 = prompt generator (name), $3 = task json
 # writes posts/<tid>-<tag>-<id>.md and .json (tail); sets .last_votes; returns 0 ok / 1 member failure
@@ -1890,12 +1904,17 @@ run_step() {
   if [ "$CODEMAP" = 1 ] && codemap_is_deliberation "$gen"; then
     codemap_prepare "$tid" "$tag" "$( [ "$gen" = prompt_round1 ] && echo 1 || echo 0 )"
   fi
-  for i in $idxs; do
-    if needs_handover $i; then do_handover $i; [ "$CALL_LEFT_RUNNING" = 1 ] && { stop_inflight handover; return 1; }; fi
+  # Members past their handover threshold write their notes at the same time, while the others already start this step;
+  # each handed-over member is launched as soon as its own note is through the gate.
+  local ho=""
+  for i in $idxs; do needs_handover $i && ho="$ho $i"; done
+  for i in $ho; do handover_launch $i; done
+  launch_member() {  # idx -> this step's call for one member (or its checkpointed post); 1 = launch failed, all stopped
+    local i=$1
     pf="$RUN/prompts/$tid-$tag-$(mid $i).md"
     if [ "$(st '.reuse_posts // false')" = true ] && post_valid "$RUN/posts/$tid-$tag-$(mid $i).json" && [ -s "$RUN/posts/$tid-$tag-$(mid $i).md" ]; then
       log "member $(mid $i): reusing its $tag post from the checkpoint (not re-run)"; sts --argjson i $i '.members[$i].inflight={tag:"reuse"}'
-      tm reused --member $i --task step=$tstep round=$r; continue
+      tm reused --member $i --task step=$tstep round=$r; return 0
     fi
     launch_gen[$i]=$(mget $i gen)
     codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID
@@ -1917,8 +1936,13 @@ run_step() {
     codemap_append_locator "$pf" "$tid" "$tag" prompt
     case "$gen" in prompt_round1|prompt_roundN) ;; *) append_historical_map_locator "$pf" "$tid" ;; esac
     $gen $i "$t" "$r" >>"$pf"
-    launch $i "$pf" "$tid-$tag" || { tm_launch_failed $i; log "member $(mid $i): launch failed"; stop_inflight launch_failed; return 1; }   # members launched before it are not left running unwatched
+    launch $i "$pf" "$tid-$tag" || { tm_launch_failed $i; log "member $(mid $i): launch failed"; stop_inflight launch_failed; return 1; }   # calls launched before it are not left running unwatched
     codemap_record_launched "$pf" "$tid" "$tag"
+  }
+  for i in $idxs; do case " $ho " in *" $i "*) ;; *) launch_member $i || return 1 ;; esac; done
+  for i in $ho; do
+    handover_finish $i || { stop_inflight handover; return 1; }
+    launch_member $i || return 1
   done
   local fail=0
   for i in $idxs; do

@@ -179,7 +179,7 @@ How it works:
   the Mac's platform UUID; never ids, task text, posts, notes, paths or names). `COUNCIL_TELEMETRY=0` turns it off;
   `COUNCIL_TELEMETRY_DIR` moves the ledger; `scripts/ptools/telemetry_report.py` reports offline over one or many
   Macs' ledgers. Details in SKILL.md, "Telemetry".
-- **Tests.** `bash scripts/test-completion.sh` — 1780 offline checks (no network, no model calls), including
+- **Tests.** `bash scripts/test-completion.sh` — 1834 offline checks (no network, no model calls), including
   `scripts/ptools/test_ptools.py` (779 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
@@ -187,6 +187,23 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **0.14.0** — less waiting, tighter scope. Measured on the local telemetry ledger (27 councils, 525 calls, 10.6 h):
+  plan rounds are 42% of the time, handovers 11% plus 0.7 h of gate waits, and 4.2 h passed between invocations waiting
+  for answers to member questions. (1) **Parallel handovers:** `do_handover` is split into `handover_launch` and
+  `handover_finish`; `run_step` starts the note of every member past its threshold at once, launches the members that need
+  no handover meanwhile, and launches each handed-over member as soon as its own note is through the gate. A note call
+  that leaves a process group running still stops everything in flight. (2) **Round 1 clarifies first (grilling):** each
+  member maps the task as a decision tree, settles facts from the working directory itself, and asks the whole frontier
+  (every open decision whose prerequisites are settled) in one post, numbered, with options and a recommended answer;
+  later rounds ask only about a choice that an answer or another post opened. (3) **HARD scope rule:** the rules now start
+  with a rule that overrides the others: members read, analyse, ask and propose only what the current task needs;
+  later rounds and ratification judge only against the task and the plan. The byte-exact baselines (97f4c70, d62a356)
+  are compared with the same changes applied (`approve_scope_prompts`, `approve_parallel_handover`). A new suite,
+  `verify_0140_tests`, checks each change directly: the argv of real claude launches and the oc.sh calls (bypass and
+  `--auto`), the scope and question lines in every deliberation prompt, the real `handover_finish` (order, new
+  generation, retired totals, a call left running, a failed launch), and that every line the baseline helpers patch
+  into 97f4c70 and d62a356 equals the current line.
+  test-completion.sh: 1834 checks; test_ptools.py: 779 cases.
 - **0.13.0** — council members run with permissions bypassed. Claude Code members start with
   `--permission-mode bypassPermissions` (previously `plan` for read members and `acceptEdits` for the executor),
   also on `resume` of older runs and on `--replace`. OpenCode members pass `--auto` to `oc.sh new`/`prompt`/`wait`, so
@@ -394,7 +411,7 @@ python3 scripts/ptools/run_check.py --log-dir /tmp/checks -- sh -c 'pytest --jun
   shell) with the caller's cwd and environment plus `RUN_CHECK_REPORT_DIR`, stdin `/dev/null`, in its own process group. A usage error exits 2
   with the message on stderr only: stdout is empty, nothing is created and the command does not run. Use a `--log-dir` outside the project
   (or in an ignored directory): `.gitignore` ignores `*.log` but neither the failures index nor the report directory, and
-  `scripts/council.sh:2056-2057` puts `git status --short` into the ratification diff.
+  `scripts/council.sh:2081-2082` puts `git status --short` into the ratification diff.
 - **The whole stdout is capped.** The final newline included, stdout is at most `--max-bytes` bytes of UTF-8 whatever the locale or
   `PYTHONIOENCODING`, and it never splits a code point. The mandatory lines are budgeted **before launch** in their worst case (every
   optional line present, 20-digit counters, the real absolute paths, 80-byte reasons, the pending line with its `--fallback-dir` disclosure, the final and emergency variants): when

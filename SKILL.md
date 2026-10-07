@@ -140,7 +140,7 @@ cheap pair is already at the ceiling, and a stronger or larger council only adds
 input/output tokens and `gpt-6.1-sol` costs $2/$10, so Terra is older but not cheaper. The cheap
 OpenAI option is `gpt-6-luna` at $0.1/$0.5.
 
-When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:642`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:738,800`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
+When `map_code` is true, every original task receives a bounded read-only navigation pre-pass and a user map-review checkpoint. Mapper settings may be supplied in `map_prepass` (`kind`, `model`, `effort`, `timeout_s`, `max_output_bytes`). If model or effort is omitted, `start` proposes OpenCode `google/gemini-3.8-flash` at medium effort and pauses before any inference call. Confirm with `resume --run-dir D --confirm-mapper FILE`, where FILE contains the exact `{"kind":"opencode","model":"google/gemini-3.8-flash","effort":"medium"}` tuple (or the displayed proposal). A config-specified complete mapper pair needs no confirmation. The mapper prompt asks for exactly one JSON object (`scripts/council.sh:643`). When strict parsing fails, a narrow syntax repair runs outside string literals: it quotes bare keys, removes a trailing comma after a value, inserts a missing comma between the three known top-level fields, and adds missing outer braces. It never changes a value. Ambiguous text stays unavailable, and duplicate keys and NaN/Infinity are rejected (`_repair_json_syntax`, `_unique_keys`, `_reject_constant`: `scripts/council_map_prepass.py:22-81,98-105`). Each repair is listed in `result.repairs`, `validation.err` and the map review (`council_map_prepass.py:153,313`; `scripts/council.sh:739,801`). After mapping, inspect the displayed complete-map locator and use `resume --run-dir D --map-decision FILE`; FILE is `{"action":"keep"}` or `{"action":"split","contract_file":"path/to/contract.json"}`. Splits are checked offline against declared baseline files before any further model call. The map remains incomplete, and members must inspect raw evidence and independently check task scope.
 
 The split contract file path is relative to the directory containing the map-decision JSON. A version-1 contract names `parent_id` and the exact contract `map_seed_id` printed at map review from `coverage.json`; the locator's `snapshot_id` is a distinct lookup identity and must not be substituted. It then supplies non-empty `subtasks`; every child declares unique `id`, complete `text`, boolean `execute`, and arrays `requires`, `modifies`, `deletes`, `creates`, `acceptance`, and `unresolved`. Existing-file declarations bind to `{ "path": "...", "sha256": "<64 lowercase hex>" }`; created paths must be absent. Each acceptance item requires a unique `id`, `description`, non-empty `argv`, integer `expected_exit`, and its own baseline/output paths. Shared reads are valid; sibling-output dependencies and overlapping writes are not. The validator is offline and failure returns to map review (exit 4); correct the contract or explicitly keep the parent task.
 
@@ -173,7 +173,7 @@ run's state). Exit codes: **0** all tasks reached consensus · **1** config erro
 council has questions for the user · **5** finished but a task is `unresolved`/`unratified`.
 
 **Claude member calls.** Each `claude -p` call runs as the leader of its own process group (a
-`python3` `os.setsid` exec wrapper, `scripts/council.sh:1431`), and every attempt writes its own
+`python3` `os.setsid` exec wrapper, `scripts/council.sh:1432`), and every attempt writes its own
 `D/raw/<tag>-<id>-a<N>.json` (`:1100`). `kill_group` stops the whole group: SIGTERM, up to 10 s,
 SIGKILL, then up to 10 s until no live process is left (`:1034-1037`). It runs on timeout, after a
 call that exited but left processes in its group, on TERM/INT/HUP to `start`/`resume` (the trap is
@@ -215,20 +215,37 @@ language, shell and permissions instead of picking them). Read `D/questions.json
 answer on the user's behalf), write `answers.json` as `{"<id>": "<answer>"}` covering every id (or
 `--answer TEXT` for one answer to all), and `resume`. The answers are relayed verbatim to every member
 and the round is re-run without consuming the round budget.
+Round 1 clarifies first, in the style of the [grilling skill](https://github.com/mattpocock/skills/blob/main/skills/productivity/grilling/SKILL.md):
+each member maps the task as a decision tree, settles every *fact* from the working directory itself (facts are never
+asked), and asks the whole *frontier* — every open decision whose prerequisites are already settled — in one post,
+numbered, with options and a recommended answer (`Q1 — <title>: <question and options>. Recommended: <answer> (<why>)`).
+A question that depends on one still open waits for the next stop; a member proposes only when its frontier is empty.
+After the answers it recomputes the frontier and asks only what those answers opened; in later rounds a member asks
+only about a choice that an answer or another member's post opened. When you put the questions to the user, offer a
+member's recommended answer as the first option, marked (Recommended). (Measured before this rule: 21 of 22 question
+rounds were round 1, but a re-run round 1 often found new questions — one task stopped 4 times.)
+
+**Scope — HARD rule.** The council rules start with a scope rule that overrides the others: members read, analyse,
+ask and propose only what the current task needs — no review of unrelated code, no wider task, no extra features,
+refactors or follow-up work. Something noticed outside the task gets at most one line marked "outside scope" and
+never drives a proposal or a vote. Later rounds judge the candidate only against the task, and ratification checks
+only what the plan and the task cover.
 For two or more pending questions of one task, `--answer TEXT` records one explicitly shared answer with all question IDs in `ids` and all original questions labelled inside `question`. The answer applies to every listed question. `id` remains the first ID; `member` lists distinct originating members in first-appearance order. Do not assume one `.answers[]` entry means one original question or that its `member` names one council member. Single-question answers and `--answers FILE` are unchanged. Older stored records are not migrated, and placeholder strings are never interpreted or recovered.
 
 **Context handover.** After every call the member's context use is measured (OpenCode: tokens of the
 last assistant message vs the model's context limit; Claude: `usage` of the last iteration vs
 `modelUsage.contextWindow`). At ≥ `handover_at` (after at least 2 calls on that session) the session
 writes a handover note, a fresh session is created for the same member id (generation +1), and the
-note + council rules are prepended to its first prompt. `status` and the transcript show per member:
+note + council rules are prepended to its first prompt. Members that cross their threshold in the same step write
+their notes in parallel (`handover_launch`/`handover_finish`); members that need no handover start the step
+meanwhile, and each handed-over member is launched as soon as its own note is through the gate. `status` and the transcript show per member:
 generation, context %, session tokens, cost, calls, retired sessions. Both include each
 member's final-generation + retired subtotal and a **RUN TOTAL** across all generations.
 
 **Handover gate (optional).** With `COUNCIL_HANDOVER_GATE=1` in the orchestrator's environment (it works on
 `start` and on `resume` of an existing run), the delivered handover note waits for an outside review before the
-successor reads it: `do_handover` writes `<note>.pending`, logs `handover gate: review <note>; remove
-<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1834-1850`). A replacement note (`resume --replace`) waits the same way.
+successor reads it: `handover_finish` writes `<note>.pending`, logs `handover gate: review <note>; remove
+<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1839-1855`). A replacement note (`resume --replace`) waits the same way.
 The successor reads the note by path when its prompt is built, so a reviewer may correct the file in place before
 releasing it. Without the gate the successor's prompt is written 0-1 s after the note (measured on 5 handovers), too
 soon for any review. The wait is bounded by `COUNCIL_HANDOVER_GATE_TIMEOUT` seconds (default 3600); an unreleased
@@ -521,7 +538,7 @@ byte-for-byte match with one of the member's own prompt files, otherwise `unknow
 
 Build/test runner with a capped summary (`run_check.py`, Python 3 standard library, POSIX only, `-h`; it **executes** the command and **writes**
 files, so unlike the other tools it is not read-only; use a `--log-dir` outside the project, `.gitignore` covers `*.log` only and
-`diff_text` (`scripts/council.sh:2056-2057`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
+`diff_text` (`scripts/council.sh:2081-2082`) puts `git status --short` into the ratification diff when the executor is not an OpenCode member):
 
 ```bash
 python3 scripts/ptools/run_check.py --log-dir D [--fallback-dir F] [--reports GLOB]... [--max-bytes N] [--timeout SECONDS] -- COMMAND [ARG...]
