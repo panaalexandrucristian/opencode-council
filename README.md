@@ -190,6 +190,12 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **0.16.0** — Claude Code members launch with a 1-hour prompt cache. `launch()` sets `CLAUDE_CODE_PROMPT_CACHE_TTL`
+  on every Claude Code member: `1h` by default, or `5m` with `"claude_cache_ttl": "5m"` in `council.json` (any other value
+  is a config error). The council value wins over an operator-exported variable; Claude Code ≥ 2.1.242 reads it,
+  OpenCode members are unaffected, and subagents and compaction keep their own 5-minute default. The default is not
+  stored in the config and the roster shows `claude cache TTL: …` only when the field is set, so a default start stays
+  byte-identical to the 97f4c70 baseline. New suite `claude_cache_ttl_tests` (16 checks).
 - **0.15.0** — Claude Code members no longer bypass permissions (the Claude half of 0.13.0 undone). Read members run
   with `--permission-mode plan` and without Edit/Write/MultiEdit/NotebookEdit; the executor runs with `acceptEdits` and
   `--allowedTools "Bash Edit Write MultiEdit NotebookEdit"`, also on `--replace`. A run started by 0.13/0.14 that
