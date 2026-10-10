@@ -12,7 +12,7 @@ COUNCIL ROSTER
   B    opencode  kimi-code-plan-global/k3           high     edit   build        1048k
   executor (only member allowed to edit files): B
   dir: /path/to/project
-  max_rounds/task: 4 · timeout/call: 600s · handover at 50% context · claude max_turns: 30
+  max_rounds/task: 4 · timeout/call: 600s · handover at 50% context · claude max_turns: 30 · claude cache TTL: 1h
   tasks:
     hello [build]: Creează în directorul de lucru un script shell `hello.sh` care afișează un salut.
 ```

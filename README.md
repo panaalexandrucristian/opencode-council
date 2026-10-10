@@ -98,6 +98,7 @@ council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member 
 ```json
 {
   "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "handover_at": 0.5, "max_turns": 30,
+  "claude_cache_ttl": "1h",
   "map_code": false,
   "executor": "C",
   "tasks": [

@@ -527,6 +527,51 @@ SH
     done
   fi
 )
+# council.json claude_cache_ttl ("1h" default | "5m"): every Claude member is launched with CLAUDE_CODE_PROMPT_CACHE_TTL set to
+# it, whatever the operator's own environment says; a run directory that predates the field resumes with 1h.
+claude_cache_ttl_tests() (
+  load council.sh; RUN="$scratch/cachettl"; ST="$RUN/state.json"; N=1; DIR=$scratch; MAXT=3; TIMEOUT=20; MAP_PREPASS=0
+  F="$scratch/cachettl-bin"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts" "$F"
+  export PATH="$F:$PATH"
+  # a fake claude records the cache TTL variable it was started with ("unset" when absent) and answers at once
+  cat >"$F/claude" <<'SH'
+#!/bin/sh
+printf '%s' "${CLAUDE_CODE_PROMPT_CACHE_TTL-unset}" >"$FAKE_ENV"
+printf '%s\n' '{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+SH
+  chmod +x "$F/claude"; printf 'prompt\n' >"$RUN/prompts/p.md"
+  jq -n '{members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"read",permission_mode:"plan",session:null,fresh:false,calls:0,session_calls:0}],last_votes:[]}' >"$ST"
+  run_cl() { FAKE_ENV="$F/env" launch 0 "$RUN/prompts/p.md" "t-$1" && FAKE_ENV="$F/env" collect 0; }
+  seen() { test "$(cat "$F/env")" = "$1"; }
+  check 0 'cache ttl: a claude member launches and is collected' '' run_cl default
+  check 0 'cache ttl: with nothing configured the member runs with 1h' '' seen 1h
+  CACHE_TTL=5m
+  check 0 'cache ttl: a council set to 5m launches its next call' '' run_cl five
+  check 0 'cache ttl: the member runs with 5m' '' seen 5m
+  CACHE_TTL=1h; export CLAUDE_CODE_PROMPT_CACHE_TTL=5m   # the operator exported a different value
+  check 0 'cache ttl: a call launches while the operator environment holds another value' '' run_cl operator
+  check 0 'cache ttl: the council setting wins over the operator environment' '' seen 1h
+  unset CLAUDE_CODE_PROMPT_CACHE_TTL
+  # resume: load_state reads the field, and a state from before the field existed gives 1h
+  mkstate() { mkdir -p "$scratch/cachettl-$1"; jq -n --argjson extra "$2" '{config:({dir:"/tmp",max_rounds:2,timeout_s:30,handover_at:0.5,executor:null} + $extra),members:[]}' >"$scratch/cachettl-$1/state.json"; echo "$scratch/cachettl-$1"; }
+  ttl_of() { RUN=$1; load_state; printf '%s' "$CACHE_TTL"; }
+  check 0 'cache ttl: load_state reads claude_cache_ttl from the run config' 5m ttl_of "$(mkstate five '{"claude_cache_ttl":"5m"}')"
+  check 0 'cache ttl: a run directory that predates the field resumes with 1h' 1h ttl_of "$(mkstate old '{}')"
+  # config validation, normalisation and the roster
+  mkcfg() { jq -n --argjson extra "$2" '{dir:"/tmp",executor:null,handover_at:0.5,max_rounds:2,timeout_s:30,tasks:["x"],members:[{id:"A",kind:"claude",model:"sonnet",effort:"high",mode:"read"},{id:"B",kind:"claude",model:"sonnet",effort:"high",mode:"read"}]} + $extra' >"$RUN/cfg-$1.json"; echo "$RUN/cfg-$1.json"; }
+  field_of() { jq -r .claude_cache_ttl <<<"$(validate_config "$1")"; }
+  invalid_config() { validate_config "$1" 2>&1; }
+  unset_in() { jq -e 'has("claude_cache_ttl")|not' <<<"$(validate_config "$1")"; }   # the 1h default lives in load_state and launch, not in the stored config
+  check 0 'cache ttl: validate_config does not write a default claude_cache_ttl into the config' '' unset_in "$(mkcfg none '{}')"
+  check 0 'cache ttl: validate_config keeps 5m' 5m field_of "$(mkcfg five '{"claude_cache_ttl":"5m"}')"
+  check 0 'cache ttl: validate_config keeps 1h' 1h field_of "$(mkcfg hour '{"claude_cache_ttl":"1h"}')"
+  check 1 'cache ttl: a value other than 1h or 5m is rejected' 'claude_cache_ttl must be 1h|5m' invalid_config "$(mkcfg bad '{"claude_cache_ttl":"2h"}')"
+  check 1 'cache ttl: a number is rejected' 'claude_cache_ttl must be 1h|5m' invalid_config "$(mkcfg num '{"claude_cache_ttl":3600}')"
+  no_ttl_line() { ! print_roster "$(validate_config "$1")" "" | grep -q 'cache TTL'; }   # a default start prints exactly what it printed before the field existed
+  check 0 'cache ttl: the roster stays unchanged when the field is not set' '' no_ttl_line "$(mkcfg none '{}')"
+  check 0 'cache ttl: the roster states a configured 5m' 'claude cache TTL: 5m' print_roster "$(validate_config "$(mkcfg five '{"claude_cache_ttl":"5m"}')")" ""
+  check 0 'cache ttl: the roster states a configured 1h' 'claude cache TTL: 1h' print_roster "$(validate_config "$(mkcfg hour '{"claude_cache_ttl":"1h"}')")" ""
+)
 ptools_tests() (
   # the analysis tools are part of the skill: their own unittest suite must pass,
   # and both must run on a run directory produced by council.sh itself.
@@ -3577,7 +3622,7 @@ PY
   check 0 'held rerun: a clock status that does not match the held signal: not rerun' '0 1 -' clock '130 0' TERM 1
   check 0 'held rerun: a clock outside the held interval: not rerun' '0 1 -' clock '143 0' TERM 0
 )
-SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests verify_0140_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests"
+SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests verify_0140_tests claude_cache_ttl_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests"
 usage() {
   echo "usage: test-completion.sh [-j N] [--list] [SUITE...]"
   echo "  SUITE...  run only these suites (default: all, in the listed order)"

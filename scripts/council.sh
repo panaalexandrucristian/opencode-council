@@ -19,6 +19,7 @@
 # Config (JSON, every field explicit — no hidden defaults, see SKILL.md "Council"):
 # {
 #   "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "handover_at": 0.5, "max_turns": 30,
+#   "claude_cache_ttl": "1h" | "5m",    (optional, default "1h": the prompt-cache lifetime of every Claude Code member)
 #   "executor": "A" | null,
 #   "tasks": ["question", {"id":"t2","text":"...","execute":true}],
 #   "members": [ {"id":"A","kind":"opencode","model":"openai/gpt-6-astra","effort":"high","mode":"read","handover_at":0.35},
@@ -68,7 +69,7 @@ while [ $# -gt 0 ]; do
     --answer)  ANSWER_TEXT=$2; shift 2 ;;
     --confirm-mapper) CONFIRM_MAPPER_FILE=$2; shift 2 ;;
     --map-decision) MAP_DECISION_FILE=$2; shift 2 ;;
-    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
     --*)       die "unknown option: $1" ;;
     *)         [ -z "$CMD" ] && CMD=$1 || die "unexpected argument: $1"; shift ;;
   esac
@@ -92,11 +93,11 @@ ST=""
 st()  { jq -r "$1" "$ST"; }                                   # read
 stj() { jq -c "$1" "$ST"; }                                   # read json
 sts() { jq "$@" "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"; }     # update (atomic)
-N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; EXEC=""; CODEMAP=0; MAP_PREPASS=0
+N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; CACHE_TTL=1h; EXEC=""; CODEMAP=0; MAP_PREPASS=0
 load_state() {
   ST="$RUN/state.json"; [ -f "$ST" ] || die "no state in $RUN (not a council run dir)"
   N=$(st '.members|length'); DIR=$(st '.config.dir'); MAXR=$(st '.config.max_rounds'); TIMEOUT=$(st '.config.timeout_s')
-  HANDOVER=$(st '.config.handover_at'); MAXT=$(st '.config.max_turns // 30'); EXEC=$(st '.config.executor // ""')
+  HANDOVER=$(st '.config.handover_at'); MAXT=$(st '.config.max_turns // 30'); CACHE_TTL=$(st '.config.claude_cache_ttl // "1h"'); EXEC=$(st '.config.executor // ""')
   MAP_PREPASS=0
   if [ "$(st '.map_prepass_version // 0')" = 1 ] && [ "$(st '.config.map_code // false')" = true ]; then MAP_PREPASS=1; fi
   codemap_check_version
@@ -1210,6 +1211,7 @@ validate_config() {  # $1 = config file -> prints normalised config json
     + (if (.max_rounds|type)=="number" and .max_rounds>=2 and .max_rounds<=10 then [] else ["max_rounds must be 2..10 (round 1 = proposals, consensus needs at least one voting round)"] end)
     + (if (.timeout_s|type)=="number" and .timeout_s>=30 then [] else ["timeout_s must be >= 30"] end)
     + (if (.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))) then [] else ["handover_at must be a fraction in (0,1] of the model context window, or an absolute token count >= 1000 (e.g. 150000)"] end)
+    + (if has("claude_cache_ttl") and (.claude_cache_ttl|IN("1h","5m")|not) then ["claude_cache_ttl must be 1h|5m"] else [] end)
     + (if has("map_code") and (.map_code|type)!="boolean" then ["map_code must be a boolean"] else [] end)
     + (if has("map_prepass") and (.map_prepass|type)!="object" then ["map_prepass must be an object containing mapper settings"] else [] end)
     + (if ($mp|has("kind")) and (($mp.kind|type)!="string" or $mp.kind!="opencode") then ["map_prepass.kind must be opencode"] else [] end)
@@ -1276,7 +1278,7 @@ print_roster() {  # $1 = normalised config json, $2 = ctx-limit tsv (id<TAB>limi
     echo "  mapper: $(jq -r '"opencode / " + (.map_prepass.model // "google/gemini-3.8-flash") + " / " + (.map_prepass.effort // "medium") + (if (.map_prepass.model and .map_prepass.effort) then " (configured)" else " (proposal; explicit confirmation required)" end)' <<<"$cfg")"
     echo "  mapper limits: $(jq -r '.map_prepass.timeout_s // 120' <<<"$cfg")s, $(jq -r '.map_prepass.max_output_bytes // 65536' <<<"$cfg") response bytes"
   fi
-  echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at as $h | if $h > 1 then ($h|tostring)+" tokens" else (($h*100|floor)|tostring)+"% of context" end' <<<"$cfg") (council default; per-member values in the table) · claude max_turns: $(jq -r .max_turns <<<"$cfg")"
+  echo "  max_rounds/task: $(jq -r .max_rounds <<<"$cfg") · timeout/call: $(jq -r .timeout_s <<<"$cfg")s · handover at $(jq -r '.handover_at as $h | if $h > 1 then ($h|tostring)+" tokens" else (($h*100|floor)|tostring)+"% of context" end' <<<"$cfg") (council default; per-member values in the table) · claude max_turns: $(jq -r .max_turns <<<"$cfg")$(jq -r 'if has("claude_cache_ttl") then " · claude cache TTL: " + .claude_cache_ttl else "" end' <<<"$cfg")"
   echo "  tasks:"; jq -r '.tasks[] | "    \(.id)\(if .execute then " [build]" else "" end): \(.text|gsub("\n";" ")|.[0:110])"' <<<"$cfg"
 }
 
@@ -1431,7 +1433,7 @@ launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inf
     local n=1 out; while [ -e "$RUN/raw/$tag-$(mid $i)-a$n.json" ]; do n=$((n+1)); done; out="$RUN/raw/$tag-$(mid $i)-a$n.json"
     # own session, so its own process group (pgid = $! = claude itself after the execs); no controlling terminal
     CL_PREV=$!; CL_LAUNCHING=pending   # until its record is written, the signal trap stops this call through CL_LAUNCHING
-    ( cd "$DIR" && exec python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' env -u CLAUDE_EFFORT claude "${args[@]}" <"$pf" >"$out" 2>"$out.err" ) &
+    ( cd "$DIR" && exec python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' env -u CLAUDE_EFFORT CLAUDE_CODE_PROMPT_CACHE_TTL="${CACHE_TTL:-1h}" claude "${args[@]}" <"$pf" >"$out" 2>"$out.err" ) &
     CL_LAUNCHING=$!
     sts --argjson i $i --arg t "$tag" --argjson p $CL_LAUNCHING --arg s "$(LC_ALL=C ps -o lstart= -p $CL_LAUNCHING 2>/dev/null)" --arg o "$out" \
       '.members[$i].inflight={tag:$t,pid:$p,pgid:$p,started:$s,raw:$o}'

@@ -4,6 +4,7 @@
   "timeout_s": 600,
   "handover_at": 0.5,
   "max_turns": 30,
+  "claude_cache_ttl": "1h",
   "executor": "B",
   "tasks": [
     {"id": "hello", "text": "Creează în directorul de lucru un script shell `hello.sh` care afișează un salut.", "execute": true}
