@@ -191,7 +191,7 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
-- **Unreleased** — a member's handover is no longer a note the model writes. `council.sh` compacts the retiring
+- **0.17.0** — a member's handover is no longer a note the model writes. `council.sh` compacts the retiring
   session's own transcript with jev's `make_context.py` (a Claude session from its transcript, an OpenCode session from
   `opencode.db`; no model call) into `D/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` + `blobs/`. The successor's
   first prompt names that file (read, never copied) and says it overrides what the file tells a reader to do after reading;
