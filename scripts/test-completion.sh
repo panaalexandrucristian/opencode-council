@@ -258,6 +258,7 @@ dedup_tests() (
     fixture
     [ "$1" != trailing ] || { proposal="$proposal"$'\n\n'; fixture; }
     [ "$1" != fresh ] || sts '.members[1].fresh=true'
+    [ "$1" != compact ] || { echo COUNCIL_POST >"$scratch/handover"; sts --arg f "$scratch/handover" '.members[1] += {fresh:true,handover_note:$f,handover_kind:"compact"}'; }
     cp "$ST" "$scratch/before-state"; cp "$RUN/posts/fixture-r1-A.md" "$scratch/before-post"
     pair 1
     grep -q '^Exact candidate:' "$scratch/dedup-prompt" &&
@@ -271,6 +272,7 @@ dedup_tests() (
   }
   check 0 'dedup exact decoded equality, Unicode, escaped quotes/newlines, posts/state unchanged' '' exact resumed
   check 0 'dedup fresh session' '' exact fresh
+  check 0 'dedup still applies when the fresh member only references a compact handoff that mentions the marker' '' exact compact
   check 0 'dedup preserves trailing proposal newlines' '' exact trailing
   difference() { fixture; sts --arg suffix "$1" '.candidate.text += $suffix'; fallback; }
   check 0 'dedup one-character difference falls back' '' difference x
@@ -416,8 +418,8 @@ handover_tests() (
   mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
   mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
 
-  # run_step: every member past its threshold writes its note at once; the others start the step meanwhile, and each
-  # handed-over member is launched right after its own note is through the gate
+  # run_step: the handoff of every member past its threshold is built at once; the others start the step meanwhile, and each
+  # handed-over member is launched right after its own handoff is through the gate
   RUN="$scratch/ho-run"; rm -rf "$RUN"; mkdir -p "$RUN"; ST="$RUN/state.json"; CODEMAP=0
   jq -n '{reuse_posts:false,last_votes:[],notices:[],members:[{id:"A",gen:1,fresh:false},{id:"B",gen:1,fresh:false},{id:"C",gen:1,fresh:false}]}' >"$ST"
   validate_child_launch() { :; }; tm() { :; }; tm_end() { :; }; render_transcript() { :; }
@@ -430,13 +432,134 @@ handover_tests() (
   stop_inflight() { echo "STOP $1" >>"$RUN/order"; }
   collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r2-$(mid $1).md"; }
   check 0 'parallel handovers: the step succeeds' '' run_step r2 fakegen '{"id":"t1"}' 2
-  check 0 'parallel handovers: both notes start, B starts meanwhile, A and C follow their own notes' 'HL 0 HL 2 L 1 HF 0 L 0 HF 2 L 2' sh -c 'tr "\n" " " <"$1"' _ "$RUN/order"
-  rm -f "$RUN/order"; handover_finish() { echo "HF $1" >>"$RUN/order"; [ "$1" != 0 ]; }
-  check 1 'parallel handovers: a note call left running fails the step' '' run_step r2 fakegen '{"id":"t1"}' 2
-  check 0 'parallel handovers: everything in flight is stopped and A is never launched beside it' 'HL 0 HL 2 L 1 HF 0 STOP handover' sh -c 'tr "\n" " " <"$1"' _ "$RUN/order"
+  check 0 'parallel handovers: both handoffs start, B starts meanwhile, A and C follow their own handoffs' 'HL 0 HL 2 L 1 HF 0 L 0 HF 2 L 2' sh -c 'tr "\n" " " <"$1"' _ "$RUN/order"
+)
+# scripts/vendor/jev-handoff is the pinned copy of the jev compact-handoff scripts that council.sh builds handover notes with;
+# update_jev_handoff.py refreshes it from a jev commit and --check proves the committed copy is exactly the pinned one.
+vendor_tests() (
+  U="$HERE/vendor/update_jev_handoff.py"; V="$scratch/vendor"; rm -rf "$V"; mkdir -p "$V"
+  check 0 'vendor: the committed copy matches VENDOR.json' 'jev-handoff: OK' python3 -B "$U" --check
+  check 0 'vendor: VENDOR.json pins one full jev commit' true jq -e '(.commit|test("^[0-9a-f]{40}$")) and (.source|startswith("https://github.com/"))' "$HERE/vendor/jev-handoff/VENDOR.json"
+  check 0 'vendor: the pinned copy carries the jev license' 'MIT License' cat "$HERE/vendor/jev-handoff/LICENSE"
+  cp -R "$HERE/vendor/jev-handoff" "$V/c"
+  C=skills/compact-handoff/scripts/make_context.py
+  printf '\n# edited\n' >>"$V/c/$C"
+  check 1 'vendor: an edited file is reported' "changed: $C" python3 -B "$U" --check --dest "$V/c"
+  cp "$HERE/vendor/jev-handoff/$C" "$V/c/$C"; rm "$V/c/skills/handoff-verify/scripts/sanitize.py"
+  check 1 'vendor: a missing file is reported' 'missing: skills/handoff-verify/scripts/sanitize.py' python3 -B "$U" --check --dest "$V/c"
+  cp "$HERE/vendor/jev-handoff/skills/handoff-verify/scripts/sanitize.py" "$V/c/skills/handoff-verify/scripts/sanitize.py"; : >"$V/c/skills/handoff-verify/scripts/extra.py"
+  check 1 'vendor: a file VENDOR.json does not list is reported' 'not in VENDOR.json: skills/handoff-verify/scripts/extra.py' python3 -B "$U" --check --dest "$V/c"
+  rm "$V/c/skills/handoff-verify/scripts/extra.py"
+  check 1 'vendor: a copy without VENDOR.json is reported' 'VENDOR.json is missing' python3 -B "$U" --check --dest "$V/none"
+  # refreshing from a jev commit: only compact-handoff plus the import closure of prepare/omissions/discover is copied
+  R="$V/jev"; mkdir -p "$R/skills/compact-handoff/scripts" "$R/skills/handoff-verify/scripts"
+  for f in make_context compact_context opencode_source prepare_all; do echo "x = 1" >"$R/skills/compact-handoff/scripts/$f.py"; done
+  H="$R/skills/handoff-verify/scripts"
+  printf 'import helper\nfrom discover import find\n' >"$H/prepare.py"; printf 'import os.path\nimport discover\n' >"$H/omissions.py"; echo 'x = 1' >"$H/discover.py"
+  printf 'import deeper, json\n' >"$H/helper.py"; echo 'x = 1' >"$H/deeper.py"; echo 'import prepare' >"$H/unrelated.py"
+  echo '{}' >"$H/report.schema.json"; echo 'MIT License' >"$R/LICENSE"
+  git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -q -m one || exit 1
+  check 0 'vendor: refreshing from a commit copies it and says so' "vendored 11 files" python3 -B "$U" --repo "$R" --commit HEAD --dest "$V/u"
+  check 0 'vendor: the closure is followed through imports (helper, deeper), nothing else of handoff-verify is copied' 'deeper.py discover.py helper.py omissions.py prepare.py report.schema.json' sh -c 'jq -r ".files|keys[]" "$1/VENDOR.json" | grep handoff-verify | xargs -n1 basename | tr "\n" " " | sed "s/ \$//"' _ "$V/u"
+  check 0 'vendor: VENDOR.json records the full commit' "$(git -C "$R" rev-parse HEAD)" jq -r .commit "$V/u/VENDOR.json"
+  check 0 'vendor: the refreshed copy passes --check' 'jev-handoff: OK' python3 -B "$U" --check --dest "$V/u"
+  # a later commit that no longer needs helper: its files go, a foreign file in the destination stays
+  echo 'x = 1' >"$H/prepare.py"; echo foreign >"$V/u/keep.txt"
+  git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -q -m two || exit 1
+  check 0 'vendor: a second refresh succeeds' "vendored 9 files" python3 -B "$U" --repo "$R" --commit HEAD --dest "$V/u"
+  check 1 'vendor: a module the new commit no longer needs is removed' '' test -e "$V/u/skills/handoff-verify/scripts/helper.py"
+  check 0 'vendor: a file the manifest never listed is left alone' foreign cat "$V/u/keep.txt"
+  check 2 'vendor: --repo without --commit is refused' 'go together' sh -c 'python3 -B "$1" --repo "$2" --dest "$3" 2>&1' _ "$U" "$R" "$V/u"
+  check 1 'vendor: a commit that does not exist fails' 'git rev-parse' sh -c 'python3 -B "$1" --repo "$2" --commit deadbeef --dest "$3" 2>&1' _ "$U" "$R" "$V/u"
+)
+# A member's handover note is the compact handoff of its retiring session, built from the session's own transcript by the
+# vendored jev script (HANDOFF_PY): no model call, one folder per member and generation, a reference in the successor's
+# first prompt. A script that cannot build it falls back to a note made of the member's own posts.
+compact_handover_tests() (
+  load council.sh; RUN="$scratch/ch-run"; ST="$RUN/state.json"; N=2; DIR=$scratch; HANDOVER=0.5; TM_STEP=plan; TM_ROUND=1
+  F="$scratch/ch-bin"; rm -rf "$RUN" "$F"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts" "$F"
+  # a stub make_context.py: records its argv, writes OUT/HANDOFF.md the way the real one does, or fails on demand
+  cat >"$F/make_context.py" <<'PY'
+import os, sys
+open(os.environ["STUB_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
+open(os.environ["STUB_LOG"] + ".env", "a").write("HV_SCRIPTS=%s\n" % os.environ.get("HV_SCRIPTS", "<unset>"))
+if os.environ.get("STUB_FAIL"):
+    # the real script ends its message with a blank line (sys.exit of a text that already ends in a newline)
+    sys.stderr.write("stub: no such session\n" + ("\n" if os.environ.get("STUB_BLANK") else "")); sys.exit(3)
+out = sys.argv[-1]
+os.makedirs(os.path.join(out, "blobs"))
+open(os.path.join(out, "HANDOFF.md"), "w").write("# Handoff\nstub transcript\n")
+PY
+  HANDOFF_PY="$F/make_context.py"; OC_DB="$F/oc.db"; export STUB_LOG="$F/log"
+  tm() { echo "tm $*" >>"$F/tm"; }; render_transcript() { :; }; handover_gate() { echo "$1" >>"$F/gate"; }
+  launch() { echo "launch $*" >>"$F/launches"; }; collect() { echo "collect $*" >>"$F/launches"; }
+  mk() { jq -n '{task_id:"t1",log:[],members:[
+        {id:"A",kind:"claude",model:"m",effort:"high",mode:"read",gen:1,session:"sess-claude-1",fresh:false,handover_note:null,ctx_used:900,ctx_limit:1000,session_tokens:5,session_cost:1,session_calls:3,retired:[]},
+        {id:"B",kind:"opencode",model:"p/m",effort:"high",mode:"read",gen:1,session:"ses_oc1",fresh:false,handover_note:null,ctx_used:900,ctx_limit:1000,session_tokens:7,session_cost:2,session_calls:3,retired:[]}]}' >"$ST"
+    rm -rf "$RUN/handoffs" "$RUN/raw/"*; : >"$F/log"; : >"$F/gate"; : >"$F/tm"; : >"$F/launches"; }
+  ho() { handover_launch "$1" 2>"$F/err" && handover_finish "$1" 2>>"$F/err"; }
+  mk; check 0 'compact handover: launch + finish succeed for a Claude member' '' ho 0
+  note=$(jq -r '.members[0].handover_note' "$ST")
+  folder_ok() { head -n1 "$F/log" | grep -Eq "^sess-claude-1 $RUN/handoffs/handoff-[0-9a-f]{8}-[0-9]{8}-A-g1\$"; }
+  check 0 'compact handover: the script gets the session id and a folder named so the next handoff finds this one as its parent' '' folder_ok
+  check 0 'compact handover: the note is the HANDOFF.md of that folder' "handoffs/handoff-" sh -c 'case "$1" in */HANDOFF.md) echo "$1" ;; esac' _ "$note"
+  check 0 'compact handover: the folder holds the handoff' 'stub transcript' cat "$note"
+  check 0 'compact handover: no model is called' '' sh -c '! test -s "$1"' _ "$F/launches"
+  check 0 'compact handover: no handover prompt is written' '' sh -c '! ls "$1"/handover-* >/dev/null 2>&1' _ "$RUN/prompts"
+  check 0 'compact handover: council.sh has no handover prompt left to send' '' sh -c '! grep -q "=== HANDOVER ===\|^prompt_handover" "$1"' _ "$HERE/council.sh"
+  check 0 'compact handover: the gate reviews that HANDOFF.md' "$note" cat "$F/gate"
+  check 0 'compact handover: the member moves to generation 2; its fresh session reads the handoff by reference' true jq -e --arg n "$note" '.members[0] | .gen==2 and .session==null and .fresh==true and .handover_note==$n and .handover_kind=="compact"' "$ST"
+  check 0 'compact handover: the old session is retired with its totals and the counters restart' true jq -e '.members[0] | .retired==[{session:"sess-claude-1",gen:1,tokens:5,cost:1}] and .ctx_used==0 and .session_tokens==0 and .session_cost==0 and .session_calls==0' "$ST"
+  check 0 'compact handover: telemetry records the handover as an ok note' 'note_outcome=ok' grep 'stage=end' "$F/tm"
+  mk; ho 1
+  check 0 'compact handover: an OpenCode member is read from the OpenCode database by session id' "--opencode $OC_DB --session ses_oc1 $RUN/handoffs/" cat "$F/log"
+  # the script finds handoff-verify's modules in HV_SCRIPTS before the pinned copy next to it: a value left in the
+  # environment would replace the pinned modules, so the script must not see it
+  mk; rm -f "$F/log.env"; HV_SCRIPTS=/poison/elsewhere; export HV_SCRIPTS; ho 0; ho_rc=$?; unset HV_SCRIPTS
+  check 0 'compact handover: the script never sees HV_SCRIPTS from the environment (the pinned modules are used)' 'HV_SCRIPTS=<unset>' cat "$F/log.env"
+  check 0 'compact handover: and the handover still succeeds' 0 echo "$ho_rc"
+  # a script that cannot build the handoff: the next generation still opens, from the member's own posts
+  mk; printf 'Position of A in round 1.\n' >"$RUN/posts/t1-r1-A.md"; printf 'Position of B.\n' >"$RUN/posts/t1-r1-B.md"
+  failing() { export STUB_FAIL=1; ho 0; }
+  check 0 'compact handover: a failing script still opens the next generation' '' failing
+  fb="$RUN/raw/handover-g1-A.md"
+  check 0 'compact handover: the fallback note says why the handoff could not be built' 'stub: no such session' cat "$fb"
+  check 0 'compact handover: the fallback note carries the member own posts' 'Position of A in round 1.' cat "$fb"
+  check 0 'compact handover: the fallback note never carries another member post' '' sh -c '! grep -q "Position of B" "$1"' _ "$fb"
+  check 0 'compact handover: the fallback is gated like any note' "$fb" cat "$F/gate"
+  check 0 'compact handover: the member reads the fallback inline' true jq -e --arg n "$fb" '.members[0] | .gen==2 and .handover_note==$n and (.handover_kind==null)' "$ST"
+  check 0 'compact handover: the fallback is logged' 'compact handoff failed' cat "$F/err"
+  check 0 'compact handover: telemetry records the failed note' 'note_outcome=failed' grep 'stage=end' "$F/tm"
+  mk; printf 'Position of A in round 1.\n' >"$RUN/posts/t1-r1-A.md"; export STUB_BLANK=1; failing; unset STUB_FAIL STUB_BLANK
+  check 0 'compact handover: the reason survives a script message that ends with a blank line' 'exit 3: stub: no such session' cat "$F/err"
+  check 0 'compact handover: the fallback note gives the same reason' 'exit 3: stub: no such session' cat "$fb"
+  mk; HANDOFF_PY="$F/not-there.py"; check 0 'compact handover: a missing script falls back too' '' ho 0
+  check 0 'compact handover: and says the script is missing' 'not found' cat "$F/err"
+  HANDOFF_PY="$F/make_context.py"
+  # resuming after a gate that was never released: the folder is rebuilt from scratch
+  mk; ho 0; old=$(dirname "$(jq -r '.members[0].handover_note' "$ST")"); echo stale >"$old/stale.txt"
+  jq '.members[0] |= (.gen=1 | .session="sess-claude-1" | .fresh=false | .handover_note=null | .handover_kind=null)' "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"
+  check 0 'compact handover: a second handover of the same generation succeeds' '' ho 0
+  check 0 'compact handover: it rebuilds the folder, no stale file stays' '' sh -c '! test -e "$1/stale.txt"' _ "$old"
+  # the successor's first prompt names the file and does not carry it
+  mk; ho 0; note=$(jq -r '.members[0].handover_note' "$ST"); printf 'NOTE-BODY-XYZ\n' >>"$note"
+  jq '.members |= [.[0]] | . + {reuse_posts:false,last_votes:[],notices:[]}' "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"
+  N=1; CODEMAP=0; validate_child_launch() { :; }; tm_end() { :; }; codemap_record_launch() { CODEMAP_LAUNCH_ID=x; }; codemap_record_launched() { :; }; codemap_append_locator() { :; }; codemap_stage_accepted() { :; }
+  fakegen() { echo STEP-PROMPT-BODY; }; needs_handover() { return 1; }; launch() { cp "$2" "$F/first-prompt"; }
+  collect() { printf '%s\n' 'Prose.' '```json' '{"vote":"agree","questions":[]}' '```' >"$RUN/raw/t1-r2-$(mid $1).md"; }
+  check 0 'compact handover: the successor step runs' '' run_step r2 fakegen '{"id":"t1"}' 2
+  check 0 'compact handover: the first prompt opens the handover section with the council rules before it' '<<<HANDOVER' cat "$F/first-prompt"
+  check 0 'compact handover: the first prompt names the HANDOFF.md path' "$note" cat "$F/first-prompt"
+  check 0 'compact handover: the first prompt says the transcript was compacted, not summarised' 'compacted mechanically' cat "$F/first-prompt"
+  check 0 'compact handover: the first prompt overrides what the handoff says to do after reading' 'This prompt overrides' cat "$F/first-prompt"
+  check 0 'compact handover: the first prompt tells the member to carry out the step' 'carry out the step below' cat "$F/first-prompt"
+  check 0 'compact handover: after its first valid post the member no longer carries the note or its kind' true jq -e '.members[0] | .fresh==false and .handover_note==null and .handover_kind==null' "$ST"
+  check 0 'compact handover: the file content is not copied into the prompt' '' sh -c '! grep -q NOTE-BODY-XYZ "$1"' _ "$F/first-prompt"
+  order_ok() { awk '/<<<HANDOVER/{a=NR} />>>$/{b=NR} /STEP-PROMPT-BODY/{c=NR} END{exit !(a && b>a && c>b)}' "$F/first-prompt"; }
+  check 0 'compact handover: the reference sits inside the handover section, before the step prompt' '' order_ok
 )
 # 0.14.0 claims, tested directly: bypassed permissions on the real launch/collect paths, the scope lines in every
-# deliberation prompt, the real handover_finish, and the lines the baseline helpers patch into older commits.
+# deliberation prompt, and the lines the baseline helpers patch into older commits.
 verify_0140_tests() (
   load council.sh; RUN="$scratch/v0140"; ST="$RUN/state.json"; N=2; DIR=$scratch; MAXT=3; TIMEOUT=20; MAP_PREPASS=0
   F="$scratch/v0140-bin"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts" "$F"
@@ -487,36 +610,15 @@ SH
   check 0 'scope: later rounds judge the candidate only against the task' 'Judge the candidate only against the task (HARD RULE — scope)' prompt_roundN_full 0 "$t" 2
   check 0 'scope: ratification checks only the plan and the task' 'Check only what the plan and the task cover (HARD RULE — scope)' prompt_ratify 0 "$t" 1
   check 0 'scope: the first-contact rules carry the HARD scope rule' 'HARD RULE — scope (overrides everything below)' rules_text 1
-  # c6: the real handover_finish, after the real handover_launch, with the model calls faked
-  jq -n '{task_id:"t1",members:[{id:"A",kind:"claude",model:"m",effort:"high",mode:"read",gen:1,session:"old-sess",fresh:false,handover_note:null,ctx_used:900,ctx_limit:1000,session_tokens:5,session_cost:1,session_calls:3,retired:[]}],log:[]}' >"$ST"
-  N=1; TM_STEP=plan; TM_ROUND=1; HANDOVER=0.5
-  launch() { echo "launch $1 $3" >>"$F/ho.log"; }
-  collect() { echo "Note body." >"$RUN/raw/handover-g1-A.md"; echo "collect $1" >>"$F/ho.log"; }
-  handover_gate() { echo "gate $1" >>"$F/ho.log"; }
-  render_transcript() { :; }
-  ho_ok() { handover_launch 0 && handover_finish 0; }
-  check 0 'handover: the real handover_launch + handover_finish succeed' '' ho_ok
-  check 0 'handover: the note call is launched, collected, then gated in that order' "launch 0 handover-g1 collect 0 gate $RUN/raw/handover-g1-A.md" sh -c 'tr "\n" " " <"$1"' _ "$F/ho.log"
-  check 0 'handover: the member moves to generation 2 with a fresh session that reads the note' true jq -e --arg n "$RUN/raw/handover-g1-A.md" '.members[0] | .gen==2 and .session==null and .fresh==true and .handover_note==$n' "$ST"
-  check 0 'handover: the old session is retired with its totals and the counters restart' true jq -e '.members[0] | .retired==[{session:"old-sess",gen:1,tokens:5,cost:1}] and .ctx_used==0 and .session_tokens==0 and .session_cost==0 and .session_calls==0' "$ST"
-  check 0 'handover: the handover prompt was written for the old generation' '=== HANDOVER ===' cat "$RUN/prompts/handover-A-g1.md"
-  # a note call that left its process group running: no new generation, the caller stops
-  jq '.members[0] |= (.gen=1 | .session="old-sess" | .fresh=false | .handover_note=null)' "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"
-  collect() { CALL_LEFT_RUNNING=1; return 1; }
-  ho_left() { handover_launch 0; handover_finish 0; }
-  check 1 'handover: a note call that left processes running fails handover_finish' '' ho_left
-  check 0 'handover: and the member keeps its generation and session' true jq -e '.members[0] | .gen==1 and .session=="old-sess"' "$ST"
-  # a failed launch still retires the session with the fixed placeholder note
-  launch() { return 1; }; tm_launch_failed() { :; }; rm -f "$RUN/raw/handover-g1-A.md"
-  check 0 'handover: a failed note launch still opens the next generation' '' ho_ok
-  check 0 'handover: with the placeholder note' '(the previous session produced no handover note)' cat "$RUN/raw/handover-g1-A.md"
   # c9: the lines the baseline helpers patch into older commits are exactly the current lines
   local b97="$RUN/base-97f4c70.sh" bd6="$RUN/base-d62a356.sh"
-  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_handover_prompt "$b97" && approve_opencode_auto "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" || exit 1
+  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_opencode_auto "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" && approve_compact_handover "$b97" || exit 1
   same_line() { [ "$(grep -cF -- "$2" "$1")" = 1 ] && [ "$(grep -cF -- "$2" "$HERE/council.sh")" = 1 ] && [ "$(grep -F -- "$2" "$1")" = "$(grep -F -- "$2" "$HERE/council.sh")" ]; }
   for key in 'HARD RULE — scope (overrides' 'Clarify first (grilling).' 'Recommended: <answer> (<why>)' 'Vote "question" only for a choice' 'Judge the candidate only against the task' 'Check only what the plan and the task cover' \
              'else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' '--no-wait --auto >/dev/null' '--timeout "$TIMEOUT" --auto >/dev/null' '{permission_mode:$pm, agent:null}' \
-             'for i in $idxs; do needs_handover $i && ho="$ho $i"; done' 'for i in $ho; do handover_launch $i; done' '*" $i "*) ;; *) launch_member $i || return 1 ;; esac; done'; do
+             'for i in $idxs; do needs_handover $i && ho="$ho $i"; done' 'for i in $ho; do handover_launch $i; done' '*" $i "*) ;; *) launch_member $i || return 1 ;; esac; done' \
+             'HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-$HERE/vendor/jev-handoff/skills/compact-handoff/scripts/make_context.py}"' 'if [ "$(mget $i handover_kind)" = compact ]; then' \
+             "sts --argjson i \$i '.members[\$i].fresh=false | .members[\$i].handover_note=null | .members[\$i].handover_kind=null'" 'handover_launch() {  # idx -> builds the retiring session'"'"'s compact handoff'; do
     check 0 "baseline 97f4c70 patched line equals the current line: $key" '' same_line "$b97" "$key"
   done
   check 0 'baseline 97f4c70 patched: oc.sh new carries --auto as in the current code' '' sh -c 'grep -q -- "--agent \"\$(mget \$i agent)\" --auto" "$1" && grep -q -- "--agent \"\$(mget \$i agent)\" --auto" "$2"' _ "$b97" "$HERE/council.sh"
@@ -1133,16 +1235,14 @@ map_prepass_lifecycle_tests() (
     prompt_exec 0 "$t" 1 >"$dest/exec"
     prompt_ratify 0 "$t" 1 >"$dest/ratify"
     prompt_fix 0 "$t" 2 >"$dest/fix"
-    prompt_handover 0 >"$dest/handover"
   )
   git show 97f4c70:scripts/council.sh >"$scratch/baseline-council.sh" || exit 1
-  approve_handover_prompt "$scratch/baseline-council.sh" || exit 1
   approve_scope_prompts "$scratch/baseline-council.sh" || exit 1
   for map_choice in false omitted; do
     mkdir -p "$scratch/baseline-prompts-$map_choice" "$scratch/current-prompts-$map_choice"
     baseline_prompt_fixture "$scratch/baseline-council.sh" "$scratch/baseline-prompts-$map_choice" "$map_choice"
     baseline_prompt_fixture "$HERE/council.sh" "$scratch/current-prompts-$map_choice" "$map_choice"
-    for part in round1 exec ratify fix handover; do check 0 "T1 $map_choice $part prompt bytes match 97f4c70" '' cmp -s "$scratch/baseline-prompts-$map_choice/$part" "$scratch/current-prompts-$map_choice/$part"; done
+    for part in round1 exec ratify fix; do check 0 "T1 $map_choice $part prompt bytes match 97f4c70" '' cmp -s "$scratch/baseline-prompts-$map_choice/$part" "$scratch/current-prompts-$map_choice/$part"; done
   done
   check 0 'T1 omitted map_code remains absent from state' null jq -r '.map_prepass_version // "null"' "$scratch/prompt-fixture/state.json"
   check 0 'T1 disabled and omitted fixture launch no mapper' '' test "$(wc -l <"$counter" | tr -d ' ')" -eq 0
@@ -1436,9 +1536,9 @@ SH
   check 0 'baseline drift checkpoint persists split_invalid' split_invalid jq -r '.phase' "$ST"
   check 0 'baseline drift checkpoint names changed baseline in its diagnostic' baseline jq -r '.pending_questions[0].question' "$ST"
   check 0 'baseline drift gate prevents all adapter calls' '' test ! -s "$gate_launch_calls"
-  gate_handover() { do_handover 0 2>&1; }
-  check 4 'baseline drift also blocks the handover launch path' 'context' gate_handover
-  check 0 'handover baseline gate makes zero adapter calls' '' test ! -s "$gate_launch_calls"
+  gate_handover() { mkdir -p "$RUN/raw"; do_handover 0 2>&1; }
+  check 0 'baseline drift does not stop a handover: it builds a handoff and calls no model' '' gate_handover
+  check 0 'a handover under baseline drift makes zero adapter calls' '' test ! -s "$gate_launch_calls"
 
   # Exercise the real resume dispatcher for mapped parents, inherited child scope, and both legacy formats.
   fake_resume_oc="$scratch/fake-resume-oc"; resume_calls="$scratch/resume-inference-calls"
@@ -1784,16 +1884,32 @@ SH
 # timestamp normalisation.
 # 0.10.0 intentionally changes one thing the 97f4c70 byte pins see: the user-approved handover prompt
 # addition (applied to the baseline copy, verbatim, so every other byte stays pinned). Everything else is compared.
-approve_handover_prompt() {  # council.sh copy -> the 0.10.0 prompt text, nothing else
-  python3 - "$1" <<'PY'
-import sys
-p = sys.argv[1]; s = open(p, encoding="utf-8").read()
-old = "(5) open items, pending questions and answers from the user. Self-contained"
-new = ("(5) open items, pending questions and answers from the user; (6) the deliverable: the artifact or outcome being produced and its current status; "
-       "(7) what is half-finished, in flight, or left running, explicitly saying none if applicable; (8) mistakes not to repeat: what you got wrong, "
-       "had to correct, or learned as a gotcha, explicitly saying none if applicable. Do not invent facts; mark unknowns explicitly. Self-contained")
-if s.count(old) != 1: sys.exit("approve_handover_prompt: anchor not found")
-open(p, "w", encoding="utf-8").write(s.replace(old, new))
+approve_compact_handover() {  # 97f4c70 council.sh copy (after approve_parallel_handover) -> the 0.17.0 handover: the compact handoff replaces the model-written note
+  python3 - "$1" "$HERE/council.sh" <<'PY'
+import re, sys
+p, cur_path = sys.argv[1], sys.argv[2]
+s = open(p, encoding="utf-8").read(); cur = open(cur_path, encoding="utf-8").read()
+def sub(old, new):
+    global s
+    if s.count(old) != 1: sys.exit("approve_compact_handover: anchor not found: " + old[:80])
+    s = s.replace(old, new)
+def between(text, start, end):
+    a = text.index(start); b = text.index(end, a) + len(end); return text[a:b]
+# the handover functions of the current council.sh, without what 97f4c70 does not have (telemetry and the review gate)
+region = between(cur, "# The folder of a member's handoff is named so that", "do_handover() { handover_launch $1; handover_finish $1; }   # idx -> one member alone\n")
+region = region.replace("TM_HOS=(); ", "").replace("TM_HOS[$i]=$TM_LAST; ", "").replace('TM_HO=""; TM_HO_MEMBER=""; TM_HOS[$i]=""; ', "")
+region = "".join(l for l in region.splitlines(True) if not l.lstrip().startswith(("tm handover", "handover_gate ", "TM_HO=")))
+if re.search(r"\btm |TM_HO|TM_LAST\b|handover_gate", region): sys.exit("approve_compact_handover: telemetry left in the region")
+consts = between(cur, "# A member's handover note is not written by the model", 'OC_DB="${COUNCIL_OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"\n')
+a = s.index("HO_LAUNCHED=()\nhandover_launch() {\n"); fin = s.index("handover_finish() {\n", a); b = s.index("\n}\n", fin) + 3
+s = s[:a] + region + s[b:]
+sub('CM="$HERE/council_codemap.py"\n', 'CM="$HERE/council_codemap.py"\n' + consts)
+sub('        { echo "Handover note from your predecessor session (same member id):"; echo "<<<HANDOVER"; cat "$hn"; } >>"$pf"\n',
+    between(cur, '        if [ "$(mget $i handover_kind)" = compact ]; then', '; fi\n'))
+sub("sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null'", "sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null | .members[$i].handover_kind=null'")
+sub('{ [ "$(mget "$i" fresh)" = true ] && [ -f "$hn" ] && grep -Fq COUNCIL_POST "$hn"; }; then',
+    '{ [ "$(mget "$i" fresh)" = true ] && [ "$(mget "$i" handover_kind)" != compact ] && [ -f "$hn" ] && grep -Fq COUNCIL_POST "$hn"; }; then')
+open(p, "w", encoding="utf-8").write(s)
 PY
 }
 approve_opencode_auto() {  # council.sh copy -> OpenCode members pass --auto to new, prompt and wait
@@ -1874,10 +1990,18 @@ strip_telemetry_artifacts() {  # output prefix of run_impl -> the same run witho
 legacy_differential_tests() (
   D="$scratch/legacy-diff"; mkdir -p "$D/base" "$D/proj"
   git -C "$HERE/.." archive 97f4c70 scripts | tar -x -C "$D/base" || exit 1
-  approve_handover_prompt "$D/base/scripts/council.sh" || exit 1
   approve_opencode_auto "$D/base/scripts/council.sh" || exit 1
   approve_scope_prompts "$D/base/scripts/council.sh" || exit 1
   approve_parallel_handover "$D/base/scripts/council.sh" || exit 1
+  approve_compact_handover "$D/base/scripts/council.sh" || exit 1
+  # both implementations build a member's handoff with this one stub (the fake sessions have no transcript to compact)
+  cat >"$D/stub-handoff.py" <<'PY3'
+import os, sys
+out = sys.argv[-1]
+os.makedirs(os.path.join(out, "blobs"))
+open(os.path.join(out, "HANDOFF.md"), "w").write("# Handoff\nstub transcript of " + " ".join(sys.argv[1:-1]) + "\n")
+PY3
+  export COUNCIL_HANDOFF_SCRIPT="$D/stub-handoff.py"
   mkdir -p "$D/cur"; cp -R "$HERE" "$D/cur/" || exit 1
   write_fake_oc "$D/fake-oc"
   mkdir -p "$D/bin"; real_date=$(command -v date)
@@ -1962,7 +2086,7 @@ PY2
   for form in codemap nocodemap; do
     if [ "$form" = codemap ]; then snap="$legacy.run"; else snap="$D/legacy-nocm/run"; fi
     check 0 "T3 legacy $form --answer resume is byte-identical to 97f4c70" compared diff_case "$form-answer" "$snap" "$legacy.fo" -- resume --run-dir "$D/run" --answer Hello
-    check 0 "T3 legacy $form --answer resume performs a real handover into a fresh generation" '' test -s "$D/out-$form-answer-cur.run/prompts/handover-A-g3.md"
+    check 0 "T3 legacy $form --answer resume performs a real handover into a fresh generation (a compact handoff of generation 2)" '' sh -c 'ls "$1"/handoffs/handoff-*-A-g2/HANDOFF.md >/dev/null' _ "$D/out-$form-answer-cur.run"
     check 0 "T3 legacy $form --answer resume finishes the remaining task" 0 cat "$D/out-$form-answer-cur.step1.rc"
     check 0 "T3 legacy $form --answers resume is byte-identical to 97f4c70" compared diff_case "$form-answers" "$snap" "$legacy.fo" -- resume --run-dir "$D/run" --answers "$D/answers.json"
     check 0 "T3 legacy $form --replace resume is byte-identical to 97f4c70" compared diff_case "$form-replace" "$snap" "$legacy.fo" -- resume --run-dir "$D/run" --answer Hello --replace B=opencode:p/m:medium
@@ -2078,8 +2202,8 @@ SH
   check 0 'replacement child-a is ratified and every child is bound to the new contract digest' true jq -e '[.results[]|select(.task=="child-a")|.outcome]==["ratified"] and ([.config.tasks[]|select(.map_parent=="parent")|.contract_identity]|unique)==[.map_prepasses.parent.approved_contract.digest]' "$R/state.json"
   check 0 'superseded archive marker records the old contract identity, not the new one' true jq -e --arg o "$old_digest" --slurpfile st "$R/state.json" '.old_contract_identity==$o and $o!=$st[0].map_prepasses.parent.approved_contract.digest and .reusable==false' "$R/map/$mk/superseded/$old_digest/MARKER.json"
   check 0 'ratification dissent drove a real fix round (exec2 delivers the fix prompt)' 'FIXES REQUESTED' cat "$R/prompts/child-a-exec2-A.md"
-  check 0 'members were handed over to fresh generations during the lifecycle' '' sh -c 'ls "$1"/prompts/handover-* >/dev/null 2>&1' _ "$R"
-  # T5: every expected child/member/stage delivery and every handover must exist and carry a
+  check 0 'members were handed over to fresh generations during the lifecycle' true jq -e '[.members[]|.retired|length]|min>=1' "$R/state.json"
+  # T5: every expected child/member/stage delivery must exist and carry a
   # locator; a missing prompt or snapshot_id fails rather than being skipped. Each delivered
   # snapshot is looked up with the real council_codemap.py and must enumerate both the task's own
   # region and the sibling region; no captured or uncaptured source line may appear in a prompt.
@@ -2098,20 +2222,19 @@ for snap in snaps:
 print("true")
 PY2
   expected="child-a-r1-A child-a-r1-B child-a-r2-A child-a-r2-B child-a-exec1-A child-a-x1-A child-a-x1-B child-a-exec2-A child-a-x2-A child-a-x2-B child-b-r1-A child-b-r1-B child-b-r2-A child-b-r2-B child-b-exec1-A child-b-x1-A child-b-x1-B"
-  handovers=$(cd "$R/prompts" && ls handover-*.md 2>/dev/null | sed 's/\.md$//' | tr '\n' ' ')
-  check 0 'handovers were delivered to both members during the child lifecycle' true sh -c 'ls "$1"/prompts/handover-A-* >/dev/null 2>&1 && ls "$1"/prompts/handover-B-* >/dev/null 2>&1 && echo true' _ "$R"
+  check 0 'handovers retired a session of both members during the child lifecycle, with no handover prompt sent to an old session' true sh -c 'jq -e "([.members[]|select(.id==\"A\" or .id==\"B\")|.retired|length]|min)>=1" "$1/state.json" >/dev/null && ! ls "$1"/prompts/handover-* >/dev/null 2>&1 && echo true' _ "$R"
   deliveries=0
-  for name in $expected $handovers; do
+  for name in $expected; do
     pf="$R/prompts/$name.md"; deliveries=$((deliveries+1))
-    case "$name" in *-r1-*) stage=r1;; *-r2-*) stage=r2;; handover-*) stage=handover;; *) stage=historical;; esac
+    case "$name" in *-r1-*) stage=r1;; *-r2-*) stage=r2;; *) stage=historical;; esac
     check 0 "T5 expected delivery $name exists and every delivered snapshot resolves both own and sibling regions" true python3 "$D/snapcheck.py" "$D/impl/scripts/council_codemap.py" "$R" "$pf" "$stage"
     check 0 "T5 delivered prompt $name embeds neither captured nor uncaptured source lines" '' sh -c '! grep -q "alpha_body_line_one\|alpha_body_line_two\|alpha_body_line_three\|beta_body_only_line" "$1"' _ "$pf"
     case "$stage" in
-      historical|handover) check 0 "T5 $name carries the historical framing and the live-inspection instruction" true sh -c 'grep -q "^=== HISTORICAL CODE MAP (as of the completed pre-pass snapshot; not a live-source claim) ===$" "$1" && grep -q "^Live inspection is required for current-source claims" "$1" && echo true' _ "$pf" ;;
+      historical) check 0 "T5 $name carries the historical framing and the live-inspection instruction" true sh -c 'grep -q "^=== HISTORICAL CODE MAP (as of the completed pre-pass snapshot; not a live-source claim) ===$" "$1" && grep -q "^Live inspection is required for current-source claims" "$1" && echo true' _ "$pf" ;;
       *) check 0 "T5 deliberation prompt $name is not framed as a historical map" '' sh -c '! grep -q "HISTORICAL CODE MAP" "$1"' _ "$pf" ;;
     esac
   done
-  check 0 'T5 every expected child delivery plus every handover was checked' '' test "$deliveries" -ge 19
+  check 0 'T5 every expected child delivery was checked' '' test "$deliveries" -ge 17
   # Ratification-round keep: drift during child-b ratification, then restore the parent task.
   new_digest=$(jq -r '.map_prepasses.parent.approved_contract.digest' "$R/state.json")
   printf 'drifted during ratification\n' >"$D/proj/keep.txt"
@@ -2591,7 +2714,7 @@ split_gate_process_tests() (
   check 4 'T4 approval-to-launch mutation: the launch gate stops the approving process' '' run mutate MUTATE_AFTER_PY_MATCH=--identity-output "MUTATE_CMD=printf drift >>'$P/keep.txt'" -- resume --run-dir "$R" --map-decision "$D/decide-good.json"
   check 0 'T4 approval-to-launch mutation: the mutation ran after approval validated' '' test -e "$D/flag-mutate.mut"
   check 0 'T4 approval-to-launch mutation: split_invalid names the drifted prerequisite' 'keep.txt' jq -r 'select(.phase=="split_invalid")|.pending_questions[0].question' "$R/state.json"
-  check 0 'T4 approval-to-launch mutation: zero member inference' "$before" prompts
+  check 0 'T4 approval-to-launch mutation: the child whose prerequisite drifted (child-b) gets zero member inference' 0 sh -c 'grep -c "^prompt .*prompts/child-b-" "$1" || true' _ "$F/calls.log"
   # ---- approved checkpoint, then tampering with every approved identity ----
   restore review
   echo 2 >"$F/fail-results"; echo 'TASK child-a|could not be used' >"$F/fail-pattern"
@@ -2621,7 +2744,7 @@ split_gate_process_tests() (
   chmod 644 "$P/src/a.py"
   # Gate ordering: a member due for handover is not handed over (no handover inference) when the gate fails.
   tamper 'drift while a member is due for handover' 'src/a.py' "printf drift >>\"\$P/src/a.py\"; $(st_edit "'.members[1].session_calls=5 | .members[1].ctx_used=9000 | .members[1].ctx_limit=10000'")"
-  check 0 'T4 gate runs before handover: no handover prompt was written' '' sh -c '! ls "$1"/prompts/handover-* >/dev/null 2>&1' _ "$R"
+  check 0 'T4 gate runs before handover: no handoff was built' '' sh -c '! test -e "$1/handoffs"' _ "$R"
   # ---- legitimate executor modifications, creates and deletes pass; sibling-caused drift does not ----
   cat >"$D/exec-hook" <<'SH'
 #!/bin/sh
@@ -3012,11 +3135,12 @@ telemetry_process_tests() (
   export FAKE_CL_DIR="$D/fc" PATH="$D/fake-claude:$PATH"
   printf '{"url":"http://127.0.0.1:1","version":"1.14.2","pid":1,"started":false}\n' >"$D/fo/ensure-json"
   touch "$D/fo/ask-once"
+  printf 'import os, sys\nout = sys.argv[-1]\nos.makedirs(os.path.join(out, "blobs"))\nopen(os.path.join(out, "HANDOFF.md"), "w").write("# Handoff\\nSECRETNOTE\\n")\n' >"$D/stub-handoff.py"   # the fake sessions have no transcript to compact
   jq -n --arg d "$P" '{dir:$d,max_rounds:2,timeout_s:30,handover_at:0.5,executor:"SECRETEXEC",style:"caveman",
       members:[{id:"SECRETEXEC",kind:"opencode",model:"p/m",effort:"medium",mode:"edit"},
                {id:"SECRETREADER",kind:"claude",model:"claude-opus-5-5",effort:"high",mode:"read",handover_at:0.9}],
       tasks:[{id:"SECRETTASKID1",text:"SECRETTASKTEXT build it",execute:true},{id:"SECRETTASKID2",text:"second task SECRETTASKTEXT2"}]}' >"$D/cfg.json"
-  step() { local label=$1; shift; ( cd "$D" && COUNCIL_TELEMETRY_DIR="$L" FAKE_OC_DIR="$D/fo" /bin/bash "$D/impl/scripts/council.sh" "$@" >"$D/$label.out" 2>"$D/$label.err" ); }
+  step() { local label=$1; shift; ( cd "$D" && COUNCIL_TELEMETRY_DIR="$L" COUNCIL_HANDOFF_SCRIPT="$D/stub-handoff.py" FAKE_OC_DIR="$D/fo" /bin/bash "$D/impl/scripts/council.sh" "$@" >"$D/$label.out" 2>"$D/$label.err" ); }
   q() { python3 "$TQ" "$@"; }
   host=$(tm_host "$TM_UUID"); LG="$L/$host.jsonl"; T="$R/telemetry.jsonl"
   check 4 'telemetry: a recorded start (OpenCode and Claude members) ratifies task 1 and pauses at the task-2 question' '' step start start --config "$D/cfg.json" --run-dir "$R"
@@ -3032,7 +3156,7 @@ telemetry_process_tests() (
   check 0 'telemetry: every call of the healthy run ended ok with a launch-to-completion duration' true q "$T" 'all(e["outcome"]=="ok" and "failure_class" not in e and type(e["duration_s"])==int for e in ev("call_end"))'
   check 0 'telemetry: attempt counts every launch per (member, step, round) across tasks and generations' true q "$T" 'all(c["attempt"]==1+len([p for p in ev("call_start") if p["seq"]<c["seq"] and [p.get("member_index"),p["step"],p["round"]]==[c.get("member_index"),c["step"],c["round"]]]) for c in ev("call_start")) and [[c["task_index"],c["attempt"]] for c in ev("call_start",member_index=0,step="plan",round=1)]==[[0,1],[1,2]] and len(set(c["gen"] for c in ev("call_start",member_index=0)))>=2'
   check 0 'telemetry: call ends keep the exit evidence the run observed' true q "$T" 'all(e["wait_exit_code"]==0 and e["result_exit_code"]==0 for e in ev("call_end") if e["kind"]=="opencode") and all(e["exit_code"]==0 for e in ev("call_end") if e["kind"]=="claude")'
-  check 0 'telemetry: steps are the approved enum' true q "$T" 'sorted(set(e["step"] for e in ev("call_start")))==["exec","handover","plan","ratify"]'
+  check 0 'telemetry: steps are the approved enum' true q "$T" 'sorted(set(e["step"] for e in ev("call_start")))==["exec","plan","ratify"]'
   check 0 'telemetry: Claude calls carry per-call usage, provider duration and the cumulative-cost delta' true q "$T" '[[e["tokens"],e["cost_usd"],e["provider_duration_s"],e["ctx_used"],e["ctx_limit"]] for e in ev("call_end") if e["kind"]=="claude"][:2]==[[{"input":5000,"output":20,"cache_read":900,"cache_write":100,"reasoning":None,"total":6020},0.02,1.5,6020,100000],[{"input":5000,"output":20,"cache_read":900,"cache_write":100,"reasoning":None,"total":6020},0.0,1.5,6020,100000]]'
   check 0 'telemetry: OpenCode totals are session deltas from a known zero baseline; components unknown without a turn boundary' true q "$T" '[[e["tokens"]["total"],e["tokens"]["input"],e["cost_usd"],e["ctx_used"],e["ctx_limit"],"provider_duration_s" in e] for e in ev("call_end") if e["kind"]=="opencode"][:2]==[[6010,None,0.01,6010,10000,False],[0,None,0.0,6010,10000,False]]'
   check 0 'telemetry: votes count the accepted tails of every step' true q "$T" '[[v["task_index"],v["step"],v["round"],v["vote_propose"],v["vote_agree"],v["vote_question"],v["vote_done"],v["failed_members"],v["converted"],v["replay"]] for v in ev("votes")]==[[0,"plan",1,2,0,0,0,0,0,False],[0,"plan",2,0,2,0,0,0,0,False],[0,"exec",1,0,0,0,1,0,0,False],[0,"ratify",1,0,2,0,0,0,0,False],[1,"plan",1,1,0,1,0,0,0,False]]'
@@ -3622,7 +3746,7 @@ PY
   check 0 'held rerun: a clock status that does not match the held signal: not rerun' '0 1 -' clock '130 0' TERM 1
   check 0 'held rerun: a clock outside the held interval: not rerun' '0 1 -' clock '143 0' TERM 0
 )
-SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests verify_0140_tests claude_cache_ttl_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests"
+SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests vendor_tests compact_handover_tests verify_0140_tests claude_cache_ttl_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests"
 usage() {
   echo "usage: test-completion.sh [-j N] [--list] [SUITE...]"
   echo "  SUITE...  run only these suites (default: all, in the listed order)"

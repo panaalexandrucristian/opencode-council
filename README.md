@@ -9,6 +9,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | `SKILL.md` | the skill Claude Code loads (`/opencode …`): workflow, permissions, the council checklist |
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
+| `scripts/vendor/` | `jev-handoff/`: a pinned copy of jev's compact-handoff scripts (MIT; source and commit in its `VENDOR.json`) that builds a member's handover handoff; `update_jev_handoff.py` verifies and refreshes it |
 | `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit; `session_report.py` (per-session token report, local by default); `run_check.py` (runs a build or test command with the full log on disk and a capped summary on stdout; unlike the others it executes commands and writes artifacts, so it is not read-only) |
 | `reference.md` | OpenCode HTTP endpoint notes |
 | `.claude-plugin/` | plugin + marketplace manifests, so the repo installs with `/plugin install` |
@@ -157,7 +158,7 @@ How it works:
 - **Unanimous consensus.** Round 1 = proposals; then a rotating proposer's position is the frozen candidate and everyone votes `agree` / `disagree` (with a complete revised proposal). All `agree` = consensus. `max_rounds` reached = `unresolved` (exit 5), dissent preserved — never a forced verdict.
 - **Build tasks.** Consensus on a plan → the single `executor` implements it → the council ratifies the report + diff (fix rounds if needed).
 - **No assumptions.** Each member must list every choice the task leaves open and what settles it (`task` / `dir` / `user` / `ask`). Anything not settled by the task, the working directory or an earlier answer becomes a question for the user: the run pauses (exit 4, `questions.json`), you answer, `resume` re-runs the round.
-- **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` — a fraction of the model's window, or an absolute token count such as `150000` — the session writes a handover note and is replaced by a fresh session (same member, next generation) that starts from the note. `handover_at` is a council-wide default that any member can override with its own value, so a member on a small context window (or an expensive one) hands over earlier.
+- **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` — a fraction of the model's window, or an absolute token count such as `150000` — the session's transcript is compacted into a `HANDOFF.md` by jev's `make_context.py` (vendored and pinned, no model call) and the session is replaced by a fresh session (same member, next generation) that reads that file first. `handover_at` is a council-wide default that any member can override with its own value, so a member on a small context window (or an expensive one) hands over earlier.
 - **Transcript.** `D/transcript.md`: roster, per-member tokens/context/cost/generations, every post by task and round, outcomes, Q&A, log.
 - **Visible truncation.** Diffs retain their 20000-byte cap; truncated output ends with the cap and the working directory to inspect.
 
@@ -190,6 +191,24 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **Unreleased** — a member's handover is no longer a note the model writes. `council.sh` compacts the retiring
+  session's own transcript with jev's `make_context.py` (a Claude session from its transcript, an OpenCode session from
+  `opencode.db`; no model call) into `D/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` + `blobs/`. The successor's
+  first prompt names that file (read, never copied) and says it overrides what the file tells a reader to do after reading;
+  the folder name lets the next generation's handoff find this one as its parent (`parents/`). The script is a pinned copy,
+  `scripts/vendor/jev-handoff/` (hashes in `VENDOR.json`; `update_jev_handoff.py --check`, or `--repo PATH --commit SHA` to
+  refresh; `COUNCIL_HANDOFF_SCRIPT` overrides it), and `HV_SCRIPTS` is never passed to it. If the script fails, the
+  successor gets a note made of the member's own posts, now with the script's last line of text as the reason (it used to
+  be empty: jev ends its messages with a blank line). `--replace` and the gate are unchanged. New suites `vendor_tests`
+  (16 checks) and `compact_handover_tests` (37); the 97f4c70 differential applies the same change
+  (`approve_compact_handover`); the T4 check "zero member inference" of `split_gate_process_tests` passed only because
+  the output `10` contains `1`, and now asserts that the drifted child gets no prompt. Tried on two real councils
+  (2 Claude sonnet low + 1 OpenCode, `handover_at` 1000, 3 tasks, every member handed over twice, 12 handoffs, none
+  failed; the first run had `HV_SCRIPTS` set to a broken folder): with `gpt-6-sol-fast` all six "quote your own earlier post" lines were
+  exact and the answers were right (cost 0.92 USD); the OpenCode member read the file outside the project without a
+  permission prompt. With `gpt-6-luna-fast` the member's handoffs held its posts verbatim, but it quoted the wrong
+  line and closed its JSON fence on the same line (a model fault). A handoff is larger than the note it replaces: about
+  8× on the one large session measured (104 KB against 12.8 KB), 15-21 KB on the small test sessions.
 - **0.16.0** — Claude Code members launch with a 1-hour prompt cache. `launch()` sets `CLAUDE_CODE_PROMPT_CACHE_TTL`
   on every Claude Code member: `1h` by default, or `5m` with `"claude_cache_ttl": "5m"` in `council.json` (any other value
   is a config error). The council value wins over an operator-exported variable; Claude Code ≥ 2.1.242 reads it,

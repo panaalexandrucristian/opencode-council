@@ -101,7 +101,7 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |
 | Claude prompt-cache lifetime (optional) | `claude_cache_ttl`, council-wide | `1h` (default) or `5m`. Every Claude Code member is started with `CLAUDE_CODE_PROMPT_CACHE_TTL` set to it, which wins over the same variable in your own environment (read by Claude Code ≥ 2.1.242). A member that sits idle longer than the TTL pays to rebuild its context; an hour costs more per cache write, so pick `5m` for short runs without pauses. OpenCode members are not affected. |
 | prose style (optional) | `style` (top level and/or per member) | `normal` (default), `lite`, `caveman`, `ultra` — compresses only the prose a member writes for the others, modelled on the [caveman skill](https://github.com/juliusbrussee/caveman). The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
-| context handover threshold | `handover_at` (0..1], council-wide **and/or per member** | a fraction in (0,1] of the model's context window, **or an absolute token count** (≥ 1000, e.g. `150000`). At the threshold the session writes a handover note and is replaced by a fresh session (same member id, next generation). Set it per member to make one hand over earlier than the rest (`{"id":"A", …, "handover_at":0.3}`); a member without its own value uses the council-wide one. The roster prints the effective threshold per member, and `status` shows each member's context as a percentage of its own threshold |
+| context handover threshold | `handover_at` (0..1], council-wide **and/or per member** | a fraction in (0,1] of the model's context window, **or an absolute token count** (≥ 1000, e.g. `150000`). At the threshold the session's transcript is compacted into a `HANDOFF.md` by the pinned jev script (no model call) and the session is replaced by a fresh session (same member id, next generation). Set it per member to make one hand over earlier than the rest (`{"id":"A", …, "handover_at":0.3}`); a member without its own value uses the council-wide one. The roster prints the effective threshold per member, and `status` shows each member's context as a percentage of its own threshold |
 | whether to seed the code map | `map_code` (one run-wide boolean) | **Ask the user once before writing the config:** “Map the code for this council?” Record true/false. It applies to every task. Hand-written configs that omit it are accepted as false; there is no prompt or pause. |
 
 Then: `council.sh show --config council.json` → paste the roster to the user and get a yes before `start`.
@@ -235,25 +235,35 @@ For two or more pending questions of one task, `--answer TEXT` records one expli
 
 **Context handover.** After every call the member's context use is measured (OpenCode: tokens of the
 last assistant message vs the model's context limit; Claude: `usage` of the last iteration vs
-`modelUsage.contextWindow`). At ≥ `handover_at` (after at least 2 calls on that session) the session
-writes a handover note, a fresh session is created for the same member id (generation +1), and the
-note + council rules are prepended to its first prompt. Members that cross their threshold in the same step write
-their notes in parallel (`handover_launch`/`handover_finish`); members that need no handover start the step
-meanwhile, and each handed-over member is launched as soon as its own note is through the gate. `status` and the transcript show per member:
+`modelUsage.contextWindow`). At ≥ `handover_at` (after at least 2 calls on that session) the session's
+transcript is compacted into `<run>/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` (+ `blobs/`) by jev's
+`make_context.py`, vendored in `scripts/vendor/jev-handoff/` (no model call: a Claude session is read from its
+transcript, an OpenCode session from `opencode.db`), and a fresh session is created for the same member id
+(generation +1). Its first prompt carries the council rules, then the path of that file — read, never copied — and
+says that this prompt overrides what the file says to do after reading it. The folder name lets the next
+generation's handoff find this one as its parent. If the script cannot build the handoff, the successor gets a note
+made of the member's own posts instead, with the reason in it. Members that cross their threshold in the same step
+build their handoffs in parallel (`handover_launch`/`handover_finish`); members that need no handover start the step
+meanwhile, and each handed-over member is launched as soon as its own handoff is through the gate. `status` and the transcript show per member:
 generation, context %, session tokens, cost, calls, retired sessions. Both include each
 member's final-generation + retired subtotal and a **RUN TOTAL** across all generations.
 
 **Handover gate (optional).** With `COUNCIL_HANDOVER_GATE=1` in the orchestrator's environment (it works on
 `start` and on `resume` of an existing run), the delivered handover note waits for an outside review before the
 successor reads it: `handover_finish` writes `<note>.pending`, logs `handover gate: review <note>; remove
-<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1839-1855`). A replacement note (`resume --replace`) waits the same way.
+<note>.pending to release`, and polls until the marker is removed (`handover_gate`, `scripts/council.sh:1842-1858`). A replacement note (`resume --replace`) waits the same way.
 The successor reads the note by path when its prompt is built, so a reviewer may correct the file in place before
 releasing it. Without the gate the successor's prompt is written 0-1 s after the note (measured on 5 handovers), too
 soon for any review. The wait is bounded by `COUNCIL_HANDOVER_GATE_TIMEOUT` seconds (default 3600); an unreleased
 note is never delivered: the calls still in flight are stopped and the run stops with the failed checkpoint
 (exit 2) before the old session is retired, so `resume` redoes the handover.
 
-The handover prompt asks for the deliverable, half-finished work and mistakes not to repeat.
+**The pinned handoff script.** `scripts/vendor/jev-handoff/` is a copy of jev's `compact-handoff` scripts and the
+`handoff-verify` modules they import, pinned to one commit and listed with hashes in `VENDOR.json`. The council never
+looks for an installed jev plugin and does not pass `HV_SCRIPTS` on to the script. `python3
+scripts/vendor/update_jev_handoff.py --check` verifies the copy; `--repo PATH --commit SHA` refreshes it from a jev
+checkout (commit there first: the files are read from git, not from the working tree), then run the `vendor_tests` and
+`compact_handover_tests` suites. `COUNCIL_HANDOFF_SCRIPT` points the council at another `make_context.py`.
 
 **Lossless prompt de-duplication.** In voting rounds, an exactly matching candidate or a
 byte-identical proposal token can refer to a uniquely anchored peer post in the same prompt.

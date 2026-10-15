@@ -1,0 +1,27 @@
+{
+ "source": "https://github.com/panaalexandrucristian/jev-mcp-private",
+ "commit": "d918f59dce58a6435ce9b9a231e0e39ceeb80c3f",
+ "files": {
+  "LICENSE": "61ada187d8ec32d7ee7a31fe6d9ec1623cf02e43b9333300fdf8b3508a383717",
+  "skills/compact-handoff/scripts/compact_context.py": "b9aa23a0e47059886cebdce95bd1d53d735429f16acbb8ff9795531cf2e2541d",
+  "skills/compact-handoff/scripts/make_context.py": "3e3e49abd2dc1464a089f7b8eccdf2a3cf9c73bb1e9b7c0bd33a71c4de7e4304",
+  "skills/compact-handoff/scripts/opencode_source.py": "58324ce516cb15c1d8f3e2bd4215fe8b0140be870749321581c0b34c328630cf",
+  "skills/compact-handoff/scripts/prepare_all.py": "ccf02c8a0266f94dc4341076355137e8ac8d0cedecf7b304a8ca13a5dec3602c",
+  "skills/handoff-verify/scripts/advice.py": "8384ef90a2c98b4b638f4c33ab7bf778cdc3f40f14a0611200018c98a0f9a41c",
+  "skills/handoff-verify/scripts/audit.py": "bec1a3ebf3acab20b9f5e0a1128662310ee3a5b19992644b167c0fed187cbdae",
+  "skills/handoff-verify/scripts/discover.py": "9de31d6921d03e9ae72e39064fca900d60c0c9093a7a1c52bab1927d84992241",
+  "skills/handoff-verify/scripts/jevref.py": "93240ac755cf34bb3428e132b2e7d6f717943b44575b6eb090161bad9683ea44",
+  "skills/handoff-verify/scripts/ledger.py": "c4ae7e74fc3819db40aceae9c1f5f285eca7e0c560e624b789e126e4485eefd7",
+  "skills/handoff-verify/scripts/omissions.py": "06786ca82d634206f8e4676882b56fe5fd29e4b2caf942c754956ae6276f3dc7",
+  "skills/handoff-verify/scripts/opencode.py": "5071ec98cb5d24034a002f211cc37a4971f97ffb2806330502259c64e6bb47b2",
+  "skills/handoff-verify/scripts/prepare.py": "5c838eba851571a1b1afeca665e931bc70c6cb7d185a595e1d2be2adf5dcced2",
+  "skills/handoff-verify/scripts/refs.py": "47a0ecd55f640fa70cb3b08e5e66ae0722e2680b83533d70657c227fc600a114",
+  "skills/handoff-verify/scripts/report.py": "5fb63fafd00e2e403187f5cb446fb9b0d0c5978f9f34fa6647303425c9543c4a",
+  "skills/handoff-verify/scripts/report.schema.json": "09db577af2a60d1b6243dfe28a7579f384ca28f005bc83eaa603200aaeacf4a1",
+  "skills/handoff-verify/scripts/sanitize.py": "7d0d9924c0d7b8819e42fc2540ae033fb19182ea4928ffe1f24b61c6dc4ec92f",
+  "skills/handoff-verify/scripts/schema_check.py": "10dc263a327caf2dec8bb2dcbe94780117f9974d9b0e3746d680b3c8bbe89796",
+  "skills/handoff-verify/scripts/scope.py": "1cc9a6359035947cf542bbc0cc172e16d259f4fe96b508b6fe648d8c3df5a5c0",
+  "skills/handoff-verify/scripts/slice.py": "f4cd05c2619725c07fbfef07578d3b839fe4ea9e7009d35b7ff82567ace22992",
+  "skills/handoff-verify/scripts/versions.py": "9c8ecfc87ea5ee0c8abbdd3713f63b1d1b23c40e9b5c2316c043eccb792d5ad4"
+ }
+}

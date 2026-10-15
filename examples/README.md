@@ -114,7 +114,7 @@ run: /path/to/run · status: done · task hello (1/1 done) · phase plan · roun
 ```
 
 Every member's context use is measured after each call; had one crossed `handover_at` (50%), the
-session would have written a handover note and been replaced by a fresh session (`g2`) — the
+session would have been compacted into a handoff file and replaced by a fresh session (`g2`) — the
 `retired` column and the transcript log record that.
 
 ## From Claude Code
