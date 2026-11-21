@@ -92,8 +92,8 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 
 | decide | field | notes |
 |---|---|---|
-| how many sessions, how many OpenCode vs Claude Code | `members[]` (`kind`: `opencode` \| `claude`) | ≥ 2 members, unique ids (A, B, C…) |
-| which model each one uses | `members[].model` | OpenCode: `provider/id` from `oc.sh models`; Claude: `opus`, `sonnet`, `haiku`, `fable` or a full id |
+| how many sessions, how many OpenCode vs Claude Code | `members[]` (`kind`: `opencode` \| `claude`) | ≥ 2 members, unique ids (A, B, C…). A Claude model can also be a `kind: opencode` member on a `claude-agent/*` model (below) |
+| which model each one uses | `members[].model` | OpenCode: `provider/id` from `oc.sh models` (`claude-agent/opus` etc. for a Claude model through OpenCode); Claude (`kind: claude`): `opus`, `sonnet`, `haiku`, `fable` or a full id |
 | what effort each one uses | `members[].effort` | OpenCode = the model's **variant** (validated live: Astra low\|medium\|high\|xhigh\|max, Gemini low\|medium\|high, Kimi K3 low\|high\|max; models without variants take `"default"`); Claude = `--effort` low\|medium\|high\|xhigh\|max |
 | who may edit files | `executor` + that member's `mode: "edit"` | exactly one executor or `null` (read-only council). OpenCode members get an allow-all ruleset + `--auto`. read → OpenCode agent `plan` / Claude `--permission-mode plan` without Edit/Write/MultiEdit/NotebookEdit; edit → `build` / Claude `acceptEdits` with Bash and the edit tools allowed |
 | project directory | `dir` | absolute; the sessions inspect/edit it |
@@ -148,6 +148,28 @@ The split contract file path is relative to the directory containing the map-dec
 Mapper permission rules allow `read`, `grep` and `glob` everywhere inside the project, including repository metadata (`.git`/`.hg`/`.svn`) and an in-project run directory; the orchestrator excludes nothing (`exclusions: []`). Parent paths and outside paths (`external_directory`) are denied, and the session remains ask-before-permission and deny-by-default. Because OpenCode never resolves symlinks, the orchestrator scans the project before dispatch. Every in-project symlink that resolves outside the project, and every directory alias leading to one, is denied for read by name. OpenCode's matcher is case-sensitive, so on a filesystem that ignores letter case (probed, recorded as `boundary.case_insensitive`) these denies are also emitted case-folded (`?` per ASCII letter, `*` per non-ASCII character) and may block same-shaped in-project names. When any exists, `grep`/`glob` are denied for that session only, since they are authorized by pattern and follow a symlinked search path; the reason is in `state.json`, `coverage.json` and the map review. An incomplete scan means no dispatch (unavailable). A rescan after the run, on resume too, discards the map if the escaping-link records changed. Capture still rejects escaping selectors. Links changed by another process during the run are detected, not blocked (README: Known gaps / future tests). Timeout, blocked permission, invalid/oversized response, and uncertain interrupted work are retained as unavailable/partial artifacts; uncertain dispatches are never automatically relaunched. The map is historical navigation evidence, not exhaustive coverage. Executor edits do not refresh it, and current-source conclusions require live inspection. Usage/capture telemetry may be incomplete and must remain labelled unknown where unavailable.
 
 Replacing an approved split or keeping its parent after split validation fails archives superseded prompts, posts, raw outputs, map attempts and outcomes under the old contract identity before publishing the replacement state. Both paths reset planning to round 1 and clear stale candidate/vote/reuse state. Archival or publication failures leave a checkpoint; resume must not reuse superseded posts.
+
+### Claude models through OpenCode (`claude-agent/*`)
+
+Ask whether a Claude member should be started by the council (`kind: claude`, `claude -p`) or run through OpenCode's `claude-agent`
+provider (`kind: opencode`, `model: claude-agent/<id>`), when the user says the council must not launch the Claude Code CLI itself, or
+asks for "Claude through OpenCode". `oc.sh models | grep claude-agent` lists the ids (`opus`, `sonnet`, `haiku`, `fable`,
+`claude-opus-5`, …). Roster example: `{"id":"B","kind":"opencode","model":"claude-agent/opus","effort":"xhigh","mode":"read"}`;
+`examples/council-claude-agent.json` is a complete config.
+
+- The member is an ordinary OpenCode member: `council.sh` creates an OpenCode session for it (agent `plan` for `read`, `build` for the executor),
+  validates `effort` against the model's variants (`show` refuses anything else; a model without variants takes `"default"`), and
+  reads its context window and tokens from OpenCode. The provider starts its own `claude --output-format stream-json …` processes;
+  that is not the council's `claude -p --resume` launch, so `max_turns` and `claude_cache_ttl` do not apply to it.
+- Handover: the handoff of a retiring `claude-agent/*` member is built from `opencode.db`, because `handoff_build` chooses by the member's
+  `kind`, not its model; a `kind: claude` member's handoff still comes from its Claude Code transcript. (Run once on a real `claude-agent/opus`
+  council session: roundtrip identical.)
+- `kind: claude` takes Claude Code's names (`sonnet`, …); `show` does not check it against OpenCode's list, so never put a `claude-agent/*`
+  id on a `kind: claude` member.
+- On the install this was checked on, OpenCode reports cost `0` for these sessions: the council's cost columns read 0 for them while
+  tokens are counted. Say so when you report costs.
+- Not verified: a full council run to the end on `claude-agent/*` members, `mode: "edit"` (an executor) on one, `resume --replace ID=opencode:claude-agent/…`.
+  Say so if the user asks for one of these.
 
 ### 2. Run
 
@@ -206,6 +228,13 @@ os.dup2(os.open("/dev/null",os.O_RDONLY),0)
 os.execvp("caffeinate",["caffeinate","-i","<skill-dir>/scripts/council.sh","start","--config","<config>","--run-dir","<run-dir>"])
 EOF
 ```
+
+**Watching a run (optional).** `python3 -I ${CLAUDE_SKILL_DIR}/scripts/ui/server.py <run-dir> [--port N]` serves a read-only page at
+`http://127.0.0.1:8765/` (127.0.0.1 only, GET only, writes nothing; standard library): status, phase and round, the tasks with their
+outcomes, each member's context bar and handoffs, every post and vote, the pending questions, the events and the last lines of
+`<run-dir>.out`. It cannot answer a question: a pending question is still answered with `council.sh resume` (its banner shows the
+command). Start it in the background and give the user the URL; "stopped" on the status chip means no `council.sh start|resume`
+process names the run directory as an absolute `--run-dir` path (a heuristic). Offline tests: `python3 scripts/ui/test_ui.py`.
 
 **Exit 4 — no assumptions.** Members must list every choice the task leaves open with what settles
 it (`task` / `dir` / `user` answer / `ask`); anything not settled by the task, the working directory
@@ -602,7 +631,7 @@ password at startup (`server password ...`); `--port`/`--hostname`/`--cors` conf
 ## Changing the skill
 
 `scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (779 cases, including the telemetry writer/report), run automatically by
-`scripts/test-completion.sh`.
+`scripts/test-completion.sh`; `scripts/ui/test_ui.py` is the one of the live view (`ui_tests`), and `claude_agent_tests` checks the `claude-agent` example and its handover path.
 
 `scripts/ptools/telemetry_report.py [INPUT ...]` reports offline over telemetry (read-only, standard library).
 INPUT is a ledger file, a directory (its immediate `*.jsonl`) or a run directory (its `telemetry.jsonl`); the default

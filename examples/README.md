@@ -12,6 +12,7 @@ Files in this directory:
 | [`council.json`](council.json) | the roster + task (set `dir` to an absolute path of a scratch git repo before running) |
 | [`answers.json`](answers.json) | the answers given to the council's questions |
 | [`transcript.md`](transcript.md) | the full transcript the run produced |
+| [`council-claude-agent.json`](council-claude-agent.json) | a read-only council of two Claude models run as OpenCode members (`claude-agent/opus`, `claude-agent/sonnet`), so the council itself never starts the Claude Code CLI; see [the last section](#claude-models-through-opencode-no-claude-code-cli-launched-by-the-council) |
 
 ## 1. Check the roster (nothing runs yet)
 
@@ -129,3 +130,31 @@ The same thing driven by the skill instead of by hand:
 Claude writes `council.json`, shows you the roster, waits for your yes, runs `start` in the
 background, relays the council's questions to you one by one, writes `answers.json`, resumes, and
 reports the outcome, the diff and the token/context summary.
+
+## Claude models through OpenCode (no Claude Code CLI launched by the council)
+
+[`council-claude-agent.json`](council-claude-agent.json) is the same shape as `council.json`, but both members are
+`"kind": "opencode"` on a model of OpenCode's `claude-agent` provider (`oc.sh models | grep claude-agent` lists them).
+Set `dir` to a real directory first. `show` checks every model and effort against the live OpenCode server:
+
+```
+$ scripts/council.sh show --config examples/council-claude-agent.json
+COUNCIL ROSTER
+  sessions: 2 total = 2 OpenCode + 0 Claude Code
+  id   kind      model                              effort   mode   agent/perm   style    handover  ctx-window
+  A    opencode  claude-agent/opus                  xhigh    read   plan         normal   50%       1000k
+  B    opencode  claude-agent/sonnet                high     read   plan         normal   50%       1000k
+  executor (only member allowed to edit files): none — read-only council
+  dir: /path/to/project
+  max_rounds/task: 4 · timeout/call: 600s · handover at 50% of context (council default; per-member values in the table) · claude max_turns: 30
+  tasks:
+    t1: Read the project's README and agree on the three most important pieces of documentation that are missing.
+config OK: examples/council-claude-agent.json
+```
+
+(Output trimmed of the cost note and of the path. `start`, `resume`, `status` and `report` work as in the first example.)
+The efforts of such a member are the model's OpenCode variants, which differ per model: on the install this was checked on,
+`claude-agent/opus` offers `low|medium|high|xhigh|max`, `claude-agent/claude-opus-4-6` has no `xhigh`, and
+`claude-agent/claude-haiku-4-5-20251001` has none at all (its effort is `"default"`); `show` refuses anything else. When such
+a member's context crosses `handover_at`, its handoff is built from the OpenCode database, like any OpenCode member's. The
+README section "Claude models through OpenCode" says when to prefer this over `"kind": "claude"` and what was not verified.
