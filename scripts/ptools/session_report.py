@@ -117,7 +117,7 @@ class Session:
         self.models = set()     # every message.model of every assistant line (None = missing), duplicates included
         self.odd = 0            # OpenCode message elements outside the measured flat schema (skipped, never guessed)
         self.seg_prompts = []   # first prompt text of each segment (None when unknown)
-        self.member = None      # member id, for the byte-exact prompt attribution
+        self.member = None      # member id, for the byte-exact prompt attribution (one named OpenCode exception)
 
 
 class Gen:
@@ -740,9 +740,15 @@ def member_prompt_files(run, mid):
     return out
 
 
+OC_NEWLINE = " (final newline removed by oc.sh)"
+
+
 def attribute_segment(s, j, run, pr, cache):
     """(task, round, phase, provenance) of segment j, only from a byte-for-byte match, with no
-    normalization of any kind, to exactly one of the member's own prompt files; otherwise unknown."""
+    normalization of any kind, to exactly one of the member's own prompt files; otherwise unknown.
+    One named exception, for OpenCode segments only: oc.sh sends the prompt through $(...), which
+    removes the file's final newline (scripts/oc.sh read_text), so a prompt equal to a file minus
+    exactly one final newline also matches and its provenance says so."""
     unknown = ("unknown", "unknown", "unknown")
     if pr is None:
         return unknown + ("prompt_report unavailable",)
@@ -759,11 +765,13 @@ def attribute_segment(s, j, run, pr, cache):
             data = prompt.encode("utf-8")
         except UnicodeEncodeError:               # a lone surrogate: there are no bytes to compare, and none are invented
             return unknown + ("first prompt is not valid UTF-8 (a lone surrogate); not compared with any prompt file",)
-    hits = [f for f in cache[s.member] if data is not None and f["data"] == data]
+    hits = [(f, "") for f in cache[s.member] if data is not None and f["data"] == data]
+    if s.kind == "opencode" and data is not None:
+        hits += [(f, OC_NEWLINE) for f in cache[s.member] if f["data"] == data + b"\n"]
     if len(hits) != 1:
         return unknown + ("several matches" if hits else "no match",)
-    f = hits[0]
-    prov = "prompts/" + disp(f["name"]) + (" (retry)" if f["kind"] == "retry" else "")
+    f, how = hits[0]
+    prov = "prompts/" + disp(f["name"]) + (" (retry)" if f["kind"] == "retry" else "") + how
     if f["kind"] == "handover":
         return ("unknown", "unknown", "handover request", prov)
     try:
@@ -989,46 +997,54 @@ def print_run_totals(state):
     print()
 
 
-def report(gens, cpt, top, state=None, run=None):
-    print("# Token report \u2014 member sessions\n")
-    print_coverage(gens, unusable_entries(state) if state is not None else ())
-    print_state_totals(gens)
-    if state is not None:
-        print_run_totals(state)
+def segment_ranges(s):
+    """(first call, end) of each segment of s, in order; a session without a prompt is one segment."""
+    starts = list(s.segments) or [0]
+    return list(zip(starts, starts[1:] + [len(s.calls)]))
+
+
+class Analysis:
+    """What report() prints, as data; compute() fills it and prints nothing."""
+
+    def __init__(self):
+        self.sessions = []    # (session, analyse() result: measured, by_cat, by_key, harness, inherited)
+        self.all_cat = collections.Counter()
+        self.all_key = collections.defaultdict(lambda: [0, 0, 0])   # (category, key) -> times, chars, re-sent tokens
+        self.tot_meas, self.tot_inh, self.n_keep, self.n_calls = 0, 0.0, 0, 0
+        self.segs = []        # (consumed, label, segment #, turns, context at start, at end, attribution, session)
+        self.rewrites = []    # (tokens written, label, call #, gap before in minutes or a reason)
+        self.agg = collections.OrderedDict([(("unknown", "unknown", "unknown"), [0, [0, 0, 0, 0]])])  # -> segments, consumed
+
+
+def compute(gens, cpt, run=None):
+    """The analysis of every generation's session: provider counters, attribution over items, segments with
+    their task/round/phase, the aggregate per attribution and the large cache writes."""
+    a = Analysis()
     for g in gens:
         if g.session:
             g.session.member = g.member
-    sessions = [g.session for g in gens if g.session]
     pr, cache = load_prompt_report(), {}
-    print("## Provider counters (as reported by the provider, from transcripts or fetched messages)\n")
-    print("| session | kind | calls | council calls | input (new) | cache read | cache write | output | reasoning (reported) |")
-    print("|---|---|---|---|---|---|---|---|---|")
-    all_cat, all_key = collections.Counter(), collections.defaultdict(lambda: [0, 0, 0])
-    tot_meas, tot_inh, rewrites, segs, n_keep, n_calls = 0, 0.0, [], [], 0, 0
-    for s in sessions:
+    for s in [g.session for g in gens if g.session]:
         cs = s.calls
-        print("| %s | %s | %d | %d | %s | %s | %s | %s | %s |" % (
-            s.label, s.kind, len(cs), len(s.segments), column(cs, "inp"), column(cs, "cr"), column(cs, "cw"),
-            column(cs, "out"),
-            column(cs, "reasoning") if s.kind == "opencode" else "n/a (Claude usage has no reasoning count)"))
-        meas, by_cat, by_key, harness, inh = analyse(s, cpt)
-        tot_meas += meas
-        n_calls += len(cs)
-        tot_inh += inh
-        all_cat.update(by_cat)
+        res = analyse(s, cpt)
+        a.sessions.append((s, res))
+        meas, by_cat, by_key, harness, inh = res
+        a.tot_meas += meas
+        a.n_calls += len(cs)
+        a.tot_inh += inh
+        a.all_cat.update(by_cat)
         for k, v in by_key.items():
             for i in range(3):
-                all_key[k][i] += v[i]
+                a.all_key[k][i] += v[i]
         keep, rank = attributable(s)
-        n_keep += len(keep)
-        starts = list(s.segments) or [0]
-        for j, (a, b) in enumerate(zip(starts, starts[1:] + [len(cs)])):
-            calls = cs[a:b]
+        a.n_keep += len(keep)
+        for j, (x, y) in enumerate(segment_ranges(s)):
+            calls = cs[x:y]
             if calls:
                 seg = [c for c in calls if complete(c)]
                 seg_ctx = [c["inp"] + c["cr"] + c["cw"] for c in seg]
-                segs.append((consumed(s.kind, calls), s.label, j + 1, len(calls), seg_ctx[0] if seg else None,
-                             seg_ctx[-1] if seg else None, attribute_segment(s, j, run, pr, cache)))
+                a.segs.append((consumed(s.kind, calls), s.label, j + 1, len(calls), seg_ctx[0] if seg else None,
+                               seg_ctx[-1] if seg else None, attribute_segment(s, j, run, pr, cache), s))
         for c in keep:
             p = cs[c["i"] - 1] if c["i"] else None   # the immediately preceding call, attributable or not
             ctx = c["inp"] + c["cr"] + c["cw"]
@@ -1040,7 +1056,33 @@ def report(gens, cpt, top, state=None, run=None):
                     gap = "%.0f" % ((c["ts"] - p["ts"]) / 60)
                 else:
                     gap = "n/a (a timestamp is missing)"
-                rewrites.append((w, s.label, c["i"], gap))
+                a.rewrites.append((w, s.label, c["i"], gap))
+    for tokc, lab, j, turns, c0, c1, at, s in a.segs:
+        row = a.agg.setdefault(at[:3], [0, [0, 0, 0, 0]])
+        row[0] += 1
+        row[1] = [x + y for x, y in zip(row[1], tokc)]
+    return a
+
+
+def report(gens, cpt, top, state=None, run=None):
+    print("# Token report \u2014 member sessions\n")
+    print_coverage(gens, unusable_entries(state) if state is not None else ())
+    print_state_totals(gens)
+    if state is not None:
+        print_run_totals(state)
+    a = compute(gens, cpt, run)
+    sessions = [s for s, res in a.sessions]
+    all_cat, all_key, tot_meas, tot_inh, n_keep, n_calls = a.all_cat, a.all_key, a.tot_meas, a.tot_inh, a.n_keep, a.n_calls
+    segs, rewrites = a.segs, a.rewrites
+    print("## Provider counters (as reported by the provider, from transcripts or fetched messages)\n")
+    print("| session | kind | calls | council calls | input (new) | cache read | cache write | output | reasoning (reported) |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for s, (meas, by_cat, by_key, harness, inh) in a.sessions:
+        cs = s.calls
+        print("| %s | %s | %d | %d | %s | %s | %s | %s | %s |" % (
+            s.label, s.kind, len(cs), len(s.segments), column(cs, "inp"), column(cs, "cr"), column(cs, "cw"),
+            column(cs, "out"),
+            column(cs, "reasoning") if s.kind == "opencode" else "n/a (Claude usage has no reasoning count)"))
         if harness:
             print("|  \u21b3 harness prefix per call \u2248 %s tokens (heuristic estimate) | | | | | | | |" % fmt(harness))
     for s in sessions:
@@ -1082,15 +1124,12 @@ def report(gens, cpt, top, state=None, run=None):
         print("A segment starts at the first API call after a prompt; segments are not proven CLI invocations.\n")
         print("| session | segment # | turns (API calls) | context at start | context at end | tokens consumed | task | round | phase | provenance |")
         print("|---|---|---|---|---|---|---|---|---|---|")
-        for tokc, lab, j, turns, c0, c1, at in sorted(segs, key=lambda x: -x[0][0])[:top]:
+        for tokc, lab, j, turns, c0, c1, at, s in sorted(segs, key=lambda x: -x[0][0])[:top]:
             print("| %s | %d | %d | %s | %s | %s | %s |" % (lab, j, turns, "unknown" if c0 is None else fmt(c0),
                                                           "unknown" if c1 is None else fmt(c1), qualified(tokc), " | ".join(at)))
-    agg = collections.OrderedDict([(("unknown", "unknown", "unknown"), [0, [0, 0, 0, 0]])])
-    for tokc, lab, j, turns, c0, c1, at in segs:
-        row = agg.setdefault(at[:3], [0, [0, 0, 0, 0]])
-        row[0] += 1
-        row[1] = [x + y for x, y in zip(row[1], tokc)]
-    print("\n## Task and phase attribution (byte-exact match with the member's own prompt files; otherwise unknown)\n")
+    agg = a.agg
+    print("\n## Task and phase attribution (byte-exact match with the member's own prompt files, or for OpenCode the file "
+          "minus its final newline, as oc.sh sends it; otherwise unknown)\n")
     print("| task | round | phase | segments | tokens consumed |\n|---|---|---|---|---|")
     for key, (count, tokc) in sorted(agg.items(), key=lambda kv: -kv[1][1][0]):
         print("| %s | %d | %s |" % (" | ".join(key), count, qualified(tokc)))

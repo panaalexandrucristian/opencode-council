@@ -268,6 +268,19 @@ class SectionAccounting(unittest.TestCase):
         self.assertGreater(counts["rules"], 0)
         self.assertGreater(counts["replacement notes"], 0)
 
+    def test_rules_end_after_the_style_rule_and_its_caveman_block(self):
+        head = "You are member A of a council of 3 AI agents.\n" + TAIL_RULE
+        task = "=== TASK t1 {} round 2 of 4 ===\nbody\n\nYour job this round: x\n".format(EM)
+        # council.sh rules_text: rule 5, then the style rule (an empty line for "normal"), then a blank line
+        for style, rule in (("normal", ""),
+                            ("lite", "6. Style {} lite: no filler.\n".format(EM)),
+                            ("caveman", "6. Style {} caveman: follow the rules below.\n   NEVER compress: the JSON tail.\n"
+                                        "<<<CAVEMAN\nDrop filler.\n\n## Rules\n\nShort words.\n>>>\n".format(EM))):
+            with self.subTest(style=style):
+                data = (head + (rule or "\n") + "\n" + task).encode()
+                counts = self.partition_holds(data)
+                self.assertEqual(counts["rules"], len((head + rule).encode()))
+
     def test_candidate_bytes_match_the_candidate_block(self):
         candidate = "CANDIDATE BODY\nsecond line"
         body, _ = post("unrelated")
@@ -3645,9 +3658,9 @@ class SessionReportCliTests(SessionReportCase):
                 self.assertIn(needle, block, "%s: %s" % (name, needle))
             self.assertNotIn("derived only from", block, name)
             self.assertNotIn("comes only from", block, name)
-        self.assertIn("779 Python standard-library unittest cases", (root / "README.md").read_text())
-        self.assertIn("1834 offline checks", (root / "README.md").read_text())
-        self.assertIn("779 cases", (root / "SKILL.md").read_text())
+        self.assertIn("791 Python standard-library unittest cases", (root / "README.md").read_text())
+        self.assertIn("1899 offline checks", (root / "README.md").read_text())
+        self.assertIn("791 cases", (root / "SKILL.md").read_text())
 
     def test_the_docs_state_the_fill_rule_the_component_format_the_state_type_rule_and_the_numbering(self):
         root = Path(os.environ.get("SESSION_REPORT_DOCS", str(HERE.parent.parent)))
@@ -4966,7 +4979,8 @@ class SessionReportOpenCodeTests(SessionReportCase):
 
 
 class SessionReportPhaseTests(SessionReportCase):
-    """C19: task, round and phase only from a byte-exact match with the member's OWN prompt files (plan section 9)."""
+    """C19: task, round and phase only from a byte-exact match with the member's OWN prompt files (plan section 9),
+    with one named OpenCode exception: the file minus the final newline that oc.sh removes."""
 
     RETRY_TEXT = "Your previous reply could not be used: re-send your COMPLETE post for the current round now.\n"
 
@@ -5088,6 +5102,42 @@ class SessionReportPhaseTests(SessionReportCase):
         self.assertEqual(rc, 0, err)
         row = self.segment_rows(out, "B g1 %s" % SID_OC_1)[0]
         self.assertEqual(row[6:10], ["alpha", "3", "round 3 of 6", "prompts/alpha-r3-B.md"], row)
+
+    def oc_first_row(self, prompt):
+        self.write_state([sr_member("B", "opencode", "openai/gpt-6-astra", SID_OC_1, tokens=1205808)])
+        self.install_fake_oc({SID_OC_1: {"messages": [
+            oc_user("u1", prompt),
+            oc_assistant("a1", oc_tokens(1503, 711, 137, 2011, 313), 0.01, [{"type": "text", "text": "x"}])]}})
+        self.write_service()
+        rc, out, err = self.fetch()
+        self.assertEqual(rc, 0, err)
+        return self.segment_rows(out, "B g1 %s" % SID_OC_1)[0]
+
+    def test_an_opencode_prompt_without_the_files_final_newline_is_attributed_with_its_own_provenance(self):
+        text = self.task_prompt(label="round 3 of 6")
+        self.prompt_file("alpha-r3-B.md", text)
+        self.prompt_file("alpha-r3-B-retry.md", self.task_prompt(label="round 3 of 6", body="retry"))
+        row = self.oc_first_row(text[:-1])
+        self.assertEqual(row[6:10], ["alpha", "3", "round 3 of 6", "prompts/alpha-r3-B.md (final newline removed by oc.sh)"], row)
+        row = self.oc_first_row(self.task_prompt(label="round 3 of 6", body="retry")[:-1])
+        self.assertEqual(row[6:10], ["alpha", "3", "round 3 of 6",
+                                     "prompts/alpha-r3-B-retry.md (retry) (final newline removed by oc.sh)"], row)
+
+    def test_an_opencode_prompt_with_any_other_difference_stays_no_match(self):
+        text = self.task_prompt(label="round 3 of 6")
+        for name, file_text, prompt in (("two final newlines", text + "\n", text[:-1]),
+                                        ("a final CRLF", text[:-1] + "\r\n", text[:-1]),
+                                        ("a final space", text, text[:-1] + " "),
+                                        ("another byte", text, text[:-2])):
+            with self.subTest(name):
+                self.prompt_file("alpha-r3-B.md", file_text)
+                self.assertEqual(self.oc_first_row(prompt)[6:10], ["unknown", "unknown", "unknown", "no match"])
+
+    def test_an_exact_and_a_newline_match_in_two_opencode_files_are_several_matches(self):
+        text = self.task_prompt(label="round 3 of 6")
+        self.prompt_file("alpha-r3-B.md", text)
+        self.prompt_file("beta-r3-B.md", text[:-1])
+        self.assertEqual(self.oc_first_row(text[:-1])[6:10], ["unknown", "unknown", "unknown", "several matches"])
 
     def test_opencode_calls_before_the_first_user_message_are_unknown_and_never_borrow_the_later_prompt(self):
         text = self.task_prompt(label="round 3 of 6")
@@ -5662,6 +5712,161 @@ class SessionReportAdversarialTests(SessionReportCase):
         self.assertIn("fetched messages PARTIAL — 0 message(s) in 1 page(s); stopped: page 1: invalid JSON", line)
         self.assertNotIn("FORGED", out)
         self.assertNotIn("\x1b", out)
+
+
+# ---------------------------------------------------------------------------
+# token_breakdown.py: several runs read through session_report used as a module.
+# ---------------------------------------------------------------------------
+TOKEN_BREAKDOWN_PY = HERE / "token_breakdown.py"
+TB_RUN_START = {"schema": 1, "ev": "run_start", "host": "d195ee3246757fb0", "run": "8f6abc997a334742a34d06c2d6c91fdb",
+                "inv": 1, "seq": 1, "ts": 1793990787, "command": "start", "status": "created", "skill_version": "0.17.0",
+                "claude_version": "2.1.304", "opencode_version": "2.0.22", "members": 3, "max_rounds": 4, "tasks": 1,
+                "timeout_s": 600, "max_turns": 30, "handover_at": 0.5, "style": "normal", "executor_present": True,
+                "map_code": False, "gap": False, "history": "full"}
+
+
+class TokenBreakdownTests(SessionReportCase):
+    """token_breakdown.py: a run's segments, counters and attribution are session_report's; local unless
+    --fetch-opencode; unknown counted apart; no prices; re-reads counted by normalized path."""
+
+    def task_prompt(self, label):
+        return "You are member B of a council.\n=== TASK alpha %s %s ===\nbody\n" % (EM, label)
+
+    def tb(self, *args, env=None):
+        proc = subprocess.run([sys.executable, str(TOKEN_BREAKDOWN_PY)] + [str(a) for a in args],
+                              capture_output=True, text=True, env=env or self.env())
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def rows(self, out, heading, first=None):
+        rows = [[c.strip() for c in l.strip("|").split("|")] for l in self.section(out, heading).splitlines()
+                if l.startswith("| ") and not l.startswith("| run |")]
+        return [r for r in rows if first is None or r[0] == first]
+
+    def opencode_run(self, telemetry=(TB_RUN_START,)):
+        """Member B on OpenCode: round 1 (2 API calls, one file read once relative and once absolute),
+        ratification round 1 (1 call) and a prompt no file has (1 call); every prompt as oc.sh sends it."""
+        self.project = self.tmp / "project"
+        plan, ratify = self.task_prompt("round 1 of 3"), self.task_prompt("RATIFICATION round 1 of 3")
+        (self.run / "prompts" / "alpha-r1-B.md").write_text(plan)
+        (self.run / "prompts" / "alpha-x1-B.md").write_text(ratify)
+        self.write_state([sr_member("B", "opencode", "openai/gpt-6-astra", SID_OC_1, tokens=1)],
+                         config={"tasks": [], "dir": str(self.project)})
+        if telemetry is not None:
+            write_jsonl(self.run / "telemetry.jsonl", list(telemetry))
+        self.install_fake_oc({SID_OC_1: {"messages": [
+            oc_user("u1", plan[:-1]),
+            oc_assistant("a1", oc_tokens(1503, 711, 137, 2011, 313), 0.01,
+                         [oc_tool("read", {"filePath": "src/app.py"}, "x" * 640)]),
+            oc_assistant("a2", oc_tokens(1611, 823, 149, 3013, 401), 0.02,
+                         [oc_tool("read", {"filePath": str(self.project / "src" / "app.py")}, "x" * 640)]),
+            oc_user("u2", ratify[:-1]),
+            oc_assistant("a3", oc_tokens(1700, 500, 100, 5000, 0), 0.03, [{"type": "text", "text": "z"}]),
+            oc_user("u3", "a prompt that no file has"),
+            oc_assistant("a4", oc_tokens(10, 20, 0, 30, 0), 0.0, [{"type": "text", "text": "w"}])]}})
+        self.write_service()
+
+    def fetch_tb(self, *extra):
+        rc, out, err = self.tb("--fetch-opencode", "--oc", self.fake_dir / "oc.sh", *extra, self.run,
+                               env=self.env(FAKE_OC_DIR=str(self.fake_dir)))
+        self.assertEqual(rc, 0, err)
+        return out
+
+    def test_steps_rounds_and_providers_come_from_session_reports_attribution_with_unknown_apart(self):
+        self.opencode_run()
+        out = self.fetch_tb()
+        self.assertEqual(self.rows(out, "## By step\n", "plan")[0], ["plan", "1", "2", "10672", "59.2%"])
+        self.assertEqual(self.rows(out, "## By step\n", "ratify")[0], ["ratify", "1", "1", "7300", "40.5%"])
+        self.assertEqual(self.rows(out, "## By step\n", "unknown")[0], ["unknown", "1", "1", "60", "0.3%"])
+        self.assertEqual(self.rows(out, "## By round", "plan"), [["plan", "1", "openai", "1", "2", "10672"]])
+        self.assertEqual(self.rows(out, "## By round", "ratify"), [["ratify", "1", "openai", "1", "1", "7300"]])
+        self.assertEqual(self.rows(out, "## By provider", "openai")[0][1:4], ["1 of 1", "3", "4"])
+        self.assertEqual(self.rows(out, "## By provider", "openai")[0][-1], "18032")
+        run = [l for l in self.section(out, "## Runs").splitlines() if l.startswith("| %s |" % self.run)]
+        self.assertEqual([c.strip() for c in run[0].strip("|").split("|")][1:],
+                         ["0.17.0", "1 of 1", "3", "4", "18032", "1"])
+        self.assertNotIn("USD", out)
+        self.assertNotIn("$", out)
+
+    def test_a_file_read_by_relative_and_absolute_path_is_one_file_read_twice(self):
+        self.opencode_run()
+        out = self.fetch_tb()
+        self.assertIn("Files read more than once in one session: 1;", out)
+        rows = self.rows(out, "## Files read more than once")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0][2:4], ["`src/app.py`", "2"])
+
+    def test_tokens_after_the_first_n_api_calls_of_a_council_call_are_counted_apart(self):
+        self.opencode_run()
+        out = self.fetch_tb("--beyond", "1")
+        self.assertEqual(self.rows(out, "## API calls per council call", "openai")[0], ["openai", "3", "1", "2", "2", "1", "5997"])
+
+    def test_the_skill_version_comes_only_from_run_start_records_the_registry_accepts(self):
+        refused = dict(TB_RUN_START, seq=2, skill_version="6.6.6")
+        refused.pop("host")
+        run_end = {k: TB_RUN_START[k] for k in ("schema", "host", "run", "inv", "ts")}
+        run_end.update(ev="run_end", seq=3, skill_version="7.7.7", exit_code=0, status="done")
+        self.opencode_run(telemetry=(refused, dict(TB_RUN_START, skill_version=5), run_end, TB_RUN_START))
+        out = self.fetch_tb()
+        self.assertIn("| 0.17.0 |", self.section(out, "## Runs"))
+        self.assertNotIn("6.6.6", out)
+        self.assertNotIn("7.7.7", out)
+        (self.run / "telemetry.jsonl").unlink()
+        out = self.fetch_tb()
+        self.assertIn("| unknown (no readable telemetry.jsonl) |", self.section(out, "## Runs"))
+
+    def test_local_by_default_no_adapter_call_and_the_session_is_listed_as_not_complete(self):
+        self.opencode_run()
+        before = stat_fingerprint(self.run)
+        rc, out, err = self.tb("--oc", self.fake_dir / "oc.sh", self.run, env=self.env(FAKE_OC_DIR=str(self.fake_dir)))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.oc_calls(), [])
+        coverage = self.section(out, "## Coverage")
+        self.assertIn("- %s: B g1 %s:" % (self.run, SID_OC_1), coverage)
+        self.assertNotIn("Every session of every run read is complete.", coverage)
+        self.assertIn("| 0 of 1 |", self.section(out, "## Runs"))
+        self.assertEqual(stat_fingerprint(self.run), before)
+
+    def test_a_new_session_after_a_handover_has_its_first_council_call_listed(self):
+        retired = [{"session": SID_CLAUDE_1, "gen": 1, "tokens": 1, "cost": 0, "kind": "claude", "model": "opus", "effort": "high"}]
+        for sid in (SID_CLAUDE_1, SID_CLAUDE_2):
+            self.add_transcript(sid, [cl_user("prompt of " + sid),
+                                      cl_assistant("m1-" + sid, cl_usage(1234, 5678, 2345, 987), [cl_text("a")]),
+                                      cl_assistant("m2-" + sid, cl_usage(1290, 8100, 410, 1043), [cl_text("b")], req="r2")])
+        self.write_state([sr_member("A", "claude", "opus", SID_CLAUDE_2, gen=2, tokens=1, retired=retired)])
+        rc, out, err = self.tb("--projects", self.projects, self.run)
+        self.assertEqual(rc, 0, err)
+        rows = [[c.strip() for c in l.strip("|").split("|")] for l in self.section(out, "## New sessions after a handover").splitlines()
+                if l.startswith("| %s |" % self.run)]
+        self.assertEqual(rows, [[str(self.run), "A g2 %s" % SID_CLAUDE_2, "claude CLI", "9.3k", "2", "21087",
+                                 "unknown", "unknown", "unknown"]])
+
+    def test_a_pipe_in_a_read_path_stays_inside_its_table_cell(self):
+        self.project = self.tmp / "project"
+        plan = self.task_prompt("round 1 of 3")
+        (self.run / "prompts" / "alpha-r1-B.md").write_text(plan)
+        self.write_state([sr_member("B", "opencode", "openai/gpt-6-astra", SID_OC_1, tokens=1)],
+                         config={"tasks": [], "dir": str(self.project)})
+        self.install_fake_oc({SID_OC_1: {"messages": [
+            oc_user("u1", plan[:-1]),
+            oc_assistant("a1", oc_tokens(1503, 711, 137, 2011, 313), 0.01, [oc_tool("read", {"filePath": "src/a|b.py"}, "x" * 64)]),
+            oc_assistant("a2", oc_tokens(1611, 823, 149, 3013, 401), 0.02, [oc_tool("read", {"filePath": "src/a|b.py"}, "x" * 64)])]}})
+        self.write_service()
+        rows = self.rows(self.fetch_tb(), "## Files read more than once")
+        self.assertEqual([r[2:4] for r in rows], [["`src/a/b.py`", "2"]])
+
+    def test_a_run_that_cannot_be_read_is_reported_and_none_readable_is_exit_2(self):
+        self.opencode_run()
+        missing = self.tmp / "missing"
+        rc, out, err = self.tb(self.run, missing)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("| %s | n/a | not read: run dir not found or not a directory: %s |" % (missing, missing), out)
+        rc, out, err = self.tb(missing)
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("run dir not found", err)
+        for bad in (("--top", "0"), ("--beyond", "0"), ("--chars-per-token", "nan")):
+            with self.subTest(bad):
+                rc, out, err = self.tb(*bad, self.run)
+                self.assertEqual((rc, out), (2, ""), err)
 
 
 # ---------------------------------------------------------------------------

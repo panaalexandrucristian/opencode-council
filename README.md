@@ -9,8 +9,8 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | `SKILL.md` | the skill Claude Code loads (`/opencode …`): workflow, permissions, the council checklist |
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
-| `scripts/vendor/` | `jev-handoff/`: a pinned copy of jev's compact-handoff scripts (MIT; source and commit in its `VENDOR.json`) that builds a member's handover handoff; `update_jev_handoff.py` verifies and refreshes it |
-| `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit; `session_report.py` (per-session token report, local by default); `run_check.py` (runs a build or test command with the full log on disk and a capped summary on stdout; unlike the others it executes commands and writes artifacts, so it is not read-only) |
+| `scripts/vendor/` | `jev-handoff/`: a pinned copy of jev's compact-handoff scripts (MIT; source and commit in its `VENDOR.json`) that builds a member's handover handoff; `update_jev_handoff.py` verifies and refreshes it. `caveman/`: the upstream caveman skill (Apache-2.0, with its `LICENSE`, `NOTICE` and the pre-3.0.0 MIT notice `LICENSE-MIT`; commit and hashes in its `VENDOR.json`), whose text the caveman style sends to members |
+| `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit; `session_report.py` (per-session token report, local by default); `token_breakdown.py` (where the tokens of one or more runs go, built on `session_report.py`); `run_check.py` (runs a build or test command with the full log on disk and a capped summary on stdout; unlike the others it executes commands and writes artifacts, so it is not read-only) |
 | `reference.md` | OpenCode HTTP endpoint notes |
 | `.claude-plugin/` | plugin + marketplace manifests, so the repo installs with `/plugin install` |
 | `examples/` | a real end-to-end run (config, answers, console output, transcript) |
@@ -166,9 +166,11 @@ How it works:
   has a valid post for the current round is reused. `--replace ID=kind:model:effort` moves a member
   to a fresh session on another model (its provider failed or ran out of quota); the new session
   keeps the member's id and gets a handover note built from that member's own earlier posts.
-- **Prose style (optional).** `"style": "normal" | "lite" | "caveman" | "ultra"`, top level and/or per member,
-  compresses the prose members write for each other (after the [caveman skill](https://github.com/juliusbrussee/caveman)).
-  The JSON tail's `proposal`/`report` — the text that is voted on and implemented — plus quoted code, paths,
+- **Prose style (caveman by default).** `"style": "caveman" | "normal" | "lite" | "ultra"`, top level and/or per member,
+  compresses the prose members write for each other. `caveman`, the default, sends the text of the
+  [caveman skill](https://github.com/juliusbrussee/caveman) (vendored in `scripts/vendor/caveman`) in the member's first
+  prompt, and every prompt of a styled member ends with a one-line reminder, so the style holds in every round.
+  `"style": "normal"` turns it off. The JSON tail's `proposal`/`report` — the text that is voted on and implemented — plus quoted code, paths,
   commands, errors and numbers are never compressed. Expect single-digit % of output tokens in this council,
   not the headline figures: the JSON tail is 74–99% of a post.
 - **Token report.** Every finished run's transcript ends with a Token report (prompt bytes by section,
@@ -181,8 +183,8 @@ How it works:
   the Mac's platform UUID; never ids, task text, posts, notes, paths or names). `COUNCIL_TELEMETRY=0` turns it off;
   `COUNCIL_TELEMETRY_DIR` moves the ledger; `scripts/ptools/telemetry_report.py` reports offline over one or many
   Macs' ledgers. Details in SKILL.md, "Telemetry".
-- **Tests.** `bash scripts/test-completion.sh` — 1834 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (779 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
+- **Tests.** `bash scripts/test-completion.sh` — 1899 offline checks (no network, no model calls), including
+  `scripts/ptools/test_ptools.py` (791 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
   `-j N` runs up to N suites at once, each in its own fresh scratch; names after the options run only those suites
   (`--list` prints them), e.g. `bash scripts/test-completion.sh -j 8` or `bash scripts/test-completion.sh verify_0140_tests`.
   Run `/bin/bash -n` separately on each changed shell script after any change.
@@ -191,6 +193,19 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **Unreleased** — the members' prose style is `caveman` by default (`"style": "normal"` turns it off). Rule 6 of a
+  member's first prompt carries the text of the upstream caveman skill, pinned in `scripts/vendor/caveman/` (Apache-2.0,
+  with its `NOTICE` and the pre-3.0.0 `LICENSE-MIT`; commit and hashes in `VENDOR.json`), without its `/caveman`
+  commands and Persistence section; every prompt, the retry included, ends with a one-line style reminder. Members get
+  no skills and no MCP tools: OpenCode sessions deny `skill`, `execute` (Code Mode), `browser` and `*_*` (every MCP
+  tool; `external_directory` is allowed again), which took a real member's first call from ~20.3k to ~4.0k input tokens
+  (measured while the caveman skill was still allowed); Claude members run with `--disable-slash-commands
+  --strict-mcp-config`, so they cannot start on a machine with a deployed `managed-mcp.json`. `prompt_report.py` counts
+  rule 6 and its caveman block as `rules`. `session_report.py` also matches an OpenCode prompt whose final newline
+  `oc.sh` removed, and its numbers come from a new `compute()`; the new `token_breakdown.py` splits the tokens of one or
+  more runs by provider, step, round, context, tools, re-read files, handovers and retries. The 97f4c70 differential
+  applies the same change (`approve_caveman_council`; both trees run the current `prompt_report.py`).
+  test-completion.sh: 1899 checks; test_ptools.py: 779 → 791 cases.
 - **0.17.0** — a member's handover is no longer a note the model writes. `council.sh` compacts the retiring
   session's own transcript with jev's `make_context.py` (a Claude session from its transcript, an OpenCode session from
   `opencode.db`; no model call) into `D/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` + `blobs/`. The successor's
@@ -431,8 +446,35 @@ python3 scripts/ptools/session_report.py --session FILE.jsonl [FILE.jsonl ...]  
   writes 0 when no cost was reported), per mapper session, and per OpenCode message; a cumulative cost is never repeated per call or
   added to per-message costs. The split of the input side over items is a `heuristic estimate (character-based)`. Task, round and phase
   are attributed only when a segment's first prompt equals, byte for byte, one of the member's own files in `prompts/`; otherwise `unknown`;
+  one named exception, for OpenCode segments only: `oc.sh` sends the prompt through `$(...)`, which removes the file's final newline,
+  so a prompt equal to the file minus exactly one final newline also matches, with `(final newline removed by oc.sh)` in its provenance;
   a member with no id (absent or `null`) is attributed `unknown` (provenance `no member id in state.json`), since its own prompt files
   cannot be identified. A context drop or a large cache write is reported without a cause; call numbers start at 0 (the first call of the session).
+
+Where the tokens of one or more runs go, `token_breakdown.py` (Python 3 standard library only, read-only, `-h`):
+
+```bash
+python3 scripts/ptools/token_breakdown.py [--projects DIR] [--oc scripts/oc.sh] [--fetch-opencode] [--top N] [--beyond N] RUN_DIR [RUN_DIR ...]
+```
+
+- **Same numbers as `session_report.py`.** Each run is read through `session_report.py` used as a module: the same generations,
+  provider counters, segments and task/round/phase attribution, so a run's figures agree with its `session_report` report. It is
+  **local by default** in the same way: only `--fetch-opencode` contacts OpenCode (through `oc.sh`, never auto-starting the service),
+  and without it an OpenCode session has no per-call data and is listed in Coverage as not complete. `--projects`, `--oc` and
+  `--chars-per-token` have `session_report`'s defaults; `--top` (default 15, at least 1) caps the long tables; `--beyond` (default 20,
+  at least 1) also counts apart the tokens of the API calls after the first N of a council call.
+- **What it prints, over all the runs given.** Per run: skill version, sessions complete, council calls (segments), API calls, tokens
+  consumed and the segments whose task is `unknown`. Then tokens by provider (the provider part of the recorded OpenCode model, or
+  `claude CLI`), by step (named as `council.sh` names it in telemetry: `plan`, `ratify`, `exec`; a handover request is `handover`; a retry
+  prompt names no phase and has its own `retry` row; an unattributed segment is `unknown`), by round, the context at the start of a council
+  call, API calls per council call, the input split over categories and the harness prefix per API call (`session_report`'s heuristic
+  estimate), the tools called, files read more than once in a session (paths made relative to the run's project directory, so the
+  absolute and the relative spelling of one file are one file), files read by several members in round 1 of a task, the first council
+  call of every session after a handover, task boundaries inside a session and the retries.
+- **No prices, nothing guessed.** Tokens and API calls are what the providers reported; there are no prices or weights. An unknown
+  value is counted apart, never as 0. The skill version is read only from `run_start` records that `council_telemetry.py` accepts.
+- **Exit codes.** 0 when a report is printed, also a partial one (a run that cannot be read is listed as `not read: <reason>`); 2 for a
+  usage error or when no run can be read.
 
 Run a build or test command with the full log on disk and only a short, capped summary on stdout, `run_check.py` (Python 3 standard
 library only, POSIX only, `-h`). Unlike the tools above it **executes** the command and **writes** files, so it is not read-only:
@@ -640,4 +682,6 @@ scripts/oc.sh prompt ses_… "follow-up" ; scripts/oc.sh diff ses_… --patch ; 
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). `scripts/vendor/caveman/` is the upstream caveman skill under the Apache License 2.0, kept with its own
+[LICENSE](scripts/vendor/caveman/LICENSE) and [NOTICE](scripts/vendor/caveman/NOTICE); contributions made to it before
+caveman 3.0.0 also remain under the MIT License, whose notice is kept in [LICENSE-MIT](scripts/vendor/caveman/LICENSE-MIT).

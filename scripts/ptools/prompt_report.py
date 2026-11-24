@@ -4,7 +4,8 @@
 Usage: prompt_report.py <run-dir>
 Reads prompts/*.md, posts/*.{md,json}, and state.json; never changes the run.
 Sections partition every byte: candidate/plan includes its fences; relayed posts
-include their heading; rules and replacement/handover notes include their framing;
+include their heading; rules and replacement/handover notes include their framing,
+and rules end after the member's style rule 6 (with its <<<CAVEMAN block) when it is sent;
 answers include their heading; task text is the configured text only. Everything
 else (including retries and handover requests) is instructions. These are UTF-8
 file bytes, not tokens, filesystem allocation, or predicted dollars.
@@ -67,6 +68,16 @@ def section_bytes(data, state):
         rules_end = prefix.find(b"Nothing may follow the JSON tail.\n")
         if data.startswith(b"You are member ") and rules_end >= 0:
             rules_end += len(b"Nothing may follow the JSON tail.\n")
+            if prefix.startswith(b"6. Style ", rules_end):
+                # Rule 6 runs to the first blank line; the caveman text it carries has blank
+                # lines of its own, so a <<<CAVEMAN block runs to its closing >>> line instead.
+                stop = prefix.find(b"\n\n", rules_end)
+                block = prefix.find(b"\n<<<CAVEMAN\n", rules_end)
+                if block >= 0 and (stop < 0 or block < stop):
+                    stop = prefix.find(b"\n>>>\n", block + 1)
+                    stop = stop + len(b"\n>>>") if stop >= 0 else -1
+                if stop >= 0:
+                    rules_end = stop + 1
             mark("rules", 0, rules_end)
         for marker in (b"Handover note from your predecessor session (same member id):\n",
                        b"Notes from the orchestrator:\n"):

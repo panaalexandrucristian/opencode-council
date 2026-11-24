@@ -58,6 +58,9 @@ CM="$HERE/council_codemap.py"
 # VENDOR.json). COUNCIL_HANDOFF_SCRIPT and COUNCIL_OPENCODE_DB override the script and OpenCode's database.
 HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-$HERE/vendor/jev-handoff/skills/compact-handoff/scripts/make_context.py}"
 OC_DB="${COUNCIL_OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+# The caveman style's rules are the upstream caveman skill, vendored verbatim in scripts/vendor/caveman (pinned by its
+# VENDOR.json, Apache-2.0); caveman_text sends it in the member's first prompt.
+CAVEMAN_MD="$HERE/vendor/caveman/skills/caveman/SKILL.md"
 
 die() { echo "council: $*" >&2; exit 1; }
 log() { echo "council: $*" >&2; }
@@ -1235,9 +1238,9 @@ validate_config() {  # $1 = config file -> prints normalised config json
   # optional per-member handover threshold (overrides the council-wide handover_at)
   err=$(jq -r '.members[] | select(has("handover_at")) | select(((.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))))|not) | "  member \(.id): handover_at must be a fraction in (0,1] or an absolute token count >= 1000"' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
-  # optional prose-compression style (see style_rules): normal (default) | lite | caveman | ultra
-  err=$(jq -r '(if (.style // "normal")|IN("normal","lite","caveman","ultra")|not then "  style must be normal|lite|caveman|ultra" else empty end),
-               (.members[] | select((.style // "normal")|IN("normal","lite","caveman","ultra")|not) | "  member \(.id): style must be normal|lite|caveman|ultra")' "$1")
+  # optional prose-compression style (see style_rules): caveman (default) | normal | lite | ultra
+  err=$(jq -r '(if (.style // "caveman")|IN("normal","lite","caveman","ultra")|not then "  style must be normal|lite|caveman|ultra" else empty end),
+               (.members[] | select((.style // "caveman")|IN("normal","lite","caveman","ultra")|not) | "  member \(.id): style must be normal|lite|caveman|ultra")' "$1")
   [ -z "$err" ] || { echo "council: invalid config:" >&2; echo "$err" >&2; exit 1; }
   # normalise: tasks -> {id,text,execute}; members -> +agent/permission_mode
   jq '.map_code = (.map_code // false)
@@ -1246,9 +1249,9 @@ validate_config() {  # $1 = config file -> prints normalised config json
                                   else ({id:(.value.id // ("t"+((.key+1)|tostring))), text:.value.text, execute:(.value.execute==true)} +
                                         (.value | with_entries(select(.key|IN("acceptance","map_parent","map_contract_id","contract_identity","parent_id","map_seed_id","inherited_answers"))))) end)]
       | .max_turns = (.max_turns // 30)
-      | .style = (.style // "normal")
+      | .style = (.style // "caveman")
       | .members |= [ .[] | {style: $s, handover_at: $h} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
-                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "normal"' "$1")" --argjson h "$(jq -r '.handover_at' "$1")" "$1"
+                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "caveman"' "$1")" --argjson h "$(jq -r '.handover_at' "$1")" "$1"
 }
 
 check_opencode_models() {  # $1 = normalised config json -> validates model + variant against the live server; prints ctx limits json
@@ -1341,9 +1344,15 @@ cost_note() {  # config only; measured comparisons, never a dollar forecast or a
 
 # --------------------------------------------------------------- adapters ----
 # member call = launch (async) + collect (blocking). Raw reply -> $RUN/raw/<tag>-<id>.md ; tokens -> state.
+# A member gets no skill and no MCP tool: the skill list and every tool definition ride along in each request, and the
+# caveman text reaches it through rule 6 of its first prompt.
+# An MCP tool's permission action is <server>_<tool>, so *_* covers every server; denying execute removes Code Mode, whose
+# catalog reaches those tools, and browser removes the desktop browser's catalog. external_directory is the one built-in
+# action with an underscore a member needs.
+OC_MEMBER_RULES=(--deny skill --deny execute --deny browser --deny '*_*' --allow external_directory)
 oc_new_session() {  # idx -> prints ses_...
   local i=$1 sid; sid=$("$OC" new --dir "$DIR" --model "$(mget $i model)" --variant "$(mget $i effort)" --agent "$(mget $i agent)" --auto \
-        --title "Council $(mid $i) g$(mget $i gen) ($(mget $i model))") || return 1
+        "${OC_MEMBER_RULES[@]}" --title "Council $(mid $i) g$(mget $i gen) ($(mget $i model))") || return 1
   printf '%s' "$sid"
 }
 cl_new_session() { uuidgen | tr 'A-Z' 'a-z'; }
@@ -1430,7 +1439,9 @@ launch() {  # idx promptfile tag  -> starts the call; state gets .members[i].inf
   else
     local pm; pm=$(mget $i permission_mode)   # a run started by 0.13/0.14 stored bypassPermissions: back to the role's mode
     [ "$pm" = bypassPermissions ] && { [ "$(mget $i mode)" = edit ] && pm=acceptEdits || pm=plan; }
-    local args=(-p --output-format json --model "$(mget $i model)" --effort "$(mget $i effort)" --permission-mode "$pm" --max-turns "$MAXT")
+    # no skills and no MCP servers, as for OpenCode members (Claude Code cannot keep one skill; caveman travels in the prompt)
+    local args=(-p --output-format json --model "$(mget $i model)" --effort "$(mget $i effort)" --permission-mode "$pm" --max-turns "$MAXT"
+                --disable-slash-commands --strict-mcp-config)
     if [ "$sid" = null ] || [ -z "$sid" ]; then sid=$(cl_new_session); args+=(--session-id "$sid"); TM_NEW[$i]=1; sts --argjson i $i --arg s "$sid" '.members[$i].session=$s|.members[$i].cl_started=false'
     else args+=(--resume "$sid"); fi
     if [ "$(mget $i mode)" = read ]; then args+=(--disallowedTools "Edit Write MultiEdit NotebookEdit")
@@ -1526,6 +1537,23 @@ roster_lines() { st '.members[] | "  - member \(.id): \(.kind) \(.model), effort
 # code, paths, commands, errors or numbers. Measured expectation: the JetBrains lab found ~8.5% fewer output
 # tokens on real agentic tasks (the skill's own README claims ~50% on output-only evals); in this council the
 # JSON tail is 74-99% of a post, so treat single-digit percent as the honest expectation.
+# caveman is the default; its rule carries the skill's own text (caveman_text) and every prompt ends with a reminder
+# (style_reminder), so the style holds in every round, not only after the first prompt.
+caveman_text() {  # the vendored caveman skill, without what only a chat host uses: its frontmatter and title, its
+  # Persistence section (switch-off phrases, /caveman commands, hooks) and its /caveman-compress note
+  [ -f "$CAVEMAN_MD" ] || return 0
+  echo "<<<CAVEMAN"
+  awk 'NR==1 && /^---$/ {fm=1; next} fm {if (/^---$/) fm=0; next}
+       /^# / {next} /^## / {skip=($0=="## Persistence")} skip {next}
+       {sub(/ `\/caveman-compress` exempt\./, ""); print}' "$CAVEMAN_MD" | sed '/./,$!d'
+  echo ">>>"
+}
+style_reminder() {  # idx -> the line that ends every prompt of a styled member (empty for "normal")
+  local s; s=$(mget $1 style)
+  case "$s" in
+    lite|caveman|ultra) printf '\nStyle reminder: write this post in %s style (rule 6 of the council rules). The JSON tail, code, paths, commands, errors and numbers stay verbatim.\n' "$s" ;;
+  esac
+}
 style_rules() {  # member style -> extra rule text (empty for "normal")
   case "$1" in
     lite) cat <<'TXT'
@@ -1533,9 +1561,10 @@ style_rules() {  # member style -> extra rule text (empty for "normal")
 TXT
 ;;
     caveman) cat <<'TXT'
-6. Style — caveman: compress the prose you write for the other members. Drop articles, pleasantries, hedging and transitions; use fragments and lists; one line per point; no preamble and no recap. Keep every technical fact.
-   NEVER compress: the JSON tail (its "proposal"/"report" must stay complete, unambiguous English — it is what gets voted on and implemented), quoted code, file paths, commands, error messages, numbers, names, and anything you quote from the task, the working directory or the user's answers. Precision beats brevity: if compressing a sentence could change its meaning, write it out.
+6. Style — caveman: every post you write in this council, in every round, follows the caveman rules between <<<CAVEMAN and >>> below. They are the caveman skill, already active for the whole run. They compress the prose you write for the other members.
+   NEVER compress: the JSON tail (its "proposal"/"report" must stay complete, unambiguous English — it is what gets voted on and implemented), quoted code, file paths, commands, error messages, numbers, names, and anything you quote from the task, the working directory or the user's answers. Precision beats brevity: if compressing a sentence could change its meaning, write it out. This line wins over the caveman rules.
 TXT
+    caveman_text
 ;;
     ultra) cat <<'TXT'
 6. Style — ultra: telegraphic prose. Fragments only, one line per point, symbols over words (-> = becomes, != = not). No articles, no hedging, no preamble, no recap.
@@ -1968,6 +1997,7 @@ run_step() {
     codemap_append_locator "$pf" "$tid" "$tag" prompt
     case "$gen" in prompt_round1|prompt_roundN) ;; *) append_historical_map_locator "$pf" "$tid" ;; esac
     $gen $i "$t" "$r" >>"$pf"
+    style_reminder $i >>"$pf"
     launch $i "$pf" "$tid-$tag" || { tm_launch_failed $i; log "member $(mid $i): launch failed"; stop_inflight launch_failed; return 1; }   # calls launched before it are not left running unwatched
     codemap_record_launched "$pf" "$tid" "$tag"
   }
@@ -1994,7 +2024,7 @@ run_step() {
       # A re-dispatched retry is a genuinely new launch: it gets its own immutable record, so the
       # reply it produces is bound to it and not to the launch whose reply was unusable.
       [ $attempt -eq 1 ] && [ "$CALL_LEFT_RUNNING" = 1 ] && break   # never retry beside a group that is still running
-      [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; TM_STDIN=$TM_EVID; tm retry --member $i --task call_seq="$TM_LASTSEQ" step=$tstep round=$r failure_class="$TM_LASTCLS" $TM_LASTEV; TM_STDIN=""; prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch_gen[$i]=$(mget $i gen); codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID; TM_STEP=$tstep; TM_ROUND=$r; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || { tm_launch_failed $i; break; }; }
+      [ $attempt -eq 1 ] && { log "member $id: no valid JSON tail / call failed — retrying once"; TM_STDIN=$TM_EVID; tm retry --member $i --task call_seq="$TM_LASTSEQ" step=$tstep round=$r failure_class="$TM_LASTCLS" $TM_LASTEV; TM_STDIN=""; { prompt_retry; style_reminder $i; } >"$RUN/prompts/$tid-$tag-$id-retry.md"; launch_gen[$i]=$(mget $i gen); codemap_record_launch $i "$tid" "$tag" "${launch_gen[$i]}"; launch_id[$i]=$CODEMAP_LAUNCH_ID; TM_STEP=$tstep; TM_ROUND=$r; launch $i "$RUN/prompts/$tid-$tag-$id-retry.md" "$tid-$tag" || { tm_launch_failed $i; break; }; }
     done
     sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null | .members[$i].handover_kind=null'
     if [ $ok -eq 1 ]; then

@@ -95,12 +95,12 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | how many sessions, how many OpenCode vs Claude Code | `members[]` (`kind`: `opencode` \| `claude`) | ≥ 2 members, unique ids (A, B, C…) |
 | which model each one uses | `members[].model` | OpenCode: `provider/id` from `oc.sh models`; Claude: `opus`, `sonnet`, `haiku`, `fable` or a full id |
 | what effort each one uses | `members[].effort` | OpenCode = the model's **variant** (validated live: Astra low\|medium\|high\|xhigh\|max, Gemini low\|medium\|high, Kimi K3 low\|high\|max; models without variants take `"default"`); Claude = `--effort` low\|medium\|high\|xhigh\|max |
-| who may edit files | `executor` + that member's `mode: "edit"` | exactly one executor or `null` (read-only council). OpenCode members get an allow-all ruleset + `--auto`. read → OpenCode agent `plan` / Claude `--permission-mode plan` without Edit/Write/MultiEdit/NotebookEdit; edit → `build` / Claude `acceptEdits` with Bash and the edit tools allowed |
+| who may edit files | `executor` + that member's `mode: "edit"` | exactly one executor or `null` (read-only council). OpenCode members get an allow-all ruleset + `--auto`, minus every skill, Code Mode (`execute`), the desktop browser and all MCP tools (`*_*`); Claude members run with `--disable-slash-commands --strict-mcp-config` (no skills, no MCP servers), so they cannot start on a machine with a deployed `managed-mcp.json` (Claude Code exits at startup there). read → OpenCode agent `plan` / Claude `--permission-mode plan` without Edit/Write/MultiEdit/NotebookEdit; edit → `build` / Claude `acceptEdits` with Bash and the edit tools allowed |
 | project directory | `dir` | absolute; the sessions inspect/edit it |
 | the tasks | `tasks[]` | strings, or `{"id","text","execute":true}` for a build task (plan → executor implements → council ratifies the diff) |
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |
 | Claude prompt-cache lifetime (optional) | `claude_cache_ttl`, council-wide | `1h` (default) or `5m`. Every Claude Code member is started with `CLAUDE_CODE_PROMPT_CACHE_TTL` set to it, which wins over the same variable in your own environment (read by Claude Code ≥ 2.1.242). A member that sits idle longer than the TTL pays to rebuild its context; an hour costs more per cache write, so pick `5m` for short runs without pauses. OpenCode members are not affected. |
-| prose style (optional) | `style` (top level and/or per member) | `normal` (default), `lite`, `caveman`, `ultra` — compresses only the prose a member writes for the others, modelled on the [caveman skill](https://github.com/juliusbrussee/caveman). The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
+| prose style (optional) | `style` (top level and/or per member) | `caveman` (default), `normal`, `lite`, `ultra` — compresses only the prose a member writes for the others. `caveman` sends the [caveman skill](https://github.com/juliusbrussee/caveman)'s own text (vendored and pinned in `scripts/vendor/caveman`, Apache-2.0) in the member's first prompt, and every prompt of a styled member ends with a one-line style reminder; set `"style": "normal"` for an uncompressed baseline. The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
 | context handover threshold | `handover_at` (0..1], council-wide **and/or per member** | a fraction in (0,1] of the model's context window, **or an absolute token count** (≥ 1000, e.g. `150000`). At the threshold the session's transcript is compacted into a `HANDOFF.md` by the pinned jev script (no model call) and the session is replaced by a fresh session (same member id, next generation). Set it per member to make one hand over earlier than the rest (`{"id":"A", …, "handover_at":0.3}`); a member without its own value uses the council-wide one. The roster prints the effective threshold per member, and `status` shows each member's context as a percentage of its own threshold |
 | whether to seed the code map | `map_code` (one run-wide boolean) | **Ask the user once before writing the config:** “Map the code for this council?” Record true/false. It applies to every task. Hand-written configs that omit it are accepted as false; there is no prompt or pause. |
 
@@ -544,8 +544,31 @@ generations or by a member and the map pre-pass is counted once: identical recor
 `conflict`, and a component (tokens or cost) that is unknown for the member is filled from the mapper record, labelled `from mapper record`
 (a mapper field that is unknown stays an unknown component); call numbers start at 0 (large cache writes, context drops); costs are only the recorded ones (a recorded 0 is labelled, since the orchestrator also writes 0
 when no cost was reported); the split over items is a `heuristic estimate (character-based)`; task/round/phase are attributed only from a
-byte-for-byte match with one of the member's own prompt files, otherwise `unknown`; a member with no id (absent or `null`) is attributed
+byte-for-byte match with one of the member's own prompt files, otherwise `unknown` (one named exception, OpenCode segments only: `oc.sh`
+sends the prompt through `$(...)`, which removes the file's final newline, so the file minus exactly one final newline also matches, with
+`(final newline removed by oc.sh)` in the provenance); a member with no id (absent or `null`) is attributed
 `unknown` (provenance `no member id in state.json`), since its own prompt files cannot be identified. A `state.json` entry (a member, or a `retired` entry) that is not an object is listed in Coverage as `state.json: members[i] is not an object (ignored; ...)`, counted in the `PARTIAL:` line (`N state entries unusable`) and as two unknown components of the run totals, never silently dropped. The report is UTF-8 whatever the locale or `PYTHONIOENCODING` (a lone surrogate is written as `\udXXX`), and text from a transcript, `state.json` or an adapter (ids, model, effort, tool names and targets, message ids, an adapter's error line) is shown escaped (C0/C1 controls, U+2028/2029, lone surrogates as `\xNN`/`\uNNNN`, a backslash doubled, a pipe as `\|`), so it cannot forge a report line or end a table cell; the escaping happens only where text is printed, so ids from `state.json` are looked up, compared and requested exactly as recorded (a transcript file, an OpenCode request, a prompt file, a log line), and a first prompt with a lone surrogate is attributed `unknown` with that reason instead of being compared.
+
+Token breakdown over one or more runs (`token_breakdown.py`, same constraints: Python 3 standard library, read-only, `-h`):
+
+```bash
+python3 scripts/ptools/token_breakdown.py [--projects DIR] [--oc scripts/oc.sh] [--fetch-opencode] [--top N] [--beyond N] RUN_DIR [RUN_DIR ...]
+```
+
+It reads each run through `session_report.py` used as a module (same generations, provider counters, segments and task/round/phase
+attribution, so a run's figures agree with its `session_report` report), with the same defaults and the same **local by default** rule:
+only `--fetch-opencode` contacts OpenCode, and without it an OpenCode session is listed in Coverage as not complete. `--top` (default 15,
+>= 1) caps the long tables; `--beyond` (default 20, >= 1) also counts apart the tokens of the API calls after the first N of a council call.
+Over all the runs given it prints: per run the skill version (only from `run_start` records that `council_telemetry.py` accepts), sessions
+complete, council calls, API calls, tokens consumed and segments with task `unknown`; then tokens by provider (the provider part of the
+recorded OpenCode model, or `claude CLI`), by step (`plan`, `ratify`, `exec` as `council.sh` names them in telemetry; `handover` for a
+handover request; `retry` for a retry prompt, which names no phase; `unknown` when unattributed), by round, the context at the start of a
+council call, API calls per council call, the input split over categories and the harness prefix per API call (`session_report`'s
+`heuristic estimate (character-based)`), the tools called, files read more than once in a session (paths relative to the run's project
+directory, so the absolute and the relative spelling of one file are one file), files read by several members in round 1 of a task, the
+first council call of every session after a handover, task boundaries inside a session and the retries. No prices or weights; an unknown
+value is counted apart, never as 0. Exit 0 when a report is printed, also a partial one (a run that cannot be read is listed as
+`not read: <reason>`); exit 2 for a usage error or when no run can be read.
 
 Build/test runner with a capped summary (`run_check.py`, Python 3 standard library, POSIX only, `-h`; it **executes** the command and **writes**
 files, so unlike the other tools it is not read-only; use a `--log-dir` outside the project, `.gitignore` covers `*.log` only and
@@ -601,7 +624,7 @@ password at startup (`server password ...`); `--port`/`--hostname`/`--cors` conf
 
 ## Changing the skill
 
-`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (779 cases, including the telemetry writer/report), run automatically by
+`scripts/ptools/test_ptools.py` is the unittest suite of the `scripts/ptools/` tools (791 cases, including the telemetry writer/report), run automatically by
 `scripts/test-completion.sh`.
 
 `scripts/ptools/telemetry_report.py [INPUT ...]` reports offline over telemetry (read-only, standard library).

@@ -399,6 +399,39 @@ style_tests() (
   check 0 'rules_text states the HARD scope rule for every member' 'HARD RULE — scope (overrides everything below)' rules_text 1
   scope_first() { rules_text 1 | grep -A1 '^Rules:$' | grep -q '^HARD RULE — scope'; }
   check 0 'the scope rule sits inside the rules block, before rule 1' '' scope_first
+  # caveman is the default style; an explicit council or member style still wins
+  mkcfg() { jq -n --argjson extra "$1" '{dir:"/tmp",executor:null,handover_at:0.5,max_rounds:2,timeout_s:30,tasks:["x"],members:[{id:"A",kind:"opencode",model:"p/m",effort:"low",mode:"read"},{id:"B",kind:"claude",model:"opus",effort:"high",mode:"read",style:"lite"}]} + $extra' >"$scratch/style-cfg.json"; echo "$scratch/style-cfg.json"; }
+  styles_of() { jq -r '[.style, .members[].style]|join(" ")' <<<"$(validate_config "$1")"; }
+  check 0 'style: an omitted style is caveman, for the council and its members' 'caveman caveman lite' styles_of "$(mkcfg '{}')"
+  check 0 'style: an explicit council style "normal" is still honoured' 'normal normal lite' styles_of "$(mkcfg '{"style":"normal"}')"
+  # rule 6 carries the vendored caveman skill, without the parts only a chat host uses
+  check 0 'caveman: rule 6 carries the vendored skill text' 'Respond terse like smart caveman.' rules_text 0
+  check 0 'caveman: the skill text is delimited for the member' '' sh -c 'grep -qx "<<<CAVEMAN" <<<"$1" && grep -qx ">>>" <<<"$1"' _ "$(rules_text 0)"
+  check 0 'caveman: the precision line wins over the skill' 'This line wins over the caveman rules.' rules_text 0
+  lacks() { ! rules_text 0 | sed -n '/^<<<CAVEMAN$/,/^>>>$/p' | grep -q -- "$1"; }
+  for gone in '^name: caveman' '^# caveman$' '^## Persistence' 'stop caveman' '/caveman ultra' 'caveman-compress'; do
+    check 0 "caveman: the member prompt leaves out '$gone'" '' lacks "$gone"
+  done
+  check 0 'caveman: the rule keeps the When to break section' '## When to break the rules' rules_text 0
+  no_skill_file() { CAVEMAN_MD=$scratch/none.md; style_rules caveman; }
+  check 0 'caveman: without the vendored file the rule still protects the JSON tail' 'NEVER compress: the JSON tail' no_skill_file
+  check 0 'caveman: without the vendored file no empty block is sent' '' sh -c '! grep -qx "<<<CAVEMAN" <<<"$1"' _ "$(no_skill_file)"
+  # every prompt of a styled member ends with a reminder; a normal or unstyled member gets none
+  check 0 'style reminder: a caveman member is reminded in every prompt' 'Style reminder: write this post in caveman style (rule 6 of the council rules).' style_reminder 0
+  check 0 'style reminder: a normal member gets none' '' test -z "$(style_reminder 1)"
+  sts '.members[1].style=null'
+  check 0 'style reminder: a member without a style (an older run) gets none' '' test -z "$(style_reminder 1)"
+  # members get no skill and no MCP tool: OpenCode through session rules, Claude Code through its flags
+  F="$scratch/style-bin"; mkdir -p "$F"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >"%s/oc-args"\necho ses_style\n' "$F" >"$F/oc"; chmod +x "$F/oc"
+  sts '.members[0].agent="plan" | .members[0].gen=1'
+  new_session_args() { OC="$F/oc"; oc_new_session 0 >/dev/null && tr '\n' ' ' <"$F/oc-args"; }
+  check 0 'members: an OpenCode session denies every skill, Code Mode, the browser and MCP tools' "--deny skill --deny execute --deny browser --deny *_* --allow external_directory --title" new_session_args
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >"%s/claude-args"\nprintf "%%s\\n" '"'"'{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"'"'\n' "$F" >"$F/claude"; chmod +x "$F/claude"
+  RUN="$scratch/style-run"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts"; printf 'prompt\n' >"$RUN/prompts/p.md"; MAXT=3; TIMEOUT=20; MAP_PREPASS=0
+  sts '.members[1] += {permission_mode:"plan",session:null,fresh:false,calls:0,session_calls:0} | .last_votes=[]'
+  claude_args() { PATH="$F:$PATH" launch 1 "$RUN/prompts/p.md" t-style && PATH="$F:$PATH" collect 1 && tr '\n' ' ' <"$F/claude-args"; }
+  check 0 'members: a Claude Code member runs without skills or MCP servers' '--disable-slash-commands --strict-mcp-config' claude_args
 )
 handover_tests() (
   load council.sh; ST="$scratch/ho-state.json"; N=3; HANDOVER=0.5
@@ -471,6 +504,20 @@ vendor_tests() (
   check 0 'vendor: a file the manifest never listed is left alone' foreign cat "$V/u/keep.txt"
   check 2 'vendor: --repo without --commit is refused' 'go together' sh -c 'python3 -B "$1" --repo "$2" --dest "$3" 2>&1' _ "$U" "$R" "$V/u"
   check 1 'vendor: a commit that does not exist fails' 'git rev-parse' sh -c 'python3 -B "$1" --repo "$2" --commit deadbeef --dest "$3" 2>&1' _ "$U" "$R" "$V/u"
+  # scripts/vendor/caveman: the upstream caveman skill whose text the caveman style sends to members, pinned the same way
+  CV="$HERE/vendor/caveman"
+  check 0 'vendor caveman: VENDOR.json pins one full upstream commit' true jq -e '(.commit|test("^[0-9a-f]{40}$")) and .source=="https://github.com/JuliusBrussee/caveman"' "$CV/VENDOR.json"
+  check 0 'vendor caveman: every file matches its pinned sha256 and nothing else is there' 'caveman: OK' python3 -I - "$CV" <<'PY'
+import hashlib, json, os, sys
+d = sys.argv[1]; files = json.load(open(os.path.join(d, "VENDOR.json")))["files"]
+bad = [f for f, h in files.items() if hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest() != h]
+extra = sorted(os.path.relpath(os.path.join(r, n), d) for r, _, ns in os.walk(d) for n in ns if n != "VENDOR.json")
+extra = [f for f in extra if f not in files]
+print("changed: %s; not in VENDOR.json: %s" % (bad, extra) if bad or extra else "caveman: OK")
+PY
+  check 0 'vendor caveman: the pinned copy carries the Apache license and its notice' 'Apache License' cat "$CV/LICENSE" "$CV/NOTICE"
+  check 0 'vendor caveman: the pinned copy carries the pre-3.0.0 MIT notice its NOTICE names' 'MIT License' cat "$CV/LICENSE-MIT"
+  check 0 'vendor caveman: council.sh reads the vendored skill' '' test "$(cd "$HERE" && bash -c 'HERE=$PWD; eval "$(grep "^CAVEMAN_MD=" council.sh)"; printf %s "$CAVEMAN_MD"')" = "$HERE/vendor/caveman/skills/caveman/SKILL.md"
 )
 # A member's handover note is the compact handoff of its retiring session, built from the session's own transcript by the
 # vendored jev script (HANDOFF_PY): no model call, one folder per member and generation, a reference in the successor's
@@ -612,15 +659,20 @@ SH
   check 0 'scope: the first-contact rules carry the HARD scope rule' 'HARD RULE — scope (overrides everything below)' rules_text 1
   # c9: the lines the baseline helpers patch into older commits are exactly the current lines
   local b97="$RUN/base-97f4c70.sh" bd6="$RUN/base-d62a356.sh"
-  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_opencode_auto "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" && approve_compact_handover "$b97" || exit 1
+  git -C "$HERE/.." show 97f4c70:scripts/council.sh >"$b97" && approve_opencode_auto "$b97" && approve_scope_prompts "$b97" && approve_parallel_handover "$b97" && approve_compact_handover "$b97" && approve_caveman_council "$b97" || exit 1
   same_line() { [ "$(grep -cF -- "$2" "$1")" = 1 ] && [ "$(grep -cF -- "$2" "$HERE/council.sh")" = 1 ] && [ "$(grep -F -- "$2" "$1")" = "$(grep -F -- "$2" "$HERE/council.sh")" ]; }
   for key in 'HARD RULE — scope (overrides' 'Clarify first (grilling).' 'Recommended: <answer> (<why>)' 'Vote "question" only for a choice' 'Judge the candidate only against the task' 'Check only what the plan and the task cover' \
              'else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' '--no-wait --auto >/dev/null' '--timeout "$TIMEOUT" --auto >/dev/null' '{permission_mode:$pm, agent:null}' \
              'for i in $idxs; do needs_handover $i && ho="$ho $i"; done' 'for i in $ho; do handover_launch $i; done' '*" $i "*) ;; *) launch_member $i || return 1 ;; esac; done' \
              'HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-$HERE/vendor/jev-handoff/skills/compact-handoff/scripts/make_context.py}"' 'if [ "$(mget $i handover_kind)" = compact ]; then' \
-             "sts --argjson i \$i '.members[\$i].fresh=false | .members[\$i].handover_note=null | .members[\$i].handover_kind=null'" 'handover_launch() {  # idx -> builds the retiring session'"'"'s compact handoff'; do
+             "sts --argjson i \$i '.members[\$i].fresh=false | .members[\$i].handover_note=null | .members[\$i].handover_kind=null'" 'handover_launch() {  # idx -> builds the retiring session'"'"'s compact handoff' \
+             'CAVEMAN_MD="$HERE/vendor/caveman/skills/caveman/SKILL.md"' '| .style = (.style // "caveman")' '--arg s "$(jq -r '"'"'.style // "caveman"'"'"' "$1")"' \
+             'OC_MEMBER_RULES=(--deny skill' '"${OC_MEMBER_RULES[@]}" --title' '--disable-slash-commands --strict-mcp-config)' '    style_reminder $i >>"$pf"' \
+             '6. Style — caveman: every post you write' '    caveman_text'; do
     check 0 "baseline 97f4c70 patched line equals the current line: $key" '' same_line "$b97" "$key"
   done
+  # the retry line also carries telemetry, which 97f4c70 does not have: only the reminder part is compared
+  check 0 'baseline 97f4c70 patched: the retry prompt ends with the style reminder as in the current code' '' sh -c 'grep -qF -- "$3" "$1" && grep -qF -- "$3" "$2"' _ "$b97" "$HERE/council.sh" '{ prompt_retry; style_reminder $i; } >"$RUN/prompts/$tid-$tag-$id-retry.md"'
   check 0 'baseline 97f4c70 patched: oc.sh new carries --auto as in the current code' '' sh -c 'grep -q -- "--agent \"\$(mget \$i agent)\" --auto" "$1" && grep -q -- "--agent \"\$(mget \$i agent)\" --auto" "$2"' _ "$b97" "$HERE/council.sh"
   if git -C "$HERE/.." rev-parse --verify -q d62a356 >/dev/null 2>&1; then
     git -C "$HERE/.." show d62a356:scripts/council.sh >"$bd6" && approve_scope_prompts "$bd6" || exit 1
@@ -1912,6 +1964,35 @@ sub('{ [ "$(mget "$i" fresh)" = true ] && [ -f "$hn" ] && grep -Fq COUNCIL_POST 
 open(p, "w", encoding="utf-8").write(s)
 PY
 }
+approve_caveman_council() {  # 97f4c70 council.sh copy (after approve_compact_handover) -> caveman by default (the vendored skill in rule 6, a reminder ending every prompt), members without skills and without MCP tools
+  python3 - "$1" "$HERE/council.sh" <<'PY'
+import sys
+p, cur_path = sys.argv[1], sys.argv[2]
+s = open(p, encoding="utf-8").read(); cur = open(cur_path, encoding="utf-8").read()
+def sub(old, new, count=1):
+    global s
+    if s.count(old) != count: sys.exit("approve_caveman_council: anchor not found: " + old[:80])
+    s = s.replace(old, new)
+def between(text, start, end):
+    a = text.index(start); b = text.index(end, a) + len(end); return text[a:b]
+OC_DB = 'OC_DB="${COUNCIL_OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"\n'
+sub(OC_DB, OC_DB + between(cur, "# The caveman style's rules are the upstream caveman skill", 'CAVEMAN_MD="$HERE/vendor/caveman/skills/caveman/SKILL.md"\n'))
+sub("# optional prose-compression style (see style_rules): normal (default) | lite | caveman | ultra",
+    "# optional prose-compression style (see style_rules): caveman (default) | normal | lite | ultra")
+sub('(.style // "normal")|IN(', '(.style // "caveman")|IN(', 2)
+sub('| .style = (.style // "normal")', '| .style = (.style // "caveman")')
+sub("""--arg s "$(jq -r '.style // "normal"' "$1")\"""", """--arg s "$(jq -r '.style // "caveman"' "$1")\"""")
+sub(between(s, "oc_new_session() {", 'printf \'%s\' "$sid"\n}\n'), between(cur, "# A member gets no skill and no MCP tool", 'printf \'%s\' "$sid"\n}\n'))
+sub('--max-turns "$MAXT")\n', '--max-turns "$MAXT"\n                --disable-slash-commands --strict-mcp-config)\n')
+sub('    local args=(-p --output-format json', '    # no skills and no MCP servers, as for OpenCode members (Claude Code cannot keep one skill; caveman travels in the prompt)\n    local args=(-p --output-format json')
+STYLE = 'style_rules() {  # member style -> extra rule text (empty for "normal")\n'
+sub(STYLE, between(cur, "# caveman is the default; its rule carries", STYLE))
+sub(between(s, "    caveman) cat <<'TXT'\n", "TXT\n;;\n"), between(cur, "    caveman) cat <<'TXT'\n", "    caveman_text\n;;\n"))
+sub('    $gen $i "$t" "$r" >>"$pf"\n', '    $gen $i "$t" "$r" >>"$pf"\n    style_reminder $i >>"$pf"\n')
+sub('prompt_retry >"$RUN/prompts/$tid-$tag-$id-retry.md"', '{ prompt_retry; style_reminder $i; } >"$RUN/prompts/$tid-$tag-$id-retry.md"')
+open(p, "w", encoding="utf-8").write(s)
+PY
+}
 approve_opencode_auto() {  # council.sh copy -> OpenCode members pass --auto to new, prompt and wait
   python3 - "$1" <<'PY'
 import sys
@@ -1994,6 +2075,9 @@ legacy_differential_tests() (
   approve_scope_prompts "$D/base/scripts/council.sh" || exit 1
   approve_parallel_handover "$D/base/scripts/council.sh" || exit 1
   approve_compact_handover "$D/base/scripts/council.sh" || exit 1
+  approve_caveman_council "$D/base/scripts/council.sh" || exit 1
+  mkdir -p "$D/base/scripts/vendor"; cp -R "$HERE/vendor/caveman" "$D/base/scripts/vendor/" || exit 1   # the caveman text both send
+  cp "$HERE/ptools/prompt_report.py" "$D/base/scripts/ptools/prompt_report.py" || exit 1   # both reports count rule 6 and its caveman block as rules
   # both implementations build a member's handoff with this one stub (the fake sessions have no transcript to compact)
   cat >"$D/stub-handoff.py" <<'PY3'
 import os, sys
