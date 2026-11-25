@@ -1,0 +1,14 @@
+{
+  "dir": "/path/to/project",
+  "max_rounds": 4,
+  "timeout_s": 600,
+  "handover_at": 0.5,
+  "executor": null,
+  "tasks": [
+    "Read the project's README and agree on the three most important pieces of documentation that are missing."
+  ],
+  "members": [
+    {"id": "A", "kind": "opencode", "model": "claude-agent/opus",   "effort": "xhigh", "mode": "read"},
+    {"id": "B", "kind": "opencode", "model": "claude-agent/sonnet", "effort": "high",   "mode": "read"}
+  ]
+}

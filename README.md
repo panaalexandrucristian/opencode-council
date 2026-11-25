@@ -10,10 +10,11 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
 | `scripts/vendor/` | `caveman/`: the upstream caveman skill (Apache-2.0, with its `LICENSE`, `NOTICE` and the pre-3.0.0 MIT notice `LICENSE-MIT`; commit and hashes in its `VENDOR.json`), whose text the caveman style sends to members |
+| `scripts/ui/` | `server.py` + `index.html`: a read-only live view of one run in the browser (127.0.0.1 only, stdlib only), and `test_ui.py`, its unittest suite |
 | `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit; `session_report.py` (per-session token report, local by default); `token_breakdown.py` (where the tokens of one or more runs go, built on `session_report.py`); `run_check.py` (runs a build or test command with the full log on disk and a capped summary on stdout; unlike the others it executes commands and writes artifacts, so it is not read-only) |
 | `reference.md` | OpenCode HTTP endpoint notes |
 | `.claude-plugin/` | plugin + marketplace manifests, so the repo installs with `/plugin install` |
-| `examples/` | a real end-to-end run (config, answers, console output, transcript) |
+| `examples/` | a real end-to-end run (config, answers, console output, transcript) and `council-claude-agent.json`, a roster of Claude models run through OpenCode |
 
 ## Install
 
@@ -22,7 +23,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | tool | why | check |
 |---|---|---|
 | [OpenCode](https://opencode.ai) **v2** (`opencode`) | runs the OpenCode sessions / background service | `opencode --version` → `v2.x` |
-| [Claude Code](https://claude.com/claude-code) (`claude`) | loads the skill; also runs Claude council members via `claude -p` | `claude --version` |
+| [Claude Code](https://claude.com/claude-code) (`claude`) | loads the skill; also runs `"kind": "claude"` council members via `claude -p` (a Claude model can instead be an OpenCode member, see "Claude models through OpenCode") | `claude --version` |
 | `bash` (3.2+ is fine, macOS default works), `curl`, `jq` | the scripts | `jq --version` |
 | `python3` (macOS ships one; standard library only) | `scripts/ptools/` — the token report and duplicate audit the council runs on every finished run | `python3 --version` |
 
@@ -184,17 +185,62 @@ How it works:
   the Mac's platform UUID; never ids, task text, posts, notes, paths or names). `COUNCIL_TELEMETRY=0` turns it off;
   `COUNCIL_TELEMETRY_DIR` moves the ledger; `scripts/ptools/telemetry_report.py` reports offline over one or many
   Macs' ledgers. Details in SKILL.md, "Telemetry".
-- **Tests.** `bash scripts/test-completion.sh` — 1893 offline checks (no network, no model calls), including
-  `scripts/ptools/test_ptools.py` (791 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
+- **Tests.** `bash scripts/test-completion.sh` — 1904 offline checks in 38 suites (no external network, no model calls), including
+  `scripts/ptools/test_ptools.py` (791 Python standard-library unittest cases for the analysis tools and the telemetry writer/report)
+  and `scripts/ui/test_ui.py` (50 cases for the live view).
   `-j N` runs up to N suites at once, each in its own fresh scratch; names after the options run only those suites
   (`--list` prints them), e.g. `bash scripts/test-completion.sh -j 8` or `bash scripts/test-completion.sh verify_0140_tests`.
   Run `/bin/bash -n` separately on each changed shell script after any change.
+
+### Claude models through OpenCode (`claude-agent/*`)
+
+A Claude model can be a council member in two ways:
+
+| | `{"kind": "claude", "model": "sonnet", …}` | `{"kind": "opencode", "model": "claude-agent/opus", …}` |
+|---|---|---|
+| who starts Claude Code | the council: one `claude -p … --resume` process per call, in its own process group | OpenCode's `claude-agent` provider: it starts its own `claude --output-format stream-json …` processes |
+| model names | Claude Code's (`opus`, `sonnet`, `haiku`, `fable`, a full id) | `provider/id` from `oc.sh models`, e.g. `claude-agent/opus`, `claude-agent/sonnet`, `claude-agent/claude-opus-5` |
+| effort | `--effort low\|medium\|high\|xhigh\|max`, checked only against that list | the model's OpenCode variant, checked by `show` (opus: `low\|medium\|high\|xhigh\|max`; a model without variants takes `"default"`) |
+| read / edit | `--permission-mode plan` / `acceptEdits` | OpenCode agent `plan` / `build`, allow-all ruleset, `--auto` |
+| council settings that apply | `max_turns`, `claude_cache_ttl` | neither: the council passes both only to its own `claude -p` launches |
+| context window and tokens | from the `claude -p` result | from the OpenCode model list and session |
+| handover handoff | built from the member's Claude Code transcript | built from `opencode.db`, like every OpenCode member |
+
+Use `kind: opencode` with `claude-agent/*` when the council itself must not launch the Claude Code CLI, or when you want every
+member handled the same way (one effort check, one context and token source, one handover path). Keep `kind: claude` for the
+council's own `claude -p` launch, `max_turns` and `claude_cache_ttl`. The rule that picks the handover path is the member's `kind`
+(`handoff_build`), not its model, so a `claude-agent/*` member always takes the OpenCode database path. `examples/council-claude-agent.json`
+is a ready roster. A `kind: claude` member is not validated against OpenCode's list by `show`: put `claude-agent/*` ids on
+`kind: opencode` members only. To move a member of a running council over (for example a provider ran out of quota), `resume --replace ID=opencode:claude-agent/sonnet:high` takes the same form as any OpenCode replacement (read in the code, not run).
+
+What was checked, and what was not (one macOS machine, OpenCode 2.3.2 with the `claude-agent` provider, Claude Code 2.1.304):
+- Checked by running: `council.sh show` accepts the example, refuses an effort that is not one of the model's variants and a model without variants given a named effort; the vendored `make_context.py` built a handoff (roundtrip identical) from the database of a real `claude-agent/opus` council session; `ps` showed `claude --output-format stream-json --input-format stream-json … --tools= --allowedTools=mcp__opencode__*` processes started by OpenCode (by those flags, OpenCode's MCP tools are the only tools they are given).
+- On that install OpenCode reported a cost of `0` for these sessions (the model list has no prices for them), so the cost columns of `status` and the transcript read 0 for such members while their tokens are counted.
+- Not verified: a full council run to the end on these members, `mode: "edit"` (an executor) on a `claude-agent/*` model, and whether `--replace` to one works.
+
+### Live view (read-only, optional)
+
+```bash
+python3 -I scripts/ui/server.py D            # then open http://127.0.0.1:8765/   (--port N to change it; --port 0 picks a free one)
+```
+
+A single page that polls `D` every 3 seconds: status, phase and round; the task list with each task's outcome (`consensus` /
+`ratified` / `unresolved` / `unratified`, a build task's agreed plan shown as "plan agreed" until it is ratified), its agreed text,
+implementation report and dissent; one card per member with its context bar, the handover threshold, tokens, cost and any
+handoffs; every post with its vote; the council's pending questions; the events and the last lines of `D.out` (the log next to the
+run directory, if you started the run with its output sent there). It reads `D/state.json`, `D/config.json`, `D/posts/` and `D.out`, and
+lists the names in `D/handoffs/` and `D/raw/`. The server listens on `127.0.0.1` only, serves GET only, refuses requests whose `Host` is
+not `127.0.0.1`, `localhost` or `[::1]`, and writes nothing. **It cannot answer a question:** the banner shows the
+`council.sh resume --run-dir D --answers answers.json` command (`--confirm-mapper FILE` when the mapper must be confirmed, `--map-decision FILE` at map review
+and at an invalid split); you still run it. "Stopped" on the status chip means no `council.sh start|resume` process names `D` as an
+absolute `--run-dir` path (a heuristic on command lines, since the run keeps no pid). The mapper's calls are not in the totals shown.
+Tests: `python3 scripts/ui/test_ui.py` (also the `ui_tests` suite).
 
 Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member failed twice (checkpointed, `resume`) · `4` questions pending · `5` some task unresolved.
 
 ## Release notes
 
-- **Unreleased** — the members' prose style is `caveman` by default (`"style": "normal"` turns it off). Rule 6 of a
+- **0.19.0** — the members' prose style is `caveman` by default (`"style": "normal"` turns it off). Rule 6 of a
   member's first prompt carries the text of the upstream caveman skill, pinned in `scripts/vendor/caveman/` (Apache-2.0,
   with its `NOTICE` and the pre-3.0.0 `LICENSE-MIT`; commit and hashes in `VENDOR.json`), without its `/caveman`
   commands and Persistence section; every prompt, the retry included, ends with a one-line style reminder. Members get
@@ -209,7 +255,19 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
   Compact handovers use the installed `apana@apana-private` plugin instead of a vendored Jev copy. The dependency
   is unpinned; Council follows Apana's installed path instead of keeping its own copy. By default, handover
   triggers above 200,000 context tokens before the next step, even if the session has only made one call.
-  test-completion.sh: 1893 checks; test_ptools.py: 779 → 791 cases.
+  test-completion.sh: 1904 checks in 38 suites; test_ptools.py: 779 → 791 cases.
+- **0.18.0** — Claude models without the Claude Code CLI, and a live view of a run. (1) Documentation and an example, no
+  code change in `council.sh`: a council member `{"kind":"opencode","model":"claude-agent/opus","effort":"xhigh"}` runs a Claude
+  model through OpenCode's `claude-agent` provider; the README section "Claude models through OpenCode" compares it with
+  `kind: claude`, and `examples/council-claude-agent.json` is a roster. The 0.17.0 handover already covers such a member (the
+  handoff is built from the member's `kind`: an OpenCode session is read from `opencode.db`, whatever its model). New suite
+  `claude_agent_tests` (the example validates, the roster counts it as OpenCode, a `claude-agent/*` member's handoff is built
+  from the OpenCode database). (2) `scripts/ui/`: a read-only page for one run (`python3 -I scripts/ui/server.py D`, 127.0.0.1
+  only, GET only, standard library). New suite `ui_tests` (`scripts/ui/test_ui.py`, 50 unittest cases: the page's state, task
+  stages and results, posts, handoffs, the log tail, the HTTP handler, the loopback bind and Host check, nothing written, and
+  that every field the page reads is one the server produces). Not run against a live 0.17.0 council from start to end.
+  test-completion.sh: 1876 checks in 38 suites, 0 failures (one shared scratch, 1459 s);
+  test_ptools.py: 779 cases; test_ui.py: 50 cases.
 - **0.17.0** — a member's handover is no longer a note the model writes. `council.sh` compacts the retiring
   session's own transcript with jev's `make_context.py` (a Claude session from its transcript, an OpenCode session from
   `opencode.db`; no model call) into `D/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` + `blobs/`. The successor's
@@ -358,6 +416,8 @@ Tracked limitations of the map pre-pass and the tests not yet written:
 - **Directory aliases are blocked as a whole.** An in-project directory symlink whose target contains an escaping link is denied entirely, so its other in-project content is reachable only through the real path.
 - **Case-folded denies over-match.** On a filesystem that ignores letter case, OpenCode's case-sensitive matcher would let a case variant of an escaping link (`ESCAPE.PY` for `escape.py`) through, so the per-link denies are case-folded (`?` per ASCII letter, `*` per non-ASCII character). They can also block unrelated in-project names of the same shape, which the mapper then cannot read.
 - **Hard links** cannot be told apart from ordinary files by path, so a hard link to an outside file is neither blocked nor detected.
+- **`claude-agent/*` members.** Only the roster, the effort check and the handoff of a real session were checked; a full council on such members, an executor on one, and `--replace` to one were not run (see "Claude models through OpenCode").
+- **Live view not run on a live 0.17.0 council.** `scripts/ui/` was tested on synthetic run directories built from the shapes `council.sh` writes, and in a browser on one of them; the page's "stopped" chip is a command-line heuristic.
 - **Future tests:** the exhaustive alias/hard-link permutation matrix; fault injection at every persistence boundary not yet covered (the initial state write, the version marker, the authorization and the mapper checkpoints are covered); byte-level parity of the reports.
 
 ## Example

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Council</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee; --dim:#8b93a5; --ok:#3ecf8e; --warn:#f5b74a; --bad:#f06a6a; --blue:#6aa8ff; --violet:#b58cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:14px 22px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
+  h1 { font-size:16px; margin:0; font-weight:650; }
+  .chip { display:inline-block; padding:2px 9px; border-radius:99px; font-size:12px; border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .chip.running { color:var(--blue); border-color:#2d4a7a; }
+  .chip.ok, .chip.agree, .chip.done { color:var(--ok); border-color:#1f5c42; }
+  .chip.warn, .chip.question { color:var(--warn); border-color:#6b5420; }
+  .chip.bad, .chip.disagree { color:var(--bad); border-color:#6b2c2c; }
+  .chip.propose { color:var(--violet); border-color:#4d3a7a; }
+  .spacer { flex:1; }
+  .dim { color:var(--dim); }
+  main { padding:18px 22px 60px; max-width:1280px; margin:0 auto; display:grid; gap:18px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .panel h2 { margin:0 0 10px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--dim); font-weight:600; }
+  .banner { border-color:#6b5420; background:#2a2312; }
+  .banner h2 { color:var(--warn); }
+  .banner code, code { background:#0c0e12; border:1px solid var(--line); padding:1px 6px; border-radius:5px; font:12px ui-monospace, Menlo, monospace; word-break:break-all; }
+  .steps { display:flex; gap:10px; flex-wrap:wrap; }
+  .step { flex:1; min-width:240px; border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .step.current, .step.executing { border-color:#2d4a7a; background:#12192a; }
+  .step.done { border-color:#1f5c42; }
+  .step.done.bad { border-color:#6b2c2c; }
+  .step b { display:block; margin-bottom:3px; }
+  .step small { color:var(--dim); display:block; max-height:3.9em; overflow:hidden; margin-top:4px; }
+  .step .row { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+  .members { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:12px; }
+  .member { border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .member .top { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .member .id { min-width:24px; height:24px; padding:0 6px; border-radius:6px; background:#222838; display:grid; place-items:center; font-weight:700; white-space:nowrap; }
+  .bar { position:relative; height:8px; border-radius:4px; background:#222838; margin:8px 0 4px; }
+  .bar > i { display:block; height:100%; border-radius:4px; background:var(--blue); }
+  .bar > u { position:absolute; top:-3px; width:2px; height:14px; background:var(--warn); }
+  .kv { display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--dim); font-size:12px; }
+  .pulse { width:8px; height:8px; border-radius:50%; background:var(--blue); animation:p 1.2s ease-in-out infinite; }
+  @keyframes p { 50% { opacity:.25; } }
+  .cols { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
+  @media (max-width: 900px) { .cols { grid-template-columns:1fr; } }
+  .fold { border-top:1px solid var(--line); padding:10px 0; }
+  .fold:first-child { border-top:0; }
+  .fold.slim { border-top:0; padding:6px 0 0; }
+  .fold summary { cursor:pointer; display:flex; gap:8px; align-items:center; flex-wrap:wrap; list-style:none; }
+  .fold summary::-webkit-details-marker { display:none; }
+  .fold pre { white-space:pre-wrap; word-break:break-word; background:#0c0e12; border:1px solid var(--line); border-radius:6px; padding:10px; margin:8px 0 0; font:12px/1.5 ui-monospace, Menlo, monospace; max-height:420px; overflow:auto; }
+  .logbox { font:12px/1.5 ui-monospace, Menlo, monospace; white-space:pre-wrap; word-break:break-word; max-height:340px; overflow:auto; color:#b9c0d0; }
+  .empty { color:var(--dim); font-style:italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Council · <span id="runname" class="dim"></span></h1>
+  <span id="status" class="chip">…</span>
+  <span id="phase" class="chip"></span>
+  <span id="roundchip" class="chip"></span>
+  <span class="spacer"></span>
+  <span id="totals" class="dim"></span>
+  <span id="updated" class="dim"></span>
+</header>
+<main>
+  <section id="questions" class="panel banner" hidden></section>
+  <section class="panel"><h2>Tasks</h2><div id="tasks" class="steps"></div></section>
+  <section class="panel"><h2>Members</h2><div id="members" class="members"></div></section>
+  <div class="cols">
+    <section class="panel"><h2>Posts <span id="postcount" class="dim"></span></h2><div id="posts"></div></section>
+    <div style="display:grid; gap:18px; align-content:start;">
+      <section class="panel"><h2>Events</h2><div id="events" class="logbox"></div></section>
+      <section class="panel"><h2>Log <span class="dim">(.out)</span></h2><div id="out" class="logbox"></div></section>
+    </div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+const fmt = (n) => (n ?? 0).toLocaleString();
+const money = (n) => "$" + (n ?? 0).toFixed(2);
+const clock = (t) => new Date(t * 1000).toLocaleTimeString();
+const openKeys = new Set();  // <details> the reader opened: the page is rebuilt on every poll
+const OUTCOME_CLASS = { consensus: "ok", ratified: "ok", unresolved: "bad", unratified: "bad" };
+
+function fold(key, summary, body, cls) {
+  const d = el("details", "fold" + (cls ? " " + cls : "")); if (openKeys.has(key)) d.open = true;
+  d.addEventListener("toggle", () => { d.open ? openKeys.add(key) : openKeys.delete(key); });
+  const sum = el("summary"); sum.append(...summary); d.append(sum, el("pre", "", body));
+  return d;
+}
+
+function renderMembers(s) {
+  const box = $("members"); box.replaceChildren();
+  for (const m of s.members) {
+    const card = el("div", "member");
+    const top = el("div", "top");
+    top.append(el("div", "id", m.id));
+    const name = el("div"); name.append(el("div", "", m.model), el("div", "dim", `${m.kind} · ${m.effort ?? "-"} · ${m.mode ?? "-"}${m.executor ? " · executor" : ""} · gen ${m.gen}`));
+    top.append(name, el("span", "spacer"));
+    if (m.inflight) { const pill = el("span", "chip running"); pill.append(el("span", "pulse"), " " + m.inflight); pill.style.display = "inline-flex"; pill.style.gap = "6px"; pill.style.alignItems = "center"; top.append(pill); }
+    else top.append(el("span", "chip", "idle"));
+    card.append(top);
+    const pct = m.ctx_limit ? Math.min(100, (m.ctx_used / m.ctx_limit) * 100) : 0;
+    const bar = el("div", "bar"); const fill = el("i"); fill.style.width = pct + "%"; bar.append(fill);
+    if (m.handover_at && m.ctx_limit) { const at = m.handover_at > 1 ? m.handover_at : m.handover_at * m.ctx_limit; const mark = el("u"); mark.style.left = Math.min(100, (at / m.ctx_limit) * 100) + "%"; mark.title = "handover at " + fmt(Math.round(at)); bar.append(mark); }
+    card.append(bar);
+    card.append(el("div", "dim", m.ctx_limit ? `context ${fmt(m.ctx_used)} / ${fmt(m.ctx_limit)} (${pct.toFixed(0)}%) · yellow line = handover` : "context window unknown until the first reply"));
+    const kv = el("div", "kv");
+    kv.append(el("span", "", `calls ${m.calls}`), el("span", "", `tokens ${fmt(m.tokens)}`), el("span", "", `cost ${money(m.cost)}`), el("span", "", `retired sessions ${m.retired}`));
+    card.append(kv);
+    const ho = (s.handovers || []).filter((h) => h.member === m.id);
+    if (ho.length) card.append(el("div", "kv", "handovers: " + ho.map((h) => `g${h.gen} ${h.kind}`).join(" · ")));
+    box.append(card);
+  }
+}
+
+function taskLabel(s, t) {
+  const r = t.result;
+  if (t.stage === "done") {
+    const rounds = r.ratify_rounds ? `${r.rounds} rounds + ${r.ratify_rounds} ratification` : `${r.rounds} rounds`;
+    return { text: `${r.outcome} · ${rounds}`, cls: OUTCOME_CLASS[r.outcome] || "ok" };
+  }
+  const where = `${s.phase ?? ""} · round ${s.round ?? "?"}/${s.max_rounds ?? "?"}`;
+  if (t.stage === "pending") return { text: "waiting", cls: "" };
+  const head = t.stage === "executing" ? "plan agreed" : "in progress";
+  if (t.id !== s.task_id) return { text: `${head} · not finished`, cls: "warn" };  // the run is on another task
+  if (s.status === "questions") return { text: `${head} · waiting for your answers`, cls: "warn" };
+  if (s.status === "failed") return { text: `${head} · failed, resume to continue`, cls: "bad" };
+  return { text: `${head} · ${where}`, cls: "running" };
+}
+
+function renderTasks(s) {
+  const box = $("tasks"); box.replaceChildren();
+  s.tasks.forEach((t, i) => {
+    const label = taskLabel(s, t);
+    const d = el("div", "step " + t.stage + (label.cls === "bad" ? " bad" : ""));
+    d.append(el("b", "", `${i + 1}. ${t.id}${t.execute ? " [build]" : ""}`));
+    d.append(el("span", "chip " + label.cls, label.text));
+    d.append(el("small", "", t.text));
+    if (t.id === s.task_id && (t.stage === "current" || t.stage === "executing")) {
+      const votes = (s.last_votes || []).filter((v) => v.vote);
+      if (votes.length) { const row = el("div", "row"); for (const v of votes) row.append(el("span", "chip " + v.vote, `${v.member}: ${v.vote}`)); d.append(row); }
+    }
+    const r = t.result;
+    if (r && r.text) d.append(fold(`res/${t.id}/text`, [el("span", "dim", t.stage === "executing" ? "agreed plan" : "agreed text")], r.text, "slim"));
+    if (r && r.implementation) d.append(fold(`res/${t.id}/impl`, [el("span", "dim", "implementation report and diff")], r.implementation, "slim"));
+    if (r && r.dissent && r.dissent.length) d.append(fold(`res/${t.id}/dissent`, [el("span", "chip bad", "dissent"), el("span", "dim", r.dissent.map((x) => x.member).join(", "))],
+      r.dissent.map((x) => `${x.member}: ${x.reason || "(no reason)"}\n\n${x.proposal || ""}`).join("\n\n----\n\n"), "slim"));
+    box.append(d);
+  });
+}
+
+function renderPosts(s) {
+  const box = $("posts"); box.replaceChildren();
+  $("postcount").textContent = s.posts_total > s.posts.length ? `(newest ${s.posts.length} of ${s.posts_total})` : `(${s.posts.length})`;
+  if (!s.posts.length) { box.append(el("div", "empty", "No post yet. The first round is running.")); return; }
+  for (const p of s.posts) {
+    const sum = [el("span", "chip", p.member), el("span", "", `${p.task} · ${p.tag}`)];
+    if (p.vote) sum.push(el("span", "chip " + p.vote, p.vote));
+    sum.push(el("span", "spacer"), el("span", "dim", clock(p.mtime)));
+    box.append(fold(`post/${p.task}/${p.tag}/${p.member}`, sum, p.text || "(no text)"));
+  }
+}
+
+function renderQuestions(s) {
+  const box = $("questions"); const qs = s.pending_questions || [];
+  if (!qs.length) { box.hidden = true; return; }
+  box.hidden = false; box.replaceChildren(el("h2", "", `The council has ${qs.length} ${qs.length === 1 ? "question" : "questions"} for you`));
+  for (const q of qs) {
+    const d = el("div", ""); d.style.margin = "6px 0";
+    d.append(el("span", "chip warn", q.member ?? "?"), " ", el("span", "", typeof q.question === "string" ? q.question : JSON.stringify(q.question)));
+    box.append(d);
+  }
+  const flags = { "answer": ["--answers answers.json", " (or --answer \"…\" for one answer to all)"], "confirm-mapper": ["--confirm-mapper FILE", " (FILE: JSON with kind, model and effort)"], "map-decision": ["--map-decision FILE", ""] };
+  const [flag, note] = flags[s.answer_with] || flags.answer;
+  const how = el("div", "dim", "The run is stopped (exit 4). This page cannot answer; run "); how.append(el("code", "", `council.sh resume --run-dir ${s.run} ${flag}`), note);
+  box.append(how);
+}
+
+function statusChip(s) {
+  const stopped = s.alive === false && s.status === "running";
+  if (stopped) return { text: "stopped (no council.sh process found)", cls: "bad" };
+  const map = { running: ["running", "running"], questions: ["waiting for you", "warn"], failed: ["failed", "bad"], done: ["done", "ok"], created: ["created", ""] };
+  const [text, cls] = map[s.status] || [s.status ?? "?", ""];
+  return { text, cls };
+}
+
+async function tick() {
+  try {
+    const s = await (await fetch("/api/state", { cache: "no-store" })).json();
+    $("runname").textContent = s.run.split("/").slice(-1)[0];
+    const chip = statusChip(s); $("status").textContent = chip.text; $("status").className = "chip " + chip.cls;
+    $("phase").textContent = s.phase ? "phase: " + s.phase : ""; $("phase").hidden = !s.phase;
+    $("roundchip").textContent = s.round ? `round ${s.round}/${s.max_rounds ?? "?"}` : ""; $("roundchip").hidden = !s.round;
+    $("totals").textContent = `members: ${fmt(s.total_tokens)} tokens · ${money(s.total_cost)}${s.totals_exclude_mapper ? " (mapper calls not included)" : ""}`;
+    $("updated").textContent = "updated " + clock(s.now);
+    renderQuestions(s); renderTasks(s); renderMembers(s); renderPosts(s);
+    $("events").textContent = [...(s.notices || []).map((n) => "! " + n), ...(s.log || [])].join("\n") || "(nothing yet)";
+    $("out").textContent = (s.out || []).join("\n") || "(no .out file next to the run directory)";
+    for (const id of ["events", "out"]) { const e = $(id); e.scrollTop = e.scrollHeight; }
+  } catch (e) {
+    $("updated").textContent = "no connection to the server";
+  }
+}
+tick(); setInterval(tick, 3000);
+</script>
+</body>
+</html>

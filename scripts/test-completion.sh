@@ -3839,7 +3839,46 @@ PY
   check 0 'held rerun: a clock status that does not match the held signal: not rerun' '0 1 -' clock '130 0' TERM 1
   check 0 'held rerun: a clock outside the held interval: not rerun' '0 1 -' clock '143 0' TERM 0
 )
-SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests vendor_tests compact_handover_tests verify_0140_tests claude_cache_ttl_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests"
+claude_agent_tests() (
+  # A Claude model through OpenCode's claude-agent provider is an ordinary OpenCode member (kind opencode, model claude-agent/<id>): the
+  # example config must be a valid council config, and its member's handover must be built from the OpenCode database, not from a
+  # Claude Code transcript. The live model list is not used here (this suite has no OpenCode server): `council.sh show` on the
+  # example is checked by hand against a running server.
+  load council.sh; RUN="$scratch/ca-run"; ST="$RUN/state.json"; N=1; DIR=$scratch; HANDOVER=0.5; TM_STEP=plan; TM_ROUND=1
+  EX="$HERE/../examples/council-claude-agent.json"; cfg="$scratch/ca-config.json"; F="$scratch/ca-bin"
+  rm -rf "$RUN" "$F"; mkdir -p "$RUN/raw" "$RUN/prompts" "$RUN/posts" "$F"
+  check 0 'claude-agent example: the file is JSON' '' jq -e . "$EX"
+  jq --arg d "$scratch" '.dir=$d' "$EX" >"$cfg"
+  check 0 'claude-agent example: validate_config accepts it' 'claude-agent/opus' validate_config "$cfg"
+  norm=$(validate_config "$cfg")
+  check 0 'claude-agent example: every member is an OpenCode session on a claude-agent model, in the read-only plan agent' true jq -e '[.members[] | .kind=="opencode" and (.model|startswith("claude-agent/")) and .agent=="plan" and (has("permission_mode")|not)] | all' <<<"$norm"
+  check 0 'claude-agent example: no executor, so nobody may edit' true jq -e '.executor==null and ([.members[].mode]|all(.=="read"))' <<<"$norm"
+  check 0 'claude-agent example: the roster counts them as OpenCode, not Claude Code' '2 total = 2 OpenCode + 0 Claude Code' print_roster "$norm" ""
+  check 0 'claude-agent example: examples/README.md lists the file' 'council-claude-agent.json' cat "$HERE/../examples/README.md"
+  cat >"$F/make_context.py" <<'PY'
+import os, sys
+open(os.environ["STUB_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
+out = sys.argv[-1]
+os.makedirs(os.path.join(out, "blobs"))
+open(os.path.join(out, "HANDOFF.md"), "w").write("# Handoff\nstub transcript\n")
+PY
+  HANDOFF_PY="$F/make_context.py"; OC_DB="$F/oc.db"; export STUB_LOG="$F/log"; : >"$F/log"
+  tm() { :; }; render_transcript() { :; }; handover_gate() { :; }
+  jq -n '{task_id:"t1",log:[],members:[{id:"A",kind:"opencode",model:"claude-agent/opus",effort:"xhigh",mode:"read",gen:1,session:"ses_claude_agent_1",fresh:false,handover_note:null,ctx_used:900,ctx_limit:1000,session_tokens:7,session_cost:0,session_calls:3,retired:[]}]}' >"$ST"
+  ho() { handover_launch 0 2>"$F/err" && handover_finish 0 2>>"$F/err"; }
+  check 0 'claude-agent handover: launch and finish succeed' '' ho
+  check 0 'claude-agent handover: the handoff is built from the OpenCode database by session id (the branch is the member kind, not its model)' "--opencode $OC_DB --session ses_claude_agent_1 $RUN/handoffs/" cat "$F/log"
+  check 0 'claude-agent handover: the member moves to generation 2 with a compact handoff' true jq -e '.members[0] | .gen==2 and .handover_kind=="compact" and .session==null and .retired[0].session=="ses_claude_agent_1"' "$ST"
+)
+ui_tests() (
+  # the read-only run view in scripts/ui: its own unittest suite (offline, a synthetic run directory, a loopback server on a random port)
+  check 0 'python3 is available' Python python3 --version
+  out=$(python3 "$HERE/ui/test_ui.py" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then echo "FAIL ui unittest:"; echo "$out" | tail -30; exit 1; fi
+  echo "PASS ui unittest ($(printf '%s' "$out" | grep -o 'Ran [0-9]* tests' | head -1))"
+  echo x >>"$scratch/passed"
+)
+SUITES="api_tests permission_tests wait_tests result_tests cli_tests council_tests orphan_tests gate_tests dedup_tests report_tests style_tests handover_tests vendor_tests compact_handover_tests verify_0140_tests claude_cache_ttl_tests ptools_tests codemap_version_tests codemap_prompt_tests codemap_pipeline_tests codemap_baseline_tests codemap_engine_tests map_prepass_lifecycle_tests legacy_differential_tests shared_answer_process_tests mapped_lifecycle_process_tests inherited_answers_process_tests mapper_response_process_tests prepass_fault_process_tests split_gate_process_tests mapped_snapshot_process_tests mapper_permission_boundary_tests telemetry_unit_tests held_rerun_tests telemetry_process_tests telemetry_fault_tests claude_agent_tests ui_tests"
 usage() {
   echo "usage: test-completion.sh [-j N] [--list] [SUITE...]"
   echo "  SUITE...  run only these suites (default: all, in the listed order)"
