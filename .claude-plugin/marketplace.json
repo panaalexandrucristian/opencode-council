@@ -4,10 +4,12 @@
     "name": "Alexandru-Cristian Pana",
     "url": "https://github.com/panaalexandrucristian"
   },
+  "allowCrossMarketplaceDependenciesOn": ["apana-private"],
   "plugins": [
     {
       "name": "opencode-council",
       "source": "./",
+      "dependencies": ["apana@apana-private"],
       "description": "OpenCode via HTTP API + a cross-CLI council (OpenCode & Claude Code sessions) with explicit roster, no-assumptions questions and unanimous consensus.",
       "version": "0.17.0",
       "category": "productivity",

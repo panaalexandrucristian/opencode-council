@@ -18,7 +18,7 @@
 #
 # Config (JSON, every field explicit — no hidden defaults, see SKILL.md "Council"):
 # {
-#   "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "handover_at": 0.5, "max_turns": 30,
+#   "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "max_turns": 30,
 #   "claude_cache_ttl": "1h" | "5m",    (optional, default "1h": the prompt-cache lifetime of every Claude Code member)
 #   "executor": "A" | null,
 #   "tasks": ["question", {"id":"t2","text":"...","execute":true}],
@@ -33,8 +33,8 @@
 # a rotating proposer (member (r-2) mod N); everyone sees the others' previous posts and votes agree/disagree
 # (with a complete revised proposal) or asks questions. Unanimous "agree" = consensus. Build tasks: consensus on a
 # plan -> executor implements -> ratification rounds on the report + diff. Any question pauses the run (exit 4).
-# Context: after every call the member's context usage is measured; at >= handover_at of the model's window the
-# session is compacted into a HANDOFF.md (jev's make_context.py, vendored; no model call) and replaced by a fresh
+# Context: after every call the member's context usage is measured; above 200,000 tokens by default the
+# session is compacted into a HANDOFF.md (Apana's make_context.py; no model call) and replaced by a fresh
 # session (same member id, next generation).
 # handover_at is the council-wide default; a member may set its own handover_at to hand over earlier or later.
 set -o pipefail
@@ -54,9 +54,8 @@ done
 # unavailable) — exactly what a missing-file invocation naturally produces.
 CM="$HERE/council_codemap.py"
 # A member's handover note is not written by the model: it is the compact handoff of the retiring session, built from the
-# session's own transcript by the jev compact-handoff script vendored in scripts/vendor/jev-handoff (pinned by its
-# VENDOR.json). COUNCIL_HANDOFF_SCRIPT and COUNCIL_OPENCODE_DB override the script and OpenCode's database.
-HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-$HERE/vendor/jev-handoff/skills/compact-handoff/scripts/make_context.py}"
+# session's own transcript by the installed Apana plugin. Resolve its script only when building a handoff.
+HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-}"
 OC_DB="${COUNCIL_OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
 # The caveman style's rules are the upstream caveman skill, vendored verbatim in scripts/vendor/caveman (pinned by its
 # VENDOR.json, Apache-2.0); caveman_text sends it in the member's first prompt.
@@ -102,11 +101,12 @@ ST=""
 st()  { jq -r "$1" "$ST"; }                                   # read
 stj() { jq -c "$1" "$ST"; }                                   # read json
 sts() { jq "$@" "$ST" >"$ST.tmp" && mv "$ST.tmp" "$ST"; }     # update (atomic)
-N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=0.5; MAXT=30; CACHE_TTL=1h; EXEC=""; CODEMAP=0; MAP_PREPASS=0
+DEFAULT_HANDOVER=200001  # thresholds are inclusive; the default fires strictly above 200,000 tokens
+N=0; DIR=""; MAXR=0; TIMEOUT=600; HANDOVER=$DEFAULT_HANDOVER; MAXT=30; CACHE_TTL=1h; EXEC=""; CODEMAP=0; MAP_PREPASS=0
 load_state() {
   ST="$RUN/state.json"; [ -f "$ST" ] || die "no state in $RUN (not a council run dir)"
   N=$(st '.members|length'); DIR=$(st '.config.dir'); MAXR=$(st '.config.max_rounds'); TIMEOUT=$(st '.config.timeout_s')
-  HANDOVER=$(st '.config.handover_at'); MAXT=$(st '.config.max_turns // 30'); CACHE_TTL=$(st '.config.claude_cache_ttl // "1h"'); EXEC=$(st '.config.executor // ""')
+  HANDOVER=$(st ".config.handover_at // $DEFAULT_HANDOVER"); MAXT=$(st '.config.max_turns // 30'); CACHE_TTL=$(st '.config.claude_cache_ttl // "1h"'); EXEC=$(st '.config.executor // ""')
   MAP_PREPASS=0
   if [ "$(st '.map_prepass_version // 0')" = 1 ] && [ "$(st '.config.map_code // false')" = true ]; then MAP_PREPASS=1; fi
   codemap_check_version
@@ -1206,8 +1206,7 @@ validate_config() {  # $1 = config file -> prints normalised config json
     (.map_prepass | if type=="object" then . else {} end) as $mp |
     def need(f; msg): if (has(f) | not) then "missing field: " + f + " (" + msg + ")" else empty end;
     [ need("dir"; "absolute project directory"), need("tasks"; "array of tasks"), need("members"; "array of {id,kind,model,effort,mode}"),
-      need("executor"; "member id allowed to edit files, or null"), need("max_rounds"; "e.g. 4"), need("timeout_s"; "e.g. 600"),
-      need("handover_at"; "e.g. 0.5") ]
+      need("executor"; "member id allowed to edit files, or null"), need("max_rounds"; "e.g. 4"), need("timeout_s"; "e.g. 600") ]
     + (if (.dir|type)=="string" and (.dir|startswith("/")) then [] else ["dir must be an absolute path"] end)
     + (if (.tasks|type)=="array" and (.tasks|length)>0 then [] else ["tasks must be a non-empty array"] end)
     + (if (.members|type)=="array" and (.members|length)>=2 then [] else ["members must be an array of at least 2"] end)
@@ -1219,7 +1218,10 @@ validate_config() {  # $1 = config file -> prints normalised config json
     + (if ([.members[]?.id]|unique|length) == ([.members[]?.id]|length) then [] else ["member ids must be unique"] end)
     + (if (.max_rounds|type)=="number" and .max_rounds>=2 and .max_rounds<=10 then [] else ["max_rounds must be 2..10 (round 1 = proposals, consensus needs at least one voting round)"] end)
     + (if (.timeout_s|type)=="number" and .timeout_s>=30 then [] else ["timeout_s must be >= 30"] end)
-    + (if (.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))) then [] else ["handover_at must be a fraction in (0,1] of the model context window, or an absolute token count >= 1000 (e.g. 150000)"] end)
+    + (if has("handover_at") then
+        if (.handover_at|type)=="number" and ((.handover_at>0 and .handover_at<=1) or (.handover_at>=1000 and .handover_at==(.handover_at|floor))) then []
+        else ["handover_at must be a fraction in (0,1] of the model context window, or an absolute token count >= 1000 (e.g. 150000)"] end
+      else [] end)
     + (if has("claude_cache_ttl") and (.claude_cache_ttl|IN("1h","5m")|not) then ["claude_cache_ttl must be 1h|5m"] else [] end)
     + (if has("map_code") and (.map_code|type)!="boolean" then ["map_code must be a boolean"] else [] end)
     + (if has("map_prepass") and (.map_prepass|type)!="object" then ["map_prepass must be an object containing mapper settings"] else [] end)
@@ -1250,8 +1252,10 @@ validate_config() {  # $1 = config file -> prints normalised config json
                                         (.value | with_entries(select(.key|IN("acceptance","map_parent","map_contract_id","contract_identity","parent_id","map_seed_id","inherited_answers"))))) end)]
       | .max_turns = (.max_turns // 30)
       | .style = (.style // "caveman")
+      | .handover_at = (.handover_at // $default_handover)
+      | .handover_at as $h
       | .members |= [ .[] | {style: $s, handover_at: $h} + . + (if .kind=="opencode" then {agent:(if .mode=="edit" then "build" else "plan" end)}
-                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "caveman"' "$1")" --argjson h "$(jq -r '.handover_at' "$1")" "$1"
+                                 else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' --arg s "$(jq -r '.style // "caveman"' "$1")" --argjson default_handover "$DEFAULT_HANDOVER" "$1"
 }
 
 check_opencode_models() {  # $1 = normalised config json -> validates model + variant against the live server; prints ctx limits json
@@ -1860,7 +1864,7 @@ ctx_pct() { st ".members[$1] | if (.ctx_limit // 0) > 0 and (.ctx_used // 0) > 0
 member_handover_at() { st ".members[$1].handover_at // $HANDOVER"; }
 # handover_at <= 1 is a fraction of the model's context window; > 1 is an absolute token count.
 needs_handover() { st ".members[$1] | (.handover_at // $HANDOVER) as \$h
-  | ((.session_calls // 0) >= 2 and (.ctx_used // 0) > 0
+  | ((.ctx_used // 0) > 0
      and (if \$h > 1 then (.ctx_used >= \$h) else ((.ctx_limit // 0) > 0 and (.ctx_used / .ctx_limit) >= \$h) end))" | grep -q true; }
 
 # Optional handover gate (env COUNCIL_HANDOVER_GATE=1): the delivered note waits for an outside review before the
@@ -1885,20 +1889,39 @@ handover_gate() {  # note
   TM_GATE_T0=""; tm gate member_index="$TM_HO_MEMBER" handover_seq="$TM_HO" result=released wait_s=$(( $(date +%s) - t0 ))
   log "handover gate: released $note"
 }
+apana_handoff_script() {
+  local project root registry="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+  project=$(cd "${DIR:-.}" && pwd -P) || return 1
+  root=$(jq -er --arg project "$project" '
+    [.plugins["apana@apana-private"][]? |
+      select(.installPath | type == "string" and startswith("/")) |
+      if .scope == "managed" then [0, .installPath]
+      elif .projectPath == $project and .scope == "local" then [1, .installPath]
+      elif .projectPath == $project and .scope == "project" then [2, .installPath]
+      elif .scope == "user" then [3, .installPath]
+      else empty end
+    ] | sort_by(.[0]) | .[0][1]
+  ' "$registry" 2>/dev/null) || return 1
+  printf '%s/skills/compact-handoff/scripts/make_context.py\n' "$root"
+}
 # The folder of a member's handoff is named so that the script finds it as the parent of the next generation's handoff
 # (its /handoff-<8 hex>-<date>-...  pattern): the successor reads this HANDOFF.md first, so the chain stays whole.
 handoff_build() {  # idx -> 0 and HO_NOTE=<run>/handoffs/<folder>/HANDOFF.md ; 1 and HO_ERR=<why> when it could not be built
-  local i=$1 id gen sid kind out hex rc errf outf
+  local i=$1 id gen sid kind out hex rc errf outf script
   id=$(mid $i); gen=$(mget $i gen); sid=$(mget $i session); kind=$(mget $i kind)
   hex=$(printf '%08x' "$(printf '%s' "$sid" | cksum | cut -d' ' -f1)")
   out="$RUN/handoffs/handoff-$hex-$(date +%Y%m%d)-$id-g$gen"; HO_NOTE="$out/HANDOFF.md"; HO_ERR=""
-  [ -f "$HANDOFF_PY" ] || { HO_ERR="the handoff script was not found: $HANDOFF_PY"; return 1; }
+  script="$HANDOFF_PY"
+  if [ -z "$script" ]; then
+    script=$(apana_handoff_script) || { HO_ERR="Apana plugin not found: install apana@apana-private or set COUNCIL_HANDOFF_SCRIPT"; return 1; }
+  fi
+  [ -f "$script" ] || { HO_ERR="the handoff script was not found: $script"; return 1; }
   { [ -n "$sid" ] && [ "$sid" != null ]; } || { HO_ERR="the member has no session to hand over"; return 1; }
   rm -rf "$out"; mkdir -p "$RUN/handoffs" || { HO_ERR="cannot create $RUN/handoffs"; return 1; }
   errf="$RUN/raw/handoff-$id-g$gen.err"; outf="$RUN/raw/handoff-$id-g$gen.out"
-  # HV_SCRIPTS (handoff-verify's modules) would be searched before the pinned copy next to the script: never pass it on
-  if [ "$kind" = opencode ]; then env -u HV_SCRIPTS python3 -B "$HANDOFF_PY" --opencode "$OC_DB" --session "$sid" "$out" >"$outf" 2>"$errf"
-  else env -u HV_SCRIPTS python3 -B "$HANDOFF_PY" "$sid" "$out" >"$outf" 2>"$errf"; fi
+  # Keep Apana on the verifier bundled with its own version.
+  if [ "$kind" = opencode ]; then env -u HV_SCRIPTS python3 -B "$script" --opencode "$OC_DB" --session "$sid" "$out" >"$outf" 2>"$errf"
+  else env -u HV_SCRIPTS python3 -B "$script" "$sid" "$out" >"$outf" 2>"$errf"; fi
   rc=$?
   { [ $rc -eq 0 ] && [ -s "$HO_NOTE" ]; } && return 0
   # the script's messages end with a blank line: the reason is the last line that has text
@@ -2383,7 +2406,7 @@ case "$CMD" in
   status)
     [ -n "$RUN" ] || die "status needs --run-dir D"; RUN=$(abs "$RUN"); load_state
     echo "run: $RUN · status: $(st .status) · task $(st '.task_id // "-"') ($(st .task_idx)/$(st '.config.tasks|length') done) · phase $(st .phase) · round $(st .round)/$MAXR"
-    st '.members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)%; handover at \((.handover_at // 0.5) as $h | if $h > 1 then ($h|tostring)+" tok" else (($h*100|floor)|tostring)+"%" end))) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
+    st '(.config.handover_at // '"$DEFAULT_HANDOVER"') as $default | .members[] | "  member \(.id) g\(.gen) \(.kind) \(.model) [\(.effort)] session \(.session // "-") · ctx \(.ctx_used // 0)/\(.ctx_limit // "?") (\(if (.ctx_limit//0)>0 then ((.ctx_used//0)/.ctx_limit*100|floor) else 0 end)%; handover at \((.handover_at // $default) as $h | if $h > 1 then ($h|tostring)+" tok" else (($h*100|floor)|tostring)+"%" end))) · session tokens \(.session_tokens // 0) · cost \(.session_cost // 0) · calls \(.calls // 0) · retired \((.retired//[])|length)"'
     usage_totals
     st '.results[] | "  task \(.task): \(.outcome) (\(.rounds) rounds)"'
     jq -r '.pending_questions[]? | "  PENDING [\(.id)] member \(.member): \(.question)"' "$ST"

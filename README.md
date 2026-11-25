@@ -9,7 +9,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 | `SKILL.md` | the skill Claude Code loads (`/opencode …`): workflow, permissions, the council checklist |
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
-| `scripts/vendor/` | `jev-handoff/`: a pinned copy of jev's compact-handoff scripts (MIT; source and commit in its `VENDOR.json`) that builds a member's handover handoff; `update_jev_handoff.py` verifies and refreshes it. `caveman/`: the upstream caveman skill (Apache-2.0, with its `LICENSE`, `NOTICE` and the pre-3.0.0 MIT notice `LICENSE-MIT`; commit and hashes in its `VENDOR.json`), whose text the caveman style sends to members |
+| `scripts/vendor/` | `caveman/`: the upstream caveman skill (Apache-2.0, with its `LICENSE`, `NOTICE` and the pre-3.0.0 MIT notice `LICENSE-MIT`; commit and hashes in its `VENDOR.json`), whose text the caveman style sends to members |
 | `scripts/ptools/` | optional, offline Python 3 stdlib prompt-byte report and same-prompt duplicate audit; `session_report.py` (per-session token report, local by default); `token_breakdown.py` (where the tokens of one or more runs go, built on `session_report.py`); `run_check.py` (runs a build or test command with the full log on disk and a capped summary on stdout; unlike the others it executes commands and writes artifacts, so it is not read-only) |
 | `reference.md` | OpenCode HTTP endpoint notes |
 | `.claude-plugin/` | plugin + marketplace manifests, so the repo installs with `/plugin install` |
@@ -34,14 +34,15 @@ opencode auth login        # e.g. OpenAI (ChatGPT/Codex), Google, Kimi, Moonshot
 
 ### 2. Install the skill
 
-**Option A — as a Claude Code plugin (recommended).** The repository is its own plugin marketplace, so two commands inside Claude Code install it, and `/plugin` keeps it updated:
+**Option A — as a Claude Code plugin (recommended).** Register the Council and Apana marketplaces first. Apana's repository is private, so this requires GitHub access to it:
 
 ```
 /plugin marketplace add panaalexandrucristian/opencode-council
+/plugin marketplace add panaalexandrucristian/apana-plugin
 /plugin install opencode-council@opencode-council
 ```
 
-(or from a terminal: `claude plugin marketplace add panaalexandrucristian/opencode-council` and `claude plugin install opencode-council@opencode-council`; add `--scope project` to install for one repository only). Plugin skills are namespaced, so the skill is invoked as **`/opencode-council:opencode …`**. To update later: `claude plugin marketplace update opencode-council && claude plugin update opencode-council@opencode-council`, then restart Claude Code.
+Council declares `apana@apana-private` without a version pin, so the installer resolves it from the Apana marketplace. If Apana is already installed, update it separately to make sure it is current. The same commands work from a terminal with `claude plugin` instead of `/plugin`; add `--scope project` to the install for one repository only. Invoke the installed skill with **`/opencode-council:opencode …`**.
 
 **Option B — with the `skills` CLI** ([vercel-labs/skills](https://github.com/vercel-labs/skills), works for Claude Code and other agents; discovers the `SKILL.md` at the repo root):
 
@@ -56,7 +57,7 @@ git clone https://github.com/panaalexandrucristian/opencode-council.git ~/.claud
 git clone https://github.com/panaalexandrucristian/opencode-council.git .claude/skills/opencode        # project skill
 ```
 
-With B or C the skill is invoked as `/opencode …` — the name comes from the `name: opencode` line in `SKILL.md`, not from the folder. Nothing else to configure: the scripts read the OpenCode service URL/password from `~/.local/state/opencode/service.json` and start the service (`opencode service start`) when it is not running.
+With B or C the skill is invoked as `/opencode …`. For compact handovers, install `apana@apana-private` separately or set `COUNCIL_HANDOFF_SCRIPT` to an Apana `make_context.py` path. Without it, handovers fall back to the member's own posts. The scripts read the OpenCode service URL/password from `~/.local/state/opencode/service.json` and start the service (`opencode service start`) when it is not running.
 
 ### 3. Verify
 
@@ -79,7 +80,7 @@ Then, in Claude Code:
 
 ### 4. Update
 
-Plugin: `claude plugin marketplace update opencode-council && claude plugin update opencode-council@opencode-council` (restart Claude Code to apply). `skills` CLI: re-run `npx skills add …`. Git clone: `git -C ~/.claude/skills/opencode pull`.
+Plugin: refresh both marketplaces with `claude plugin marketplace update`, then run `claude plugin update apana@apana-private` and `claude plugin update opencode-council@opencode-council` (restart Claude Code to apply). `skills` CLI: re-run `npx skills add …`. Git clone: `git -C ~/.claude/skills/opencode pull`.
 
 ## The council
 
@@ -98,7 +99,7 @@ council.sh resume --run-dir D --replace C=claude:sonnet:xhigh   # give a member 
 
 ```json
 {
-  "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "handover_at": 0.5, "max_turns": 30,
+  "dir": "/abs/project", "max_rounds": 4, "timeout_s": 600, "max_turns": 30,
   "claude_cache_ttl": "1h",
   "map_code": false,
   "executor": "C",
@@ -158,7 +159,7 @@ How it works:
 - **Unanimous consensus.** Round 1 = proposals; then a rotating proposer's position is the frozen candidate and everyone votes `agree` / `disagree` (with a complete revised proposal). All `agree` = consensus. `max_rounds` reached = `unresolved` (exit 5), dissent preserved — never a forced verdict.
 - **Build tasks.** Consensus on a plan → the single `executor` implements it → the council ratifies the report + diff (fix rounds if needed).
 - **No assumptions.** Each member must list every choice the task leaves open and what settles it (`task` / `dir` / `user` / `ask`). Anything not settled by the task, the working directory or an earlier answer becomes a question for the user: the run pauses (exit 4, `questions.json`), you answer, `resume` re-runs the round.
-- **Context handover.** After every call the member's context use is measured against the model's window; at `handover_at` — a fraction of the model's window, or an absolute token count such as `150000` — the session's transcript is compacted into a `HANDOFF.md` by jev's `make_context.py` (vendored and pinned, no model call) and the session is replaced by a fresh session (same member, next generation) that reads that file first. `handover_at` is a council-wide default that any member can override with its own value, so a member on a small context window (or an expensive one) hands over earlier.
+- **Context handover.** By default, when a member uses more than 200,000 context tokens, Apana's `make_context.py` compacts the transcript before the member's next step, even if the session has made only one call. A fresh session reads the resulting `HANDOFF.md` first. Set `handover_at` for the council or for a member to override the default. Use a fraction of the model's context window or an absolute token count; use a lower value for a model with a smaller context window.
 - **Transcript.** `D/transcript.md`: roster, per-member tokens/context/cost/generations, every post by task and round, outcomes, Q&A, log.
 - **Visible truncation.** Diffs retain their 20000-byte cap; truncated output ends with the cap and the working directory to inspect.
 
@@ -183,7 +184,7 @@ How it works:
   the Mac's platform UUID; never ids, task text, posts, notes, paths or names). `COUNCIL_TELEMETRY=0` turns it off;
   `COUNCIL_TELEMETRY_DIR` moves the ledger; `scripts/ptools/telemetry_report.py` reports offline over one or many
   Macs' ledgers. Details in SKILL.md, "Telemetry".
-- **Tests.** `bash scripts/test-completion.sh` — 1899 offline checks (no network, no model calls), including
+- **Tests.** `bash scripts/test-completion.sh` — 1893 offline checks (no network, no model calls), including
   `scripts/ptools/test_ptools.py` (791 Python standard-library unittest cases for the analysis tools and the telemetry writer/report).
   `-j N` runs up to N suites at once, each in its own fresh scratch; names after the options run only those suites
   (`--list` prints them), e.g. `bash scripts/test-completion.sh -j 8` or `bash scripts/test-completion.sh verify_0140_tests`.
@@ -205,7 +206,10 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
   `oc.sh` removed, and its numbers come from a new `compute()`; the new `token_breakdown.py` splits the tokens of one or
   more runs by provider, step, round, context, tools, re-read files, handovers and retries. The 97f4c70 differential
   applies the same change (`approve_caveman_council`; both trees run the current `prompt_report.py`).
-  test-completion.sh: 1899 checks; test_ptools.py: 779 → 791 cases.
+  Compact handovers use the installed `apana@apana-private` plugin instead of a vendored Jev copy. The dependency
+  is unpinned; Council follows Apana's installed path instead of keeping its own copy. By default, handover
+  triggers above 200,000 context tokens before the next step, even if the session has only made one call.
+  test-completion.sh: 1893 checks; test_ptools.py: 779 → 791 cases.
 - **0.17.0** — a member's handover is no longer a note the model writes. `council.sh` compacts the retiring
   session's own transcript with jev's `make_context.py` (a Claude session from its transcript, an OpenCode session from
   `opencode.db`; no model call) into `D/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` + `blobs/`. The successor's

@@ -9,5 +9,6 @@
   },
   "repository": "https://github.com/panaalexandrucristian/opencode-council",
   "license": "MIT",
+  "dependencies": ["apana@apana-private"],
   "keywords": ["opencode", "council", "multi-agent", "consensus", "claude-code", "skill"]
 }

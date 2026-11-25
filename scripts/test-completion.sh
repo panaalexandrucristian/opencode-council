@@ -442,14 +442,22 @@ handover_tests() (
   mk 0.3 400 2;  check 0 'member threshold 0.3 fires at 40%' '' needs_handover 0
   mk 0.85 600 2; check 1 'member threshold 0.85 does not fire at 60%' '' needs_handover 0
   mk 0.85 900 2; check 0 'member threshold 0.85 fires at 90%' '' needs_handover 0
-  mk 0.3 900 1;  check 1 'no handover before the session made two calls' '' needs_handover 0
+  mk 0.3 900 1;  check 0 'a fractional threshold can fire after the first call' '' needs_handover 0
   mk 0.3 0 5;    check 1 'no handover without a context reading' '' needs_handover 0
   mk 150000 149999 2; check 1 'absolute threshold not reached below 150k tokens' '' needs_handover 0
   mk 150000 150000 2; check 0 'absolute threshold reached at exactly 150k tokens' '' needs_handover 0
-  mk 150000 900000 1; check 1 'absolute threshold still needs two calls' '' needs_handover 0
+  mk 150000 900000 1; check 0 'an absolute threshold can fire after the first call' '' needs_handover 0
   mk 1000 2000 2;  check 0 'absolute threshold ignores the context window' '' needs_handover 0
   mk 0.3 400 2;  check 0 'member threshold is reported' 0.3 member_handover_at 0
   mk null 400 2; check 0 'default threshold is reported' 0.5 member_handover_at 0
+  HANDOVER=$DEFAULT_HANDOVER
+  jq -n '{dir:"/tmp",executor:null,max_rounds:2,timeout_s:30,tasks:["x"],
+    members:[{id:"A",kind:"claude",model:"sonnet",effort:"low",mode:"read"},
+    {id:"B",kind:"claude",model:"sonnet",effort:"low",mode:"read",handover_at:0.3}]}' >"$scratch/ho-cfg.json"
+  resolved() { validate_config "$scratch/ho-cfg.json" | jq -ce '[.handover_at, .members[].handover_at]'; }
+  check 0 'handover config: omitted threshold defaults to 200001 and preserves member overrides' '[200001,200001,0.3]' resolved
+  mk null 200000 1; check 1 'default threshold does not fire at exactly 200000 tokens' '' needs_handover 0
+  mk null 200001 1; check 0 'default threshold fires above 200000 tokens after the first call' '' needs_handover 0
 
   # run_step: the handoff of every member past its threshold is built at once; the others start the step meanwhile, and each
   # handed-over member is launched right after its own handoff is through the gate
@@ -467,43 +475,14 @@ handover_tests() (
   check 0 'parallel handovers: the step succeeds' '' run_step r2 fakegen '{"id":"t1"}' 2
   check 0 'parallel handovers: both handoffs start, B starts meanwhile, A and C follow their own handoffs' 'HL 0 HL 2 L 1 HF 0 L 0 HF 2 L 2' sh -c 'tr "\n" " " <"$1"' _ "$RUN/order"
 )
-# scripts/vendor/jev-handoff is the pinned copy of the jev compact-handoff scripts that council.sh builds handover notes with;
-# update_jev_handoff.py refreshes it from a jev commit and --check proves the committed copy is exactly the pinned one.
+# Apana is an unpinned plugin dependency, not a vendored script.
 vendor_tests() (
-  U="$HERE/vendor/update_jev_handoff.py"; V="$scratch/vendor"; rm -rf "$V"; mkdir -p "$V"
-  check 0 'vendor: the committed copy matches VENDOR.json' 'jev-handoff: OK' python3 -B "$U" --check
-  check 0 'vendor: VENDOR.json pins one full jev commit' true jq -e '(.commit|test("^[0-9a-f]{40}$")) and (.source|startswith("https://github.com/"))' "$HERE/vendor/jev-handoff/VENDOR.json"
-  check 0 'vendor: the pinned copy carries the jev license' 'MIT License' cat "$HERE/vendor/jev-handoff/LICENSE"
-  cp -R "$HERE/vendor/jev-handoff" "$V/c"
-  C=skills/compact-handoff/scripts/make_context.py
-  printf '\n# edited\n' >>"$V/c/$C"
-  check 1 'vendor: an edited file is reported' "changed: $C" python3 -B "$U" --check --dest "$V/c"
-  cp "$HERE/vendor/jev-handoff/$C" "$V/c/$C"; rm "$V/c/skills/handoff-verify/scripts/sanitize.py"
-  check 1 'vendor: a missing file is reported' 'missing: skills/handoff-verify/scripts/sanitize.py' python3 -B "$U" --check --dest "$V/c"
-  cp "$HERE/vendor/jev-handoff/skills/handoff-verify/scripts/sanitize.py" "$V/c/skills/handoff-verify/scripts/sanitize.py"; : >"$V/c/skills/handoff-verify/scripts/extra.py"
-  check 1 'vendor: a file VENDOR.json does not list is reported' 'not in VENDOR.json: skills/handoff-verify/scripts/extra.py' python3 -B "$U" --check --dest "$V/c"
-  rm "$V/c/skills/handoff-verify/scripts/extra.py"
-  check 1 'vendor: a copy without VENDOR.json is reported' 'VENDOR.json is missing' python3 -B "$U" --check --dest "$V/none"
-  # refreshing from a jev commit: only compact-handoff plus the import closure of prepare/omissions/discover is copied
-  R="$V/jev"; mkdir -p "$R/skills/compact-handoff/scripts" "$R/skills/handoff-verify/scripts"
-  for f in make_context compact_context opencode_source prepare_all; do echo "x = 1" >"$R/skills/compact-handoff/scripts/$f.py"; done
-  H="$R/skills/handoff-verify/scripts"
-  printf 'import helper\nfrom discover import find\n' >"$H/prepare.py"; printf 'import os.path\nimport discover\n' >"$H/omissions.py"; echo 'x = 1' >"$H/discover.py"
-  printf 'import deeper, json\n' >"$H/helper.py"; echo 'x = 1' >"$H/deeper.py"; echo 'import prepare' >"$H/unrelated.py"
-  echo '{}' >"$H/report.schema.json"; echo 'MIT License' >"$R/LICENSE"
-  git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -q -m one || exit 1
-  check 0 'vendor: refreshing from a commit copies it and says so' "vendored 11 files" python3 -B "$U" --repo "$R" --commit HEAD --dest "$V/u"
-  check 0 'vendor: the closure is followed through imports (helper, deeper), nothing else of handoff-verify is copied' 'deeper.py discover.py helper.py omissions.py prepare.py report.schema.json' sh -c 'jq -r ".files|keys[]" "$1/VENDOR.json" | grep handoff-verify | xargs -n1 basename | tr "\n" " " | sed "s/ \$//"' _ "$V/u"
-  check 0 'vendor: VENDOR.json records the full commit' "$(git -C "$R" rev-parse HEAD)" jq -r .commit "$V/u/VENDOR.json"
-  check 0 'vendor: the refreshed copy passes --check' 'jev-handoff: OK' python3 -B "$U" --check --dest "$V/u"
-  # a later commit that no longer needs helper: its files go, a foreign file in the destination stays
-  echo 'x = 1' >"$H/prepare.py"; echo foreign >"$V/u/keep.txt"
-  git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -q -m two || exit 1
-  check 0 'vendor: a second refresh succeeds' "vendored 9 files" python3 -B "$U" --repo "$R" --commit HEAD --dest "$V/u"
-  check 1 'vendor: a module the new commit no longer needs is removed' '' test -e "$V/u/skills/handoff-verify/scripts/helper.py"
-  check 0 'vendor: a file the manifest never listed is left alone' foreign cat "$V/u/keep.txt"
-  check 2 'vendor: --repo without --commit is refused' 'go together' sh -c 'python3 -B "$1" --repo "$2" --dest "$3" 2>&1' _ "$U" "$R" "$V/u"
-  check 1 'vendor: a commit that does not exist fails' 'git rev-parse' sh -c 'python3 -B "$1" --repo "$2" --commit deadbeef --dest "$3" 2>&1' _ "$U" "$R" "$V/u"
+  check 0 'plugin: the manifest declares Apana without a version constraint' true \
+    jq -e '.dependencies == ["apana@apana-private"]' "$HERE/../.claude-plugin/plugin.json"
+  check 0 'plugin: the marketplace allows and resolves the Apana dependency at install' true \
+    jq -e '.allowCrossMarketplaceDependenciesOn == ["apana-private"] and
+      any(.plugins[]; .name == "opencode-council" and .dependencies == ["apana@apana-private"])' \
+    "$HERE/../.claude-plugin/marketplace.json"
   # scripts/vendor/caveman: the upstream caveman skill whose text the caveman style sends to members, pinned the same way
   CV="$HERE/vendor/caveman"
   check 0 'vendor caveman: VENDOR.json pins one full upstream commit' true jq -e '(.commit|test("^[0-9a-f]{40}$")) and .source=="https://github.com/JuliusBrussee/caveman"' "$CV/VENDOR.json"
@@ -520,7 +499,7 @@ PY
   check 0 'vendor caveman: council.sh reads the vendored skill' '' test "$(cd "$HERE" && bash -c 'HERE=$PWD; eval "$(grep "^CAVEMAN_MD=" council.sh)"; printf %s "$CAVEMAN_MD"')" = "$HERE/vendor/caveman/skills/caveman/SKILL.md"
 )
 # A member's handover note is the compact handoff of its retiring session, built from the session's own transcript by the
-# vendored jev script (HANDOFF_PY): no model call, one folder per member and generation, a reference in the successor's
+# installed Apana script: no model call, one folder per member and generation, a reference in the successor's
 # first prompt. A script that cannot build it falls back to a note made of the member's own posts.
 compact_handover_tests() (
   load council.sh; RUN="$scratch/ch-run"; ST="$RUN/state.json"; N=2; DIR=$scratch; HANDOVER=0.5; TM_STEP=plan; TM_ROUND=1
@@ -560,10 +539,9 @@ PY
   check 0 'compact handover: telemetry records the handover as an ok note' 'note_outcome=ok' grep 'stage=end' "$F/tm"
   mk; ho 1
   check 0 'compact handover: an OpenCode member is read from the OpenCode database by session id' "--opencode $OC_DB --session ses_oc1 $RUN/handoffs/" cat "$F/log"
-  # the script finds handoff-verify's modules in HV_SCRIPTS before the pinned copy next to it: a value left in the
-  # environment would replace the pinned modules, so the script must not see it
+  # A value left in the environment would replace Apana's bundled verifier.
   mk; rm -f "$F/log.env"; HV_SCRIPTS=/poison/elsewhere; export HV_SCRIPTS; ho 0; ho_rc=$?; unset HV_SCRIPTS
-  check 0 'compact handover: the script never sees HV_SCRIPTS from the environment (the pinned modules are used)' 'HV_SCRIPTS=<unset>' cat "$F/log.env"
+  check 0 'compact handover: the script never sees HV_SCRIPTS from the environment' 'HV_SCRIPTS=<unset>' cat "$F/log.env"
   check 0 'compact handover: and the handover still succeeds' 0 echo "$ho_rc"
   # a script that cannot build the handoff: the next generation still opens, from the member's own posts
   mk; printf 'Position of A in round 1.\n' >"$RUN/posts/t1-r1-A.md"; printf 'Position of B.\n' >"$RUN/posts/t1-r1-B.md"
@@ -582,6 +560,28 @@ PY
   check 0 'compact handover: the fallback note gives the same reason' 'exit 3: stub: no such session' cat "$fb"
   mk; HANDOFF_PY="$F/not-there.py"; check 0 'compact handover: a missing script falls back too' '' ho 0
   check 0 'compact handover: and says the script is missing' 'not found' cat "$F/err"
+  export CLAUDE_CONFIG_DIR="$F/Claude config"
+  mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
+  registry="$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+  HANDOFF_PY=""
+  mk; ho 0
+  check 0 'compact handover: missing Apana falls back with an installation hint' 'install apana@apana-private' cat "$F/err"
+  suffix=skills/compact-handoff/scripts/make_context.py
+  for v in user-v1 user-v2 project; do
+    mkdir -p "$(dirname "$F/$v/$suffix")"
+    cp "$F/make_context.py" "$F/$v/$suffix"
+  done
+  project=$(cd "$DIR" && pwd -P)
+  jq -n --arg root "$F" '{plugins:{"apana@apana-private":[
+    {scope:"project", projectPath:"/other-project",installPath:($root+"/project")},
+    {scope:"user",installPath:($root+"/user-v1")}]}}' >"$registry"
+  check 0 'compact handover: resolves the user install, not another project' "$F/user-v1/$suffix" apana_handoff_script
+  jq --arg path "$F/user-v2" '.plugins["apana@apana-private"][1].installPath = $path' "$registry" >"$registry.new" && mv "$registry.new" "$registry"
+  check 0 'compact handover: follows the newly installed version' "$F/user-v2/$suffix" apana_handoff_script
+  jq --arg project "$project" '.plugins["apana@apana-private"][0].projectPath = $project' "$registry" >"$registry.new" && mv "$registry.new" "$registry"
+  check 0 'compact handover: uses the install for this project' "$F/project/$suffix" apana_handoff_script
+  mk; ho 1
+  check 0 'compact handover: invokes the installed Apana script without an override' "--session ses_oc1" cat "$F/log"
   HANDOFF_PY="$F/make_context.py"
   # resuming after a gate that was never released: the folder is rebuilt from scratch
   mk; ho 0; old=$(dirname "$(jq -r '.members[0].handover_note' "$ST")"); echo stale >"$old/stale.txt"
@@ -664,7 +664,7 @@ SH
   for key in 'HARD RULE — scope (overrides' 'Clarify first (grilling).' 'Recommended: <answer> (<why>)' 'Vote "question" only for a choice' 'Judge the candidate only against the task' 'Check only what the plan and the task cover' \
              'else {permission_mode:(if .mode=="edit" then "acceptEdits" else "plan" end)} end) ]' '--no-wait --auto >/dev/null' '--timeout "$TIMEOUT" --auto >/dev/null' '{permission_mode:$pm, agent:null}' \
              'for i in $idxs; do needs_handover $i && ho="$ho $i"; done' 'for i in $ho; do handover_launch $i; done' '*" $i "*) ;; *) launch_member $i || return 1 ;; esac; done' \
-             'HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-$HERE/vendor/jev-handoff/skills/compact-handoff/scripts/make_context.py}"' 'if [ "$(mget $i handover_kind)" = compact ]; then' \
+             'HANDOFF_PY="${COUNCIL_HANDOFF_SCRIPT:-}"' 'if [ "$(mget $i handover_kind)" = compact ]; then' \
              "sts --argjson i \$i '.members[\$i].fresh=false | .members[\$i].handover_note=null | .members[\$i].handover_kind=null'" 'handover_launch() {  # idx -> builds the retiring session'"'"'s compact handoff' \
              'CAVEMAN_MD="$HERE/vendor/caveman/skills/caveman/SKILL.md"' '| .style = (.style // "caveman")' '--arg s "$(jq -r '"'"'.style // "caveman"'"'"' "$1")"' \
              'OC_MEMBER_RULES=(--deny skill' '"${OC_MEMBER_RULES[@]}" --title' '--disable-slash-commands --strict-mcp-config)' '    style_reminder $i >>"$pf"' \
@@ -1936,7 +1936,7 @@ SH
 # timestamp normalisation.
 # 0.10.0 intentionally changes one thing the 97f4c70 byte pins see: the user-approved handover prompt
 # addition (applied to the baseline copy, verbatim, so every other byte stays pinned). Everything else is compared.
-approve_compact_handover() {  # 97f4c70 council.sh copy (after approve_parallel_handover) -> the 0.17.0 handover: the compact handoff replaces the model-written note
+approve_compact_handover() {  # 97f4c70 council.sh copy (after approve_parallel_handover) -> current compact handoff and trigger
   python3 - "$1" "$HERE/council.sh" <<'PY'
 import re, sys
 p, cur_path = sys.argv[1], sys.argv[2]
@@ -1948,7 +1948,7 @@ def sub(old, new):
 def between(text, start, end):
     a = text.index(start); b = text.index(end, a) + len(end); return text[a:b]
 # the handover functions of the current council.sh, without what 97f4c70 does not have (telemetry and the review gate)
-region = between(cur, "# The folder of a member's handoff is named so that", "do_handover() { handover_launch $1; handover_finish $1; }   # idx -> one member alone\n")
+region = between(cur, "apana_handoff_script() {", "do_handover() { handover_launch $1; handover_finish $1; }   # idx -> one member alone\n")
 region = region.replace("TM_HOS=(); ", "").replace("TM_HOS[$i]=$TM_LAST; ", "").replace('TM_HO=""; TM_HO_MEMBER=""; TM_HOS[$i]=""; ', "")
 region = "".join(l for l in region.splitlines(True) if not l.lstrip().startswith(("tm handover", "handover_gate ", "TM_HO=")))
 if re.search(r"\btm |TM_HO|TM_LAST\b|handover_gate", region): sys.exit("approve_compact_handover: telemetry left in the region")
@@ -1956,6 +1956,15 @@ consts = between(cur, "# A member's handover note is not written by the model", 
 a = s.index("HO_LAUNCHED=()\nhandover_launch() {\n"); fin = s.index("handover_finish() {\n", a); b = s.index("\n}\n", fin) + 3
 s = s[:a] + region + s[b:]
 sub('CM="$HERE/council_codemap.py"\n', 'CM="$HERE/council_codemap.py"\n' + consts)
+sub("N=0; DIR=", next(line for line in cur.splitlines(True) if line.startswith("DEFAULT_HANDOVER=")) + "N=0; DIR=")
+sub("HANDOVER=0.5;", "HANDOVER=$DEFAULT_HANDOVER;")
+sub("HANDOVER=$(st '.config.handover_at');", 'HANDOVER=$(st ".config.handover_at // $DEFAULT_HANDOVER");')
+sub(',\n      need("handover_at"; "e.g. 0.5") ]', ' ]')
+old_threshold_check = next(line for line in s.splitlines(True) if line.startswith('    + (if (.handover_at|type)=="number"'))
+sub(old_threshold_check, between(cur, '    + (if has("handover_at") then\n', '      else [] end)\n'))
+sub('      | .members |= [ .[] | {style: $s, handover_at: $h}', '      | .handover_at = (.handover_at // $default_handover)\n      | .handover_at as $h\n      | .members |= [ .[] | {style: $s, handover_at: $h}')
+sub(' --argjson h "$(jq -r \'.handover_at\' "$1")"', ' --argjson default_handover "$DEFAULT_HANDOVER"')
+sub('  | ((.session_calls // 0) >= 2 and (.ctx_used // 0) > 0\n', '  | ((.ctx_used // 0) > 0\n')
 sub('        { echo "Handover note from your predecessor session (same member id):"; echo "<<<HANDOVER"; cat "$hn"; } >>"$pf"\n',
     between(cur, '        if [ "$(mget $i handover_kind)" = compact ]; then', '; fi\n'))
 sub("sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null'", "sts --argjson i $i '.members[$i].fresh=false | .members[$i].handover_note=null | .members[$i].handover_kind=null'")

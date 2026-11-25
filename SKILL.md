@@ -85,8 +85,8 @@ a multi-model decision, or several agents that must agree.
 
 ### 1. Settle the configuration with the user FIRST — never assume it
 
-Everything below is a required field of `council.json`; `council.sh` refuses a config with a
-missing field, and the roster is printed before any session exists. If the user did not state a
+`council.sh` refuses a config with a missing required field and prints the roster before any session exists.
+For required fields, if the user did not state a
 value, **ask** (one AskUserQuestion with the open points; propose concrete options, e.g. from
 `oc.sh models`). Do not fill in silently.
 
@@ -101,7 +101,7 @@ value, **ask** (one AskUserQuestion with the open points; propose concrete optio
 | bounds | `max_rounds` (2..10), `timeout_s` per call, `max_turns` for Claude members | |
 | Claude prompt-cache lifetime (optional) | `claude_cache_ttl`, council-wide | `1h` (default) or `5m`. Every Claude Code member is started with `CLAUDE_CODE_PROMPT_CACHE_TTL` set to it, which wins over the same variable in your own environment (read by Claude Code ≥ 2.1.242). A member that sits idle longer than the TTL pays to rebuild its context; an hour costs more per cache write, so pick `5m` for short runs without pauses. OpenCode members are not affected. |
 | prose style (optional) | `style` (top level and/or per member) | `caveman` (default), `normal`, `lite`, `ultra` — compresses only the prose a member writes for the others. `caveman` sends the [caveman skill](https://github.com/juliusbrussee/caveman)'s own text (vendored and pinned in `scripts/vendor/caveman`, Apache-2.0) in the member's first prompt, and every prompt of a styled member ends with a one-line style reminder; set `"style": "normal"` for an uncompressed baseline. The JSON tail's `proposal`/`report`, quoted code, paths, commands, errors and numbers are never compressed. Honest expectation: single-digit % of output tokens here (the JSON tail is 74–99% of a post); the JetBrains lab measured ~8.5% on real agentic tasks |
-| context handover threshold | `handover_at` (0..1], council-wide **and/or per member** | a fraction in (0,1] of the model's context window, **or an absolute token count** (≥ 1000, e.g. `150000`). At the threshold the session's transcript is compacted into a `HANDOFF.md` by the pinned jev script (no model call) and the session is replaced by a fresh session (same member id, next generation). Set it per member to make one hand over earlier than the rest (`{"id":"A", …, "handover_at":0.3}`); a member without its own value uses the council-wide one. The roster prints the effective threshold per member, and `status` shows each member's context as a percentage of its own threshold |
+| context handover threshold (optional) | `handover_at`, council-wide and/or per member | Defaults to 200001 tokens (strictly above 200,000). Override it with a fraction in (0,1] of the model's context window or an absolute token count ≥ 1000. A per-member value wins over the council-wide one. Use a lower threshold for a model with a smaller context window. The roster and `status` show the effective threshold |
 | whether to seed the code map | `map_code` (one run-wide boolean) | **Ask the user once before writing the config:** “Map the code for this council?” Record true/false. It applies to every task. Hand-written configs that omit it are accepted as false; there is no prompt or pause. |
 
 Then: `council.sh show --config council.json` → paste the roster to the user and get a yes before `start`.
@@ -235,9 +235,9 @@ For two or more pending questions of one task, `--answer TEXT` records one expli
 
 **Context handover.** After every call the member's context use is measured (OpenCode: tokens of the
 last assistant message vs the model's context limit; Claude: `usage` of the last iteration vs
-`modelUsage.contextWindow`). At ≥ `handover_at` (after at least 2 calls on that session) the session's
-transcript is compacted into `<run>/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` (+ `blobs/`) by jev's
-`make_context.py`, vendored in `scripts/vendor/jev-handoff/` (no model call: a Claude session is read from its
+`modelUsage.contextWindow`). At ≥ `handover_at`, even if the session has made only one call, the session's
+ transcript is compacted into `<run>/handoffs/handoff-<8 hex>-<date>-<id>-g<gen>/HANDOFF.md` (+ `blobs/`) by Apana's
+ `make_context.py` (no model call: a Claude session is read from its
 transcript, an OpenCode session from `opencode.db`), and a fresh session is created for the same member id
 (generation +1). Its first prompt carries the council rules, then the path of that file — read, never copied — and
 says that this prompt overrides what the file says to do after reading it. The folder name lets the next
@@ -258,12 +258,10 @@ soon for any review. The wait is bounded by `COUNCIL_HANDOVER_GATE_TIMEOUT` seco
 note is never delivered: the calls still in flight are stopped and the run stops with the failed checkpoint
 (exit 2) before the old session is retired, so `resume` redoes the handover.
 
-**The pinned handoff script.** `scripts/vendor/jev-handoff/` is a copy of jev's `compact-handoff` scripts and the
-`handoff-verify` modules they import, pinned to one commit and listed with hashes in `VENDOR.json`. The council never
-looks for an installed jev plugin and does not pass `HV_SCRIPTS` on to the script. `python3
-scripts/vendor/update_jev_handoff.py --check` verifies the copy; `--repo PATH --commit SHA` refreshes it from a jev
-checkout (commit there first: the files are read from git, not from the working tree), then run the `vendor_tests` and
-`compact_handover_tests` suites. `COUNCIL_HANDOFF_SCRIPT` points the council at another `make_context.py`.
+**The handoff script.** Council depends on `apana@apana-private` without a version pin. It finds Apana through
+Claude Code's installed-plugin registry (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json`); it
+does not download anything at runtime. `COUNCIL_HANDOFF_SCRIPT` overrides the path to `make_context.py`.
+The script does not receive `HV_SCRIPTS`, so it uses Apana's bundled verifier.
 
 **Lossless prompt de-duplication.** In voting rounds, an exactly matching candidate or a
 byte-identical proposal token can refer to a uniquely anchored peer post in the same prompt.
