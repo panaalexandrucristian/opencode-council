@@ -6,7 +6,7 @@ A [Claude Code](https://claude.com/claude-code) skill that drives [OpenCode](htt
 
 | file | purpose |
 |---|---|
-| `SKILL.md` | the skill Claude Code loads (`/opencode …`): workflow, permissions, the council checklist |
+| `SKILL.md` | the `conncil` skill: workflow, permissions, the council checklist |
 | `scripts/oc.sh` | thin bash + curl + jq CLI over the OpenCode v2 background service (sessions, prompts, wait, diff, models, `--variant` = effort) |
 | `scripts/council.sh` | the council orchestrator (see below) |
 | `scripts/vendor/` | `caveman/`: the upstream caveman skill (Apache-2.0, with its `LICENSE`, `NOTICE` and the pre-3.0.0 MIT notice `LICENSE-MIT`; commit and hashes in its `VENDOR.json`), whose text the caveman style sends to members |
@@ -43,7 +43,7 @@ opencode auth login        # e.g. OpenAI (ChatGPT/Codex), Google, Kimi, Moonshot
 /plugin install opencode-council@opencode-council
 ```
 
-Council declares `apana@apana-private` without a version pin, so the installer resolves it from the Apana marketplace. If Apana is already installed, update it separately to make sure it is current. The same commands work from a terminal with `claude plugin` instead of `/plugin`; add `--scope project` to the install for one repository only. Invoke the installed skill with **`/opencode-council:opencode …`**.
+Council declares `apana@apana-private` without a version pin, so the installer resolves it from the Apana marketplace. If Apana is already installed, update it separately to make sure it is current. The same commands work from a terminal with `claude plugin` instead of `/plugin`; add `--scope project` to the install for one repository only. Invoke the installed skill with **`/opencode-council:conncil …`**.
 
 **Option B — with the `skills` CLI** ([vercel-labs/skills](https://github.com/vercel-labs/skills), works for Claude Code and other agents; discovers the `SKILL.md` at the repo root):
 
@@ -51,37 +51,41 @@ Council declares `apana@apana-private` without a version pin, so the installer r
 npx skills add panaalexandrucristian/opencode-council -g -a claude-code   # -g = ~/.claude/skills, omit for ./.claude/skills
 ```
 
+For OpenCode, use `-a opencode` and ask it to use the `conncil` skill.
+
 **Option C — plain `git clone`** as a user skill (available in every project) or a project skill:
 
 ```bash
-git clone https://github.com/panaalexandrucristian/opencode-council.git ~/.claude/skills/opencode      # user skill
-git clone https://github.com/panaalexandrucristian/opencode-council.git .claude/skills/opencode        # project skill
+git clone https://github.com/panaalexandrucristian/opencode-council.git ~/.claude/skills/conncil      # user skill
+git clone https://github.com/panaalexandrucristian/opencode-council.git .claude/skills/conncil        # project skill
 ```
 
-With B or C the skill is invoked as `/opencode …`. For compact handovers, install `apana@apana-private` separately or set `COUNCIL_HANDOFF_SCRIPT` to an Apana `make_context.py` path. Without it, handovers fall back to the member's own posts. The scripts read the OpenCode service URL/password from `~/.local/state/opencode/service.json` and start the service (`opencode service start`) when it is not running.
+With B or C, invoke the skill in Claude Code as `/conncil …`. For compact handovers, install `apana@apana-private` separately or set `COUNCIL_HANDOFF_SCRIPT` to an Apana `make_context.py` path. Without it, handovers fall back to the member's own posts. The scripts read the OpenCode service URL/password from `~/.local/state/opencode/service.json` and start the service (`opencode service start`) when it is not running.
 
 ### 3. Verify
 
 ```bash
-~/.claude/skills/opencode/scripts/oc.sh ensure          # {"url":"http://127.0.0.1:49374","version":"2.0.11",...}
-~/.claude/skills/opencode/scripts/oc.sh models          # enabled models as provider/id — pick council members from here
+~/.claude/skills/conncil/scripts/oc.sh ensure          # {"url":"http://127.0.0.1:49374","version":"2.0.11",...}
+~/.claude/skills/conncil/scripts/oc.sh models          # enabled models as provider/id — pick council members from here
 claude -p "reply OK" --model sonnet --output-format json | jq .result   # only needed for Claude council members
 ```
 
 Then, in Claude Code:
 
 ```
-/opencode list the models available in OpenCode
-/opencode vreau un consiliu: 2 OpenCode (Astra high, Gemini 3.1 Pro high) + 1 Claude (Sonnet medium, executor) pe acest proiect …
+/conncil list the models available in OpenCode
+/conncil vreau un consiliu: 2 OpenCode (Astra high, Gemini 3.1 Pro high) + 1 Claude (Sonnet medium, executor) pe acest proiect …
 ```
 
-(`/opencode-council:opencode …` when installed as a plugin.)
+(`/opencode-council:conncil …` when installed as a plugin.)
 
 `SKILL.md` lists `scripts/oc.sh` and `scripts/council.sh` under `allowed-tools`, so Claude Code should not prompt for them while the skill is active; if your setup still prompts, allow the two commands once (or add them to `permissions.allow` in `~/.claude/settings.json`).
 
 ### 4. Update
 
-Plugin: refresh both marketplaces with `claude plugin marketplace update`, then run `claude plugin update apana@apana-private` and `claude plugin update opencode-council@opencode-council` (restart Claude Code to apply). `skills` CLI: re-run `npx skills add …`. Git clone: `git -C ~/.claude/skills/opencode pull`.
+Plugin: refresh both marketplaces with `claude plugin marketplace update`, then run `claude plugin update apana@apana-private` and `claude plugin update opencode-council@opencode-council` (restart Claude Code to apply). `skills` CLI: re-run `npx skills add …`. Git clone: `git -C ~/.claude/skills/conncil pull`.
+
+When upgrading from the old `opencode` skill, rename an existing Council clone's skill directory from `opencode` to `conncil` before pulling. If you installed with the `skills` CLI, remove the old Council skill entry after installing `conncil` so both names don't stay active.
 
 ## The council
 
@@ -190,6 +194,8 @@ How it works:
   and `scripts/ui/test_ui.py` (50 cases for the live view).
   `-j N` runs up to N suites at once, each in its own fresh scratch; names after the options run only those suites
   (`--list` prints them), e.g. `bash scripts/test-completion.sh -j 8` or `bash scripts/test-completion.sh verify_0140_tests`.
+  Run `bash scripts/test-live.sh` separately for the opt-in `conncil` checks against a live OpenCode
+  service with `openai/gpt-6.1-terra` (`medium`). It archives the dedicated test sessions.
   Run `/bin/bash -n` separately on each changed shell script after any change.
 
 ### Claude models through OpenCode (`claude-agent/*`)
@@ -240,6 +246,10 @@ Exit codes: `0` all tasks reached consensus · `1` config error · `2` a member 
 
 ## Release notes
 
+- **0.20.0** — rename the skill from `opencode` to `conncil` to avoid a name collision in OpenCode.
+  `oc.sh wait` now accepts several session IDs with a single deadline. In OpenCode, delegate new
+  tasks through `subagent`; `oc.sh new` and `oc.sh run` return exit 4 there. Councils still create
+  their own member and mapper sessions.
 - **0.19.0** — the members' prose style is `caveman` by default (`"style": "normal"` turns it off). Rule 6 of a
   member's first prompt carries the text of the upstream caveman skill, pinned in `scripts/vendor/caveman/` (Apache-2.0,
   with its `NOTICE` and the pre-3.0.0 `LICENSE-MIT`; commit and hashes in `VENDOR.json`), without its `/caveman`
@@ -742,6 +752,7 @@ scripts/oc.sh ensure                                   # start/check the OpenCod
 scripts/oc.sh models [filter]                          # enabled models (provider/id)
 scripts/oc.sh run "task" --dir /abs/project --model openai/gpt-6-astra --variant high
 scripts/oc.sh prompt ses_… "follow-up" ; scripts/oc.sh diff ses_… --patch ; scripts/oc.sh messages ses_…
+scripts/oc.sh wait "$sid1" "$sid2" --timeout 60         # one deadline, one status per session
 ```
 
 ## License

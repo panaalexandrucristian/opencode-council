@@ -1,6 +1,6 @@
 ---
-name: opencode
-description: Delegate coding tasks to OpenCode (the local AI coding agent, v2) through its HTTP API. Checks that the OpenCode background service is running and starts it automatically if not. Use when the user asks to run/delegate something in or with OpenCode, to use another model via OpenCode, to list OpenCode models/agents/sessions, or to continue/inspect an OpenCode session. Also runs a cross-CLI "council" (consiliu): OpenCode and Claude Code CLI sessions on chosen models/efforts that discuss a task list, ask the user instead of assuming, and must reach unanimous consensus (scripts/council.sh).
+name: conncil
+description: Use for councils (consiliu), OpenCode v2 model/agent/session discovery, and follow-up, waiting, or inspection of existing OpenCode sessions. From Claude Code, also use to delegate new tasks to OpenCode. Inside OpenCode, use the native subagent tool for new delegations. Councils run on chosen models and efforts, ask when requirements are unclear, and require unanimous consensus.
 argument-hint: [task to delegate to OpenCode]
 allowed-tools: Bash(${CLAUDE_SKILL_DIR}/scripts/oc.sh *), Bash(${CLAUDE_SKILL_DIR}/scripts/council.sh *)
 ---
@@ -21,11 +21,12 @@ to start the server yourself. Full endpoint notes: [reference.md](reference.md).
    or the cwd). The OpenCode session works *inside that directory* — files it edits land there.
 3. Pick a model only if the user asked for one or the task benefits from it: `oc.sh models [filter]`
    lists `provider/id<TAB>name` (default marked `*default`). Pass it as `--model provider/id`.
-4. Delegate:
-   - one-shot: `oc.sh run "<task>" --dir D [--model P/ID] [--agent build|plan] [--title T]`
+4. Delegate or follow up:
+   - inside OpenCode, use the native `subagent` tool for new delegated tasks when available. It delivers the result automatically; no wait loop is needed. `oc.sh new` and `oc.sh run` refuse here. Use `scripts/council.sh` for councils.
+   - outside OpenCode, `oc.sh run "<task>" --dir D [--model P/ID] [--agent build|plan] [--title T]`
      → creates a session, sends the prompt, waits for the turn to finish, prints the assistant's
      final text. The session id is printed on stderr (`oc: session ses_...`) — keep it for follow-ups.
-   - long prompts: write them to a file and use `oc.sh run - --file /path/prompt.md ...`, or pipe on stdin with `-`.
+   - for long prompts outside OpenCode: use `oc.sh run - --file /path/prompt.md ...` or pipe on stdin with `-`.
    - follow-up in the same session: `oc.sh prompt <ses_id> "<text>"`.
 5. Inspect the outcome before reporting back:
    - `oc.sh diff <ses_id> [--patch]` — files changed (falls back to git working-tree status of the session dir).
@@ -38,14 +39,18 @@ If the user gave arguments to this skill, treat `$ARGUMENTS` as the task and sta
 
 ## Permissions
 
-**User preference: always allow.** Every session `oc.sh` creates gets an allow-all ruleset, and
-`wait`/`prompt` answer `once` to any request that still shows up — so OpenCode never blocks waiting
-for approval. Do not pass `--ask` unless the user explicitly asks for interactive approval
+**Default: auto-approval.** `oc.sh new` and `oc.sh run` add a session allow-all rule by default.
+The wait path answers `once` to pending requests while it is waiting.
+Use `--ask` when the user asks for interactive approval
 (then `run`/`prompt`/`wait` exit **3** with the pending `per_...` ids; answer with
 `oc.sh reply <ses_id> <per_id> once|always|reject` and `oc.sh wait <ses_id>`).
 
-Because everything is allowed, you are the safety net: keep tasks scoped to the project directory,
-be explicit in prompts about what OpenCode may not touch, and review `oc.sh diff` before reporting.
+On OpenCode 2.4.2, sessions created through the API use the configured `shell`. The
+`opencode-shell-guard` plugin can still refuse commands under `--auto`, including for council members.
+The session allow-all rule can override `deny` rules from `opencode.jsonc`. OpenCode's shell and
+permissions do not apply to direct Claude Code council members (`kind: claude`).
+
+Keep tasks scoped to the project directory and review `oc.sh diff` before reporting.
 For a specific restriction use `--deny ACTION[:RESOURCE]` on `new`/`run` (it wins over the
 wildcard), e.g. `--deny 'bash:rm*'` or `--deny 'external_directory'`. Actions: `read edit glob grep
 list bash task external_directory webfetch websearch skill lsp` (`*` = any).
@@ -54,12 +59,32 @@ list bash task external_directory webfetch websearch skill lsp` (`*` = any).
 
 `0` ok · `1` error (message on stderr) · `2` wait timeout — the session is still running: call
 `oc.sh wait <ses_id>` again (default timeout 600 s, `--timeout S` to change) or `oc.sh interrupt <ses_id>`
-· `3` blocked on a permission request (only with `--ask`, see above).
+ · `3` blocked on a permission request (only with `--ask`, see above)
+ · `4` `oc.sh new` or `oc.sh run` called inside OpenCode; use `subagent` for new delegations when available.
 
 `prompt`, `run` (when waiting), and `result` preserve available output but return **1** for
 transport/JSON errors, assistant errors, or a turn without a succeeded idle outcome. `wait`
 returns **0** only after observing an idle marker; deadline expiry remains **2**, and permission
 blocking remains **3**.
+
+### Waiting for several sessions
+
+For follow-ups in existing sessions, dispatch each prompt with `--no-wait`, then wait once and
+retrieve the results:
+
+```bash
+oc.sh prompt "$sid1" "First follow-up" --no-wait
+oc.sh prompt "$sid2" "Second follow-up" --no-wait
+oc.sh wait "$sid1" "$sid2" --timeout 60
+oc.sh result "$sid1"
+oc.sh result "$sid2"
+```
+
+`wait` shares one deadline across the IDs. It prints one `SID<TAB>idle|timeout|blocked|error` line
+per ID in the given order. After the deadline it checks remaining states without waiting for
+a turn to finish or approving permissions. Exit-code precedence is `1` (error), `3` (blocked), `2`
+(timeout), then `0` (all idle). For one ID, success still prints only `idle`.
+Do not read `opencode.db`, write `sleep` loops with `sqlite3` or `curl`, or poll session status in a loop.
 
 ## Other commands
 
@@ -70,7 +95,8 @@ blocking remains **3**.
 | `oc.sh agents [--dir D]` | agents available (`build` = default, `plan` = read-only) |
 | `oc.sh sessions [--dir D] [--limit N]` | recent sessions for a directory (id, updated, outcome, title) |
 | `oc.sh new [--dir D] [--model] [--agent] [--title] [--deny A:R]` | create a session without prompting (prints `ses_...`) |
-| `oc.sh prompt SID TEXT --no-wait` | fire-and-forget; later `oc.sh wait SID` + `oc.sh result SID` |
+| `oc.sh prompt SID TEXT --no-wait` | send a prompt; later `oc.sh wait SID [SID...]` and `oc.sh result SID` for each ID |
+| `oc.sh wait SID [SID...] [--timeout S] [--ask]` | wait for existing sessions with one deadline |
 | `oc.sh permissions SID` | pending permission requests (only relevant with `--ask`) |
 | `oc.sh interrupt SID` | stop the running turn |
 | `oc.sh api METHOD /api/... [JSON]` | raw request (see reference.md) |

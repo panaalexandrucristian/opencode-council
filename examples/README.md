@@ -123,7 +123,7 @@ session would have been compacted into a handoff file and replaced by a fresh se
 The same thing driven by the skill instead of by hand:
 
 ```
-/opencode vreau un consiliu: 2 sesiuni — Claude Sonnet (medium, read-only) și OpenCode Kimi K3
+/conncil vreau un consiliu: 2 sesiuni — Claude Sonnet (medium, read-only) și OpenCode Kimi K3
 (high, executor) — pe /path/to/project, task: creează hello.sh care afișează un salut.
 ```
 

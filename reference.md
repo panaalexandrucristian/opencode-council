@@ -30,6 +30,7 @@ The service is global; each request targets a *location* (project directory):
 | `GET /api/model/default?...` | – | `{data: Model.Info|null}` |
 | `GET /api/agent?...` | – | `{data:[{id, name, mode: primary|subagent|all, hidden, description, permissions}]}` |
 | `GET /api/session?directory=D&limit=N&order=desc` | – | `{data:[Session.Info], cursor}` |
+| `GET /api/session/active` | – | `{data:{[sid]: SessionActive}}`; only currently running agent loops |
 | `POST /api/session` | `{title?, agent?, model?: {providerID, id, variant?}, location?: {directory}, permissions?: [{action, resource, effect: allow|deny|ask}]}` | `{data: Session.Info}` (`id` = `ses_...`) |
 | `GET /api/session/{sid}` | – | `{data: Session.Info}` (`time.idle`, `outcome`, `location`, `permissions`) |
 | `POST /api/session/{sid}/prompt` | `{text, files?, agents?, skills?, delivery?: steer|queue, resume?}` | `{data: inbox item}` (`id` = `msg_...`) |

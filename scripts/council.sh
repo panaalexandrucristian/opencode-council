@@ -682,7 +682,8 @@ EOF
       mapper_rules+=(--allow grep --allow glob)
     fi
     TM_MAP_STAGE=session
-    sid=$("$OC" new --dir "$DIR" --model "$model" --variant "$effort" --agent plan --title "Council map pre-pass" "${mapper_rules[@]}") || {
+    # The map pre-pass, like a council member, owns its session.
+    sid=$(CONNCIL_INTERNAL_NEW=1 "$OC" new --dir "$DIR" --model "$model" --variant "$effort" --agent plan --title "Council map pre-pass" "${mapper_rules[@]}") || {
         map_finalize_failure "$tid" "$dir" "mapper session creation failed" || return 1; return 0; }
     if ! sts --arg t "$tid" --arg s "$sid" '.map_prepasses[$t].session=$s | .map_prepasses[$t].status="created"'; then
       "$OC" interrupt "$sid" >/dev/null 2>&1 || true
@@ -1355,7 +1356,8 @@ cost_note() {  # config only; measured comparisons, never a dollar forecast or a
 # action with an underscore a member needs.
 OC_MEMBER_RULES=(--deny skill --deny execute --deny browser --deny '*_*' --allow external_directory)
 oc_new_session() {  # idx -> prints ses_...
-  local i=$1 sid; sid=$("$OC" new --dir "$DIR" --model "$(mget $i model)" --variant "$(mget $i effort)" --agent "$(mget $i agent)" --auto \
+  # Council owns its member sessions even when invoked from an OpenCode session.
+  local i=$1 sid; sid=$(CONNCIL_INTERNAL_NEW=1 "$OC" new --dir "$DIR" --model "$(mget $i model)" --variant "$(mget $i effort)" --agent "$(mget $i agent)" --auto \
         "${OC_MEMBER_RULES[@]}" --title "Council $(mid $i) g$(mget $i gen) ($(mget $i model))") || return 1
   printf '%s' "$sid"
 }

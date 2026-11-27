@@ -10,6 +10,7 @@ export PYTHONDONTWRITEBYTECODE=1  # every python3 invocation below must not dirt
 # (curl) or OpenCode service start (opencode) that reaches PATH fails at once, so no suite can depend on a live service.
 export HOME="$scratch/home" COUNCIL_TELEMETRY_DIR="$scratch/telemetry-ledger"
 unset COUNCIL_TELEMETRY COUNCIL_HANDOVER_GATE COUNCIL_HANDOVER_GATE_TIMEOUT  # an operator's settings never reach a suite
+unset OPENCODE_SESSION_ID CLAUDECODE  # CLI cases opt into a host environment explicitly
 mkdir -p "$HOME" "$scratch/stubbin"
 printf '#!/bin/sh\necho "+-o J316sAP  <class IOPlatformExpertDevice>"\necho "    \\"IOPlatformUUID\\" = \\"0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D\\""\n' >"$scratch/stubbin/ioreg"
 printf '#!/bin/sh\n[ "$1" = --version ] && { echo "2.1.300 (Claude Code)"; exit 0; }\necho "unexpected claude call" >&2; exit 97\n' >"$scratch/stubbin/claude"
@@ -111,6 +112,13 @@ cli_tests() (
     for spec in '0 1 1' '2 0 2' '3 0 3' '0 0 0'; do set -- $spec; wait_rc=$1; result_rc=$2; check "$3" "$cmd wait=$wait_rc result=$result_rc" '' cli "$cmd"; done
     wait_rc=3; result_rc=1; check 0 "$cmd no-wait" ses_fixture cli "$cmd" --no-wait
   done
+  check 4 'OpenCode new directs new delegations to subagent' '' env OPENCODE_SESSION_ID=ses_fixture OPENCODE_URL=http://127.0.0.1:1 bash "$HERE/oc.sh" new
+  [[ "$(cat "$scratch/err")" == *subagent* ]] || { cat "$scratch/err"; exit 1; }
+  check 4 'OpenCode run directs new delegations to subagent' '' env OPENCODE_SESSION_ID=ses_fixture OPENCODE_URL=http://127.0.0.1:1 bash "$HERE/oc.sh" run payload
+  [[ "$(cat "$scratch/err")" == *subagent* ]] || { cat "$scratch/err"; exit 1; }
+  check 1 'Claude Code with an inherited OpenCode ID can still reach the service' '' \
+    env OPENCODE_SESSION_ID=ses_fixture CLAUDECODE=1 OPENCODE_URL=http://127.0.0.1:1 bash "$HERE/oc.sh" new
+  [[ "$(cat "$scratch/err")" == *'not reachable'* ]] || { cat "$scratch/err"; exit 1; }
 )
 council_tests() (
   load council.sh; RUN="$scratch/council"; ST="$RUN/state.json"; N=1; OC=fake_oc

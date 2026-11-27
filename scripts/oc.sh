@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# oc.sh — thin CLI over the OpenCode v2 HTTP API, used by the Claude Code "opencode" skill.
+# oc.sh — thin CLI over the OpenCode v2 HTTP API, used by the conncil skill.
 #
 # Talks to the OpenCode *background service* (the same server `opencode` TUI and
 # `opencode api` use). If the service is not running it is started with
@@ -8,8 +8,13 @@
 # Override the target server (no auto-start) with:
 #   OPENCODE_URL=http://127.0.0.1:4096 [OPENCODE_PASSWORD=... OPENCODE_USERNAME=opencode]
 #
-# Exit codes: 0 ok · 1 error · 2 wait timeout (session still running) · 3 blocked on permission request
+# Exit codes: 0 ok · 1 error · 2 wait timeout · 3 blocked on permission request
+#             4 new/run unavailable inside OpenCode (use the native subagent tool when available)
 set -o pipefail
+
+# Consume the council's marker before any child process (including service startup) can inherit it.
+COUNCIL_NEW=${CONNCIL_INTERNAL_NEW:-}
+unset CONNCIL_INTERNAL_NEW
 
 STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json"
 DEFAULT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
@@ -38,10 +43,11 @@ discovery
 
 sessions
   new [--dir D] [--model P/ID] [--variant V] [--agent A] [--title T] [--ask] [--allow A[:R]]... [--deny A[:R]]...
-                                 create a session, print its id
+                                 create a session outside OpenCode, print its id
   prompt SID TEXT|- [--file F] [--no-wait] [--timeout S] [--ask]     send a prompt (TEXT, "-" = stdin, or --file), wait, print result
-  run TEXT|- [new options] [--file F] [--timeout S]                  new + prompt + wait + result in one go (session id on stderr)
-  wait SID [--timeout S] [--ask]                                     wait until the session is idle (handles permission requests)
+  run TEXT|- [new options] [--file F] [--timeout S]                  new + prompt + wait + result in one go (outside OpenCode)
+  wait SID [SID...] [--timeout S] [--ask]                            wait for sessions with one shared deadline
+                                                                      multiple IDs print SID<TAB>idle|timeout|blocked|error
   result SID                                                         text of the last assistant turn (+ errors/outcome)
   messages SID [--limit N] [--raw]                                   compact transcript (or raw JSON)
   diff SID [--patch]                                                 files changed in the last turn (with patches)
@@ -170,6 +176,13 @@ read_text() {  # $1 = positional text ("-" = stdin); --file wins
 
 check_sid() { case "$1" in ses*) ;; *) die "session id expected (ses_...), got: '$1'" ;; esac; }
 
+in_opencode() { [ -n "${OPENCODE_SESSION_ID:-}" ] && [ -z "${CLAUDECODE:-}" ]; }
+
+reject_new_delegation() {
+  echo "oc: use OpenCode's subagent tool for new tasks when it is available; oc.sh is for existing sessions and councils here" >&2
+  exit 4
+}
+
 model_json() {  # provider/id -> Model.Ref json (or empty)
   [ -z "$MODEL" ] && return
   case "$MODEL" in */*) ;; *) die "--model must be provider/id (see: oc.sh models)";; esac
@@ -212,9 +225,9 @@ handle_permissions() {  # sid -> 0 none pending / 0 auto-approved / 3 pending an
   return 3
 }
 
-wait_idle() {  # sid ; returns 0 idle, 2 timeout, 3 blocked on permission, 1 error
-  local sid=$1 deadline code rc chunk ltype
-  deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
+wait_idle() {  # sid [absolute deadline]; returns 0 idle, 2 timeout, 3 blocked on permission, 1 error
+  local sid=$1 deadline=${2:-} code rc chunk ltype
+  [ -n "$deadline" ] || deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     handle_permissions "$sid"; rc=$?
     [ $rc -ne 0 ] && return $rc
@@ -232,8 +245,41 @@ wait_idle() {  # sid ; returns 0 idle, 2 timeout, 3 blocked on permission, 1 err
       *) echo "oc: wait returned HTTP $code" >&2; return 1 ;;
     esac
   done
-  echo "oc: timed out after ${WAIT_TIMEOUT}s; session $sid is still running (oc.sh wait $sid | oc.sh interrupt $sid)" >&2
+  if [ -z "${2:-}" ]; then
+    echo "oc: timed out after ${WAIT_TIMEOUT}s; session $sid is still running (oc.sh wait $sid | oc.sh interrupt $sid)" >&2
+  fi
   return 2
+}
+
+probe_wait_status() {  # sid; read-only once the shared deadline has expired
+  local sid=$1 rc ltype active
+  if [ "$AUTO" != true ]; then
+    handle_permissions "$sid"; rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+  fi
+  ltype=$(last_type "$sid") || return 1
+  [ "$ltype" = idle ] || return 2
+  active=$(api GET /api/session/active | jq -r --arg sid "$sid" '.data | has($sid)') || return 1
+  [ "$active" = false ] || return 2
+}
+
+wait_many() {
+  local sid rc status result=0 deadline
+  deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
+  for sid in "$@"; do
+    wait_idle "$sid" "$deadline"; rc=$?
+    if [ "$rc" -eq 2 ]; then
+      probe_wait_status "$sid"; rc=$?
+    fi
+    case "$rc" in
+      0) status=idle ;;
+      2) status=timeout; [ "$result" -ne 0 ] || result=2 ;;
+      3) status=blocked; [ "$result" -eq 1 ] || result=3 ;;
+      *) status=error; result=1 ;;
+    esac
+    printf '%s\t%s\n' "$sid" "$status"
+  done
+  return "$result"
 }
 
 # the current turn of one message page (newest first): its reply text, its structured assistant errors and its outcome
@@ -312,6 +358,7 @@ case "$cmd" in
       | jq -r '.data[] | "\(.id)\t\(.time.updated/1000|todate)\t\(.outcome // "-")\t\(.title // "")"' ;;
 
   new)
+    if in_opencode && [ "$COUNCIL_NEW" != 1 ]; then reject_new_delegation; fi
     resolve; MODEL_JSON=$(model_json) || exit 1
     create_session ;;
 
@@ -325,6 +372,7 @@ case "$cmd" in
     exit $rc ;;
 
   run)
+    if in_opencode; then reject_new_delegation; fi
     resolve; MODEL_JSON=$(model_json) || exit 1
     text=$(read_text "$1"); [ -n "$text" ] || die "empty prompt"
     sid=$(create_session) || exit 1
@@ -336,7 +384,14 @@ case "$cmd" in
     exit $rc ;;
 
   wait)
-    sid=$1; check_sid "$sid"; resolve
+    [ "$#" -gt 0 ] || die "wait requires at least one session ID"
+    for sid in "$@"; do check_sid "$sid"; done
+    resolve
+    if [ "$#" -gt 1 ]; then
+      wait_many "$@"
+      exit $?
+    fi
+    sid=$1
     wait_idle "$sid"; rc=$?
     [ $rc -eq 0 ] && echo "idle"
     exit $rc ;;
